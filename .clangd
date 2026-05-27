@@ -1,0 +1,21 @@
+CompileFlags:
+  Compiler: clang
+  Add:
+    - "--target=x86_64-pc-windows-msvc"
+    - "-fms-compatibility"
+    - "-fms-extensions"
+    - "-fdelayed-template-parsing"
+    - "-fms-compatibility-version=19.43"
+    - "-std=c++20"
+    - "-D_DEBUG"
+    - "-DUNICODE"
+    - "-D_UNICODE"
+    - "-DWIN32"
+    - "-D_WINDOWS"
+    - "-isystemC:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.43.34808/include"
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/ucrt"
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/shared"
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/um"
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/winrt"
+    - "-ID:/tools/zlib"
+    - "-ID:/tools/libpng"
