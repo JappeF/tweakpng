@@ -2568,7 +2568,7 @@ static void DblClickOnList()
 	}
 }
 
-static void twpng_ApplyModernWindowStyle(HWND hwnd)
+void twpng_ApplyModernWindowStyle(HWND hwnd)
 {
 	typedef HRESULT (WINAPI *DwmSetWindowAttributeProc)(HWND,DWORD,LPCVOID,DWORD);
 	HMODULE hDwm;
@@ -2610,6 +2610,94 @@ static void twpng_ApplyModernWindowStyle(HWND hwnd)
 
 	// Force menu bar to redraw using the dark theme attributes
 	DrawMenuBar(hwnd);
+}
+
+// Owner-draws a window's standard menu bar in dark mode via the undocumented UAH
+// messages, and paints over the 1px light line Windows leaves under it. Shared by the
+// main window and the image viewer. Returns TRUE if the message was handled.
+BOOL twpng_HandleDarkMenuMsg(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT *result)
+{
+	switch(msg) {
+	case WM_UAHDRAWMENU:
+		{
+			UAHMENU *pUDM = (UAHMENU*)lParam;
+			MENUBARINFO mbi = {};
+			mbi.cbSize = sizeof(mbi);
+			GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi);
+			RECT rcWindow = {};
+			GetWindowRect(hwnd, &rcWindow);
+			RECT rc = mbi.rcBar;
+			OffsetRect(&rc, -rcWindow.left, -rcWindow.top);
+			if(globals.hUiBgBrush) FillRect(pUDM->hdc, &rc, globals.hUiBgBrush);
+			*result = TRUE;
+			return TRUE;
+		}
+
+	case WM_UAHDRAWMENUITEM:
+		{
+			UAHDRAWMENUITEM *pUDMI = (UAHDRAWMENUITEM*)lParam;
+			HDC hdc = pUDMI->um.hdc;
+			RECT rcItem = pUDMI->dis.rcItem;
+
+			BOOL created = FALSE;
+			HBRUSH hFill;
+			if(pUDMI->dis.itemState & (ODS_HOTLIGHT | ODS_SELECTED)) {
+				hFill = CreateSolidBrush(RGB(58, 58, 58));
+				created = TRUE;
+			} else {
+				hFill = globals.hUiBgBrush;
+			}
+			FillRect(hdc, &rcItem, hFill ? hFill : (HBRUSH)GetStockObject(BLACK_BRUSH));
+			if(created) DeleteObject(hFill);
+
+			MENUITEMINFO mii = {};
+			mii.cbSize = sizeof(mii);
+			mii.fMask = MIIM_STRING;
+			TCHAR szMenuText[256] = {};
+			mii.dwTypeData = szMenuText;
+			mii.cch = 255;
+			GetMenuItemInfo(pUDMI->um.hmenu, pUDMI->umi.iPosition, TRUE, &mii);
+
+			DWORD dtFlags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
+			if(pUDMI->dis.itemState & ODS_NOACCEL) dtFlags |= DT_HIDEPREFIX;
+
+			SetBkMode(hdc, TRANSPARENT);
+			SetTextColor(hdc, (pUDMI->dis.itemState & ODS_GRAYED) ? RGB(120, 120, 120) : RGB(220, 220, 220));
+			HGDIOBJ hOldFont2 = globals.hUiFont ? SelectObject(hdc, globals.hUiFont) : NULL;
+			DrawText(hdc, szMenuText, -1, &rcItem, dtFlags);
+			if(hOldFont2) SelectObject(hdc, hOldFont2);
+			*result = TRUE;
+			return TRUE;
+		}
+
+	case WM_NCACTIVATE:
+	case WM_NCPAINT:
+		{
+			// Let Windows draw the title bar / frame normally, then paint over the
+			// 1px light line Windows leaves at the bottom of the (dark) menu bar.
+			LRESULT lr = DefWindowProc(hwnd, msg, wParam, lParam);
+			if(globals.hUiBgBrush) {
+				MENUBARINFO mbi = {};
+				mbi.cbSize = sizeof(mbi);
+				if(GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi)) {
+					RECT rcWindow = {};
+					GetWindowRect(hwnd, &rcWindow);
+					RECT rcLine = mbi.rcBar;
+					OffsetRect(&rcLine, -rcWindow.left, -rcWindow.top);
+					rcLine.top = rcLine.bottom;
+					rcLine.bottom = rcLine.top + 1;
+					HDC hdc = GetWindowDC(hwnd);
+					if(hdc) {
+						FillRect(hdc, &rcLine, globals.hUiBgBrush);
+						ReleaseDC(hwnd, hdc);
+					}
+				}
+			}
+			*result = lr;
+			return TRUE;
+		}
+	}
+	return FALSE;
 }
 
 static void twpng_CreateUiFont(UINT dpi = 0)
@@ -3255,80 +3343,14 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 	switch(msg) {
 	case WM_UAHDRAWMENU:
-		{
-			UAHMENU *pUDM = (UAHMENU*)lParam;
-			MENUBARINFO mbi = {};
-			mbi.cbSize = sizeof(mbi);
-			GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi);
-			RECT rcWindow = {};
-			GetWindowRect(hwnd, &rcWindow);
-			RECT rc = mbi.rcBar;
-			OffsetRect(&rc, -rcWindow.left, -rcWindow.top);
-			if(globals.hUiBgBrush) FillRect(pUDM->hdc, &rc, globals.hUiBgBrush);
-			return TRUE;
-		}
-
 	case WM_UAHDRAWMENUITEM:
-		{
-			UAHDRAWMENUITEM *pUDMI = (UAHDRAWMENUITEM*)lParam;
-			HDC hdc = pUDMI->um.hdc;
-			RECT rcItem = pUDMI->dis.rcItem;
-
-			BOOL created = FALSE;
-			HBRUSH hFill;
-			if(pUDMI->dis.itemState & (ODS_HOTLIGHT | ODS_SELECTED)) {
-				hFill = CreateSolidBrush(RGB(58, 58, 58));
-				created = TRUE;
-			} else {
-				hFill = globals.hUiBgBrush;
-			}
-			FillRect(hdc, &rcItem, hFill ? hFill : (HBRUSH)GetStockObject(BLACK_BRUSH));
-			if(created) DeleteObject(hFill);
-
-			MENUITEMINFO mii = {};
-			mii.cbSize = sizeof(mii);
-			mii.fMask = MIIM_STRING;
-			TCHAR szMenuText[256] = {};
-			mii.dwTypeData = szMenuText;
-			mii.cch = 255;
-			GetMenuItemInfo(pUDMI->um.hmenu, pUDMI->umi.iPosition, TRUE, &mii);
-
-			DWORD dtFlags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
-			if(pUDMI->dis.itemState & ODS_NOACCEL) dtFlags |= DT_HIDEPREFIX;
-
-			SetBkMode(hdc, TRANSPARENT);
-			SetTextColor(hdc, (pUDMI->dis.itemState & ODS_GRAYED) ? RGB(120, 120, 120) : RGB(220, 220, 220));
-			HGDIOBJ hOldFont2 = globals.hUiFont ? SelectObject(hdc, globals.hUiFont) : NULL;
-			DrawText(hdc, szMenuText, -1, &rcItem, dtFlags);
-			if(hOldFont2) SelectObject(hdc, hOldFont2);
-			return TRUE;
-		}
-
 	case WM_NCACTIVATE:
 	case WM_NCPAINT:
 		{
-			// Let Windows draw the title bar / frame normally, then paint over the
-			// 1px light line Windows leaves at the bottom of the (dark) menu bar.
-			LRESULT lr = DefWindowProc(hwnd, msg, wParam, lParam);
-			if(globals.hUiBgBrush) {
-				MENUBARINFO mbi = {};
-				mbi.cbSize = sizeof(mbi);
-				if(GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi)) {
-					RECT rcWindow = {};
-					GetWindowRect(hwnd, &rcWindow);
-					RECT rcLine = mbi.rcBar;
-					OffsetRect(&rcLine, -rcWindow.left, -rcWindow.top);
-					rcLine.top = rcLine.bottom;
-					rcLine.bottom = rcLine.top + 1;
-					HDC hdc = GetWindowDC(hwnd);
-					if(hdc) {
-						FillRect(hdc, &rcLine, globals.hUiBgBrush);
-						ReleaseDC(hwnd, hdc);
-					}
-				}
-			}
-			return lr;
+			LRESULT dmResult = 0;
+			if(twpng_HandleDarkMenuMsg(hwnd, msg, wParam, lParam, &dmResult)) return dmResult;
 		}
+		break;
 
 	case WM_ERASEBKGND:
 		if(globals.hUiBgBrush) {

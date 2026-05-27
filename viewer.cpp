@@ -102,6 +102,8 @@ Viewer::Viewer(HWND parent, const TCHAR *current_filename)
 		parent,NULL,globals.hInst,NULL);
 	if(!m_hwndViewer) return;
 
+	twpng_ApplyModernWindowStyle(m_hwndViewer);
+
 	twpng_SetWindowPos(m_hwndViewer,&globals.window_prefs.viewer);
 	SetCurrentFileName(current_filename);
 	UpdateViewerWindowTitle();
@@ -460,6 +462,11 @@ LRESULT CALLBACK Viewer::WndProcViewer(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 	POINTS pts;
 	Viewer *v;
 
+	{
+		LRESULT dmResult = 0;
+		if(twpng_HandleDarkMenuMsg(hwnd, msg, wParam, lParam, &dmResult)) return dmResult;
+	}
+
 	if(!g_viewer) goto exit1;
 	v=g_viewer;
 
@@ -515,13 +522,14 @@ LRESULT CALLBACK Viewer::WndProcViewer(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 				}
 			}
 			else {
-				FillRect(hdc,&v->m_clientrect,GetSysColorBrush(COLOR_WINDOW));
+				// No image loaded: fill with the dark UI background.
+				HBRUSH hbrBg = globals.hUiBgBrush ? globals.hUiBgBrush : GetSysColorBrush(COLOR_WINDOW);
+				FillRect(hdc,&v->m_clientrect,hbrBg);
 
 				if(v->m_errorflag) {
-					SetTextColor(hdc,RGB(128,0,0));
-					SetBkColor(hdc,RGB(255,255,255));
-					SetBkMode(hdc,OPAQUE);
-					SelectObject(hdc,GetStockObject(ANSI_VAR_FONT));
+					SetTextColor(hdc,RGB(255,120,120));
+					SetBkMode(hdc,TRANSPARENT);
+					SelectObject(hdc,globals.hUiFont?globals.hUiFont:(HFONT)GetStockObject(ANSI_VAR_FONT));
 					DrawText(hdc,v->m_errormsg,-1,&v->m_clientrect,
 						DT_NOPREFIX|DT_WORDBREAK);
 				}

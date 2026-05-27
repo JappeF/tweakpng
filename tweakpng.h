@@ -256,6 +256,8 @@ void update_viewer();
 
 void twpng_InitDarkDialog(HWND hwnd);
 BOOL twpng_HandleDlgDarkMsg(UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR *result);
+void twpng_ApplyModernWindowStyle(HWND hwnd);
+BOOL twpng_HandleDarkMenuMsg(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT *result);
 
 int convert_tchar_to_latin1(const TCHAR *src, int srclen,
 								   char **pdst, int *pdstlen);
