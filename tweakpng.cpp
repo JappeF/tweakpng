@@ -3303,47 +3303,53 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			LPDRAWITEMSTRUCT pdis = (LPDRAWITEMSTRUCT)lParam;
 			if (pdis->CtlType == ODT_BUTTON) {
 				HDC hdc = pdis->hDC;
-				RECT rect = pdis->rcItem;
+				RECT rc = pdis->rcItem;
 				UINT state = pdis->itemState;
 
-				HBRUSH hBrush;
-				COLORREF textColor = RGB(255, 255, 255);
-				COLORREF borderColor = RGB(75, 75, 75);
+				// Always fill the whole rect with the window bg first — this
+				// eliminates the gray artifacts that appear in the corners
+				// outside the RoundRect clip region.
+				if(globals.hUiBgBrush) FillRect(hdc, &rc, globals.hUiBgBrush);
 
-				if (state & ODS_DISABLED) {
-					hBrush = CreateSolidBrush(RGB(38, 38, 38));
-					textColor = RGB(110, 110, 110);
-					borderColor = RGB(50, 50, 50);
-				} else if (state & ODS_SELECTED) {
-					hBrush = CreateSolidBrush(RGB(55, 55, 55));
-					borderColor = RGB(130, 130, 130);
+				COLORREF textColor;
+				HBRUSH hFill = NULL;
+
+				if(state & ODS_DISABLED) {
+					textColor = RGB(100, 100, 100);
+				} else if(state & ODS_SELECTED) {
+					hFill = CreateSolidBrush(RGB(65, 65, 65));
+					textColor = RGB(255, 255, 255);
+				} else if(state & ODS_HOTLIGHT) {
+					hFill = CreateSolidBrush(RGB(50, 50, 50));
+					textColor = RGB(255, 255, 255);
 				} else {
-					hBrush = CreateSolidBrush(RGB(45, 45, 45));
+					textColor = RGB(210, 210, 210);
 				}
 
-				HPEN hPen = CreatePen(PS_SOLID, 1, borderColor);
-				HGDIOBJ hOldPen = SelectObject(hdc, hPen);
-				HGDIOBJ hOldBrush = SelectObject(hdc, hBrush);
-
-				RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 6, 6);
+				// Draw rounded fill only when needed (no border — flat Win11 style)
+				if(hFill) {
+					HPEN hNullPen = (HPEN)GetStockObject(NULL_PEN);
+					HGDIOBJ hOldPen = SelectObject(hdc, hNullPen);
+					HGDIOBJ hOldBrush = SelectObject(hdc, hFill);
+					RoundRect(hdc, rc.left, rc.top, rc.right+1, rc.bottom+1, 6, 6);
+					SelectObject(hdc, hOldPen);
+					SelectObject(hdc, hOldBrush);
+					DeleteObject(hFill);
+				}
 
 				TCHAR text[128];
 				GetWindowText(pdis->hwndItem, text, 128);
 				SetBkMode(hdc, TRANSPARENT);
 				SetTextColor(hdc, textColor);
+				HGDIOBJ hOldFont = globals.hUiFont ? SelectObject(hdc, globals.hUiFont) : NULL;
+				DrawText(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+				if(hOldFont) SelectObject(hdc, hOldFont);
 
-				HGDIOBJ hOldFont = NULL;
-				if (globals.hUiFont) {
-					hOldFont = SelectObject(hdc, globals.hUiFont);
+				if(state & ODS_FOCUS) {
+					RECT rcFocus = rc;
+					InflateRect(&rcFocus, -3, -3);
+					DrawFocusRect(hdc, &rcFocus);
 				}
-
-				DrawText(hdc, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-				if (hOldFont) SelectObject(hdc, hOldFont);
-				SelectObject(hdc, hOldBrush);
-				SelectObject(hdc, hOldPen);
-				DeleteObject(hBrush);
-				DeleteObject(hPen);
 
 				return TRUE;
 			}
