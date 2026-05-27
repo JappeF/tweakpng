@@ -3,6 +3,9 @@
 #ifndef TWEAKPNG_H
 #define TWEAKPNG_H
 
+#include <windows.h>
+#include <tchar.h>
+
 // Symbols, characters, etc., that are different when Unicode is disabled.
 #ifdef UNICODE
 #define SYM_COPYRIGHT   _T("\xa9")
