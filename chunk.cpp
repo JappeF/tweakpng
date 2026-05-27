@@ -650,6 +650,34 @@ int Chunk::can_edit()
 	return can_edit_chunk_type(m_chunktype_id);
 }
 
+// The tEXt/zTXt/iTXt editor runs modeless so the main window stays usable and the
+// editor can be minimized. Only one is open at a time; its context is heap-allocated
+// and freed when the editor window is destroyed.
+static HWND g_hwndTextEditor = NULL;
+static struct edit_chunk_ctx *g_textEcctx = NULL;
+
+BOOL twpng_IsModelessEditorMessage(MSG *pmsg)
+{
+	return g_hwndTextEditor && IsDialogMessage(g_hwndTextEditor, pmsg);
+}
+
+// Force-close the modeless editor, discarding any unsaved edits. Called when the
+// document is about to be destroyed.
+void twpng_CloseModelessEditors()
+{
+	if(g_hwndTextEditor) {
+		DestroyWindow(g_hwndTextEditor);  // WM_NCDESTROY clears the globals
+	}
+}
+
+// Close the editor only if it is editing this specific chunk (about to be deleted).
+void twpng_CloseEditorForChunk(const Chunk *ch)
+{
+	if(g_hwndTextEditor && g_textEcctx && g_textEcctx->ch == ch) {
+		DestroyWindow(g_hwndTextEditor);
+	}
+}
+
 // return 1 if changed, 2 if changed multiple chunks
 int Chunk::edit()
 {
@@ -671,8 +699,28 @@ int Chunk::edit()
 #ifdef UNICODE
 	case CHUNK_iTXt:
 #endif
-		changed=  DialogBoxParam(globals.hInst,_T("DLG_TEXT"),globals.hwndMain,
-		    DlgProcEdit_tEXt, (LPARAM)&ecctx);
+		// Modeless: if an editor is already open, just bring it forward.
+		if(g_hwndTextEditor) {
+			SetForegroundWindow(g_hwndTextEditor);
+		}
+		else {
+			g_textEcctx = (struct edit_chunk_ctx*)calloc(1,sizeof(struct edit_chunk_ctx));
+			if(g_textEcctx) {
+				g_textEcctx->ch = this;
+				// No owner window, so minimizing the main window doesn't minimize this
+				// editor and it gets its own taskbar button.
+				g_hwndTextEditor = CreateDialogParam(globals.hInst,_T("DLG_TEXT"),
+					NULL, DlgProcEdit_tEXt, (LPARAM)g_textEcctx);
+				if(!g_hwndTextEditor) {
+					free(g_textEcctx);
+					g_textEcctx = NULL;
+				}
+				else {
+					ShowWindow(g_hwndTextEditor, SW_SHOW);
+					SetForegroundWindow(g_hwndTextEditor);
+				}
+			}
+		}
 		break;
 
 	case CHUNK_IHDR:
@@ -2358,6 +2406,15 @@ static INT_PTR CALLBACK DlgProcEdit_tEXt(HWND hwnd, UINT msg, WPARAM wParam, LPA
 		twpng_StoreWindowPos(hwnd,&globals.window_prefs.text);
 		break;
 
+	case WM_NCDESTROY:
+		// Modeless cleanup: release the heap context and clear the global handle.
+		if(g_hwndTextEditor==hwnd) {
+			g_hwndTextEditor = NULL;
+			if(g_textEcctx) { free(g_textEcctx); g_textEcctx = NULL; }
+		}
+		SetWindowLongPtr(hwnd,DWLP_USER,0);
+		return 0;
+
 	case WM_COMMAND:
 		switch(id) {
 		case IDC_TEXTUNICODE:
@@ -2373,11 +2430,16 @@ static INT_PTR CALLBACK DlgProcEdit_tEXt(HWND hwnd, UINT msg, WPARAM wParam, LPA
 
 		case IDOK:
 			Dlg_tEXt_OK(hwnd,ch);
-			EndDialog(hwnd,1);
+			ch->chunkmodified();
+			if(ch->m_parentpng) {
+				ch->m_parentpng->fill_listbox(globals.hwndMainList);
+				ch->m_parentpng->modified();
+			}
+			DestroyWindow(hwnd);
 			return 1;
 
 		case IDCANCEL:
-			EndDialog(hwnd, 0);
+			DestroyWindow(hwnd);
 			return 1;
 		}
 	}

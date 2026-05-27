@@ -37,7 +37,7 @@
 
 // This fork's own version, bumped independently of the upstream base version above.
 #define TWEAKPNG_FORK_VER_STRING _T("Dark Mode 1.1")
-#define TWEAKPNG_FORK_HOMEPAGE   _T("https://github.com/JappeF/tweakpng")
+#define TWEAKPNG_FORK_HOMEPAGE   _T("https://github.com/JappeF/tweakpng/")
 
 #define ID_STBAR      19000
 //#define ID_IMGVIEWER     19100
@@ -205,6 +205,7 @@ struct globals_struct {
 
 	COLORREF custcolors[16];
 	int autoopen_viewer;
+	int open_params_on_load; // auto-open the tEXt editor for a "parameters" chunk on load
 	HCURSOR hcurDrag2;
 	int viewer_imgpos_x, viewer_imgpos_y;
 	int viewer_correct_nonsquare;
@@ -263,6 +264,10 @@ BOOL twpng_HandleDlgDarkMsg(UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR *res
 void twpng_ApplyModernWindowStyle(HWND hwnd);
 BOOL twpng_HandleDarkMenuMsg(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT *result);
 
+// Modeless chunk editor (currently the tEXt/zTXt/iTXt editor) support.
+BOOL twpng_IsModelessEditorMessage(MSG *pmsg);
+void twpng_CloseModelessEditors();
+
 int convert_tchar_to_latin1(const TCHAR *src, int srclen,
 								   char **pdst, int *pdstlen);
 int convert_latin1_to_tchar(const char *src, int srclen,
@@ -285,6 +290,9 @@ void twpng_get_libpng_version(TCHAR *buf, int buflen);
 
 class Png;
 class Chunk;
+
+// Close the modeless editor only if it is currently editing the given chunk.
+void twpng_CloseEditorForChunk(const Chunk *ch);
 
 struct text_info_struct {
 	int processed;

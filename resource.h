@@ -82,6 +82,9 @@
 #define IDC_EDIT8                       1087
 #define IDC_EDITP4                      1088
 #define IDC_EDITP5                      1089
+#define IDC_MSGBOX_ICON                 1100
+#define IDC_MSGBOX_TEXT                 1101
+#define IDC_OPENPARAMS                  1102
 #define ID_EXIT                         40001
 #define ID_OPEN                         40002
 #define ID_SAVEAS                       40003

@@ -50,6 +50,7 @@
 #include <stdarg.h>
 #include <commctrl.h>
 #include <uxtheme.h>
+#include <vssym32.h>
 
 #include "resource.h"
 #include "tweakpng.h"
@@ -145,6 +146,141 @@ DWORD update_crc(DWORD crc, unsigned char *buf, int len)
 	return c;
 }
 
+// ---- Dark-themed MessageBox ---------------------------------------------------------
+// The standard MessageBox paints a light footer band that can't be themed, so we use a
+// small custom dialog (DLG_MSGBOX) themed like every other dialog.
+
+struct msgbox_ctx {
+	const TCHAR *text;
+	const TCHAR *caption;
+	UINT type;
+};
+
+static INT_PTR CALLBACK DlgProcMsgBox(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	WORD id = LOWORD(wParam);
+
+	if(msg == WM_INITDIALOG) {
+		struct msgbox_ctx *c = (struct msgbox_ctx*)lParam;
+		if(!c) { EndDialog(hwnd, IDCANCEL); return TRUE; }
+		SetWindowLongPtr(hwnd, DWLP_USER, (LONG_PTR)c->type);
+
+		SetWindowText(hwnd, (c->caption && c->caption[0]) ? c->caption : _T("TweakPNG"));
+		SetDlgItemText(hwnd, IDC_MSGBOX_TEXT, c->text ? c->text : _T(""));
+
+		LPCTSTR icoName = NULL;
+		switch(c->type & MB_ICONMASK) {
+		case MB_ICONERROR:       icoName = IDI_ERROR; break;
+		case MB_ICONQUESTION:    icoName = IDI_QUESTION; break;
+		case MB_ICONWARNING:     icoName = IDI_WARNING; break;
+		case MB_ICONINFORMATION: icoName = IDI_INFORMATION; break;
+		}
+		HWND hIcon = GetDlgItem(hwnd, IDC_MSGBOX_ICON);
+		if(icoName) SendMessage(hIcon, STM_SETICON, (WPARAM)LoadIcon(NULL, icoName), 0);
+		else        ShowWindow(hIcon, SW_HIDE);
+
+		HDC hdc = GetDC(hwnd);
+		int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+		HFONT hOldFont = globals.hUiFont ? (HFONT)SelectObject(hdc, globals.hUiFont) : NULL;
+		int pad     = MulDiv(14, dpi, 96);
+		int gap     = MulDiv(14, dpi, 96);
+		int iconSz  = icoName ? GetSystemMetrics(SM_CXICON) : 0;
+		int maxTxtW = MulDiv(340, dpi, 96);
+		RECT rcTxt = {0,0,maxTxtW,0};
+		DrawText(hdc, c->text ? c->text : _T(""), -1, &rcTxt,
+			DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);
+		if(hOldFont) SelectObject(hdc, hOldFont);
+		ReleaseDC(hwnd, hdc);
+		int txtW = rcTxt.right, txtH = rcTxt.bottom;
+
+		int contentLeft = pad + (iconSz ? iconSz + gap : 0);
+		int contentH = (txtH > iconSz) ? txtH : iconSz;
+
+		int btnW = MulDiv(80, dpi, 96), btnH = MulDiv(23, dpi, 96), btnGap = MulDiv(8, dpi, 96);
+		int btns[3], nbtn = 0, defbtn = IDOK;
+		switch(c->type & MB_TYPEMASK) {
+		case MB_OKCANCEL:    btns[nbtn++]=IDOK;  btns[nbtn++]=IDCANCEL; defbtn=IDOK;  break;
+		case MB_YESNO:       btns[nbtn++]=IDYES; btns[nbtn++]=IDNO;     defbtn=IDYES; break;
+		case MB_YESNOCANCEL: btns[nbtn++]=IDYES; btns[nbtn++]=IDNO; btns[nbtn++]=IDCANCEL; defbtn=IDYES; break;
+		default:             btns[nbtn++]=IDOK;  defbtn=IDOK;          break;
+		}
+		const int allBtns[4] = {IDOK, IDYES, IDNO, IDCANCEL};
+		for(int i=0;i<4;i++) ShowWindow(GetDlgItem(hwnd, allBtns[i]), SW_HIDE);
+
+		int btnRowW = nbtn*btnW + (nbtn-1)*btnGap;
+		int clientW = contentLeft + txtW + pad;
+		int minW = pad + btnRowW + pad;
+		if(clientW < minW) clientW = minW;
+		int btnY = pad + contentH + MulDiv(16, dpi, 96);
+		int clientH = btnY + btnH + pad;
+
+		RECT wr = {0,0,clientW,clientH};
+		AdjustWindowRectEx(&wr, GetWindowLong(hwnd,GWL_STYLE), FALSE, GetWindowLong(hwnd,GWL_EXSTYLE));
+		int winW = wr.right-wr.left, winH = wr.bottom-wr.top;
+
+		RECT orc; HWND owner = GetWindow(hwnd, GW_OWNER);
+		if(!(owner && GetWindowRect(owner, &orc)))
+			SystemParametersInfo(SPI_GETWORKAREA, 0, &orc, 0);
+		int x = orc.left + ((orc.right-orc.left)-winW)/2;
+		int y = orc.top  + ((orc.bottom-orc.top)-winH)/2;
+		SetWindowPos(hwnd, NULL, x, y, winW, winH, SWP_NOZORDER);
+
+		if(iconSz) SetWindowPos(hIcon, NULL, pad, pad, iconSz, iconSz, SWP_NOZORDER);
+		SetWindowPos(GetDlgItem(hwnd, IDC_MSGBOX_TEXT), NULL,
+			contentLeft, pad + (contentH-txtH)/2, txtW, txtH, SWP_NOZORDER);
+		int bx = clientW - pad - btnRowW;
+		for(int i=0;i<nbtn;i++) {
+			HWND hb = GetDlgItem(hwnd, btns[i]);
+			SetWindowPos(hb, NULL, bx, btnY, btnW, btnH, SWP_NOZORDER);
+			ShowWindow(hb, SW_SHOW);
+			bx += btnW + btnGap;
+		}
+		SendMessage(hwnd, DM_SETDEFID, defbtn, 0);
+
+		twpng_InitDarkDialog(hwnd);
+		MessageBeep(c->type & MB_ICONMASK);
+		SetFocus(GetDlgItem(hwnd, defbtn));
+		return FALSE;
+	}
+
+	switch(msg) {
+	case WM_COMMAND:
+		switch(id) {
+		case IDOK: case IDYES: case IDNO:
+			EndDialog(hwnd, id);
+			return TRUE;
+		case IDCANCEL:
+			// For an OK-only box, Esc/close should map to OK like the real MessageBox.
+			EndDialog(hwnd, ((GetWindowLongPtr(hwnd,DWLP_USER) & MB_TYPEMASK)==MB_OK) ? IDOK : IDCANCEL);
+			return TRUE;
+		}
+		break;
+	}
+	{
+		INT_PTR darkResult = 0;
+		if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &darkResult)) return darkResult;
+	}
+	return FALSE;
+}
+
+int twpng_MessageBox(HWND hwnd, const TCHAR *text, const TCHAR *caption, UINT type)
+{
+	struct msgbox_ctx c;
+	c.text = text;
+	c.caption = caption;
+	c.type = type;
+	INT_PTR r = DialogBoxParam(globals.hInst, _T("DLG_MSGBOX"),
+		hwnd ? hwnd : globals.hwndMain, DlgProcMsgBox, (LPARAM)&c);
+	if(r <= 0) {  // creation failed or closed without a button
+		switch(type & MB_TYPEMASK) {
+		case MB_OKCANCEL: case MB_YESNOCANCEL: return IDCANCEL;
+		case MB_YESNO: return IDNO;
+		default: return IDOK;
+		}
+	}
+	return (int)r;
+}
+
 void mesg(int severity, const TCHAR *fmt, ...)
 {
 	va_list ap;
@@ -162,7 +298,7 @@ void mesg(int severity, const TCHAR *fmt, ...)
 	case MSG_I: t=_T("Notice");  flags=MB_ICONINFORMATION;  break;
 	default:    t=_T("Error");   flags=MB_ICONWARNING;      break;  // (MSG_E)
 	}
-	MessageBox(globals.hwndMain,buf,t,MB_OK|flags);
+	twpng_MessageBox(globals.hwndMain,buf,t,MB_OK|flags);
 }
 
 // Some functions for reading/writing big-endian integers.
@@ -762,6 +898,7 @@ void Png::delete_chunk(int n)
 	int i;
 	if(n<0 || n>=m_num_chunks) return;
 
+	twpng_CloseEditorForChunk(chunk[n]);
 	delete chunk[n];
 	for(i=n+1;i<m_num_chunks;i++) {
 		chunk[i-1]=chunk[i];
@@ -1003,6 +1140,9 @@ Png::Png(const TCHAR *load_fn, const TCHAR *save_fn)
 Png::~Png()
 {
 	int i;
+
+	// This document is going away; close the modeless editor before its chunks are freed.
+	twpng_CloseModelessEditors();
 
 	if(chunk) {
 		// free individual chunks
@@ -1375,6 +1515,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 	hAccTable=LoadAccelerators(globals.hInst,_T("ACCELTABLE"));
 
 	while(GetMessage(&msg,NULL,0,0)){
+		if(twpng_IsModelessEditorMessage(&msg)) continue;
 		if (!TranslateAccelerator(globals.hwndMain, hAccTable, &msg)) {
 			TranslateMessage(&msg);
 			DispatchMessage(&msg);
@@ -1557,7 +1698,7 @@ static void ReopenPngDocument()
 	if(!png->m_named) return;
 
 	if(png->m_dirty) {
-		x=MessageBox(globals.hwndMain,_T("Reload and lose changes?"),
+		x=twpng_MessageBox(globals.hwndMain,_T("Reload and lose changes?"),
 			_T("TweakPNG"),MB_OKCANCEL|MB_ICONWARNING|MB_DEFBUTTON1);
 		if(x!=IDOK) return;
 	}
@@ -1806,7 +1947,7 @@ int Png::check_validity(int msgmode)
 
 done:
 	if(msgmode==0) {
-		MessageBox(globals.hwndMain,m,_T("Validity check"),MB_OK|(e?MB_ICONWARNING:MB_ICONINFORMATION));
+		twpng_MessageBox(globals.hwndMain,m,_T("Validity check"),MB_OK|(e?MB_ICONWARNING:MB_ICONINFORMATION));
 		return (e==0);
 	}
 	//else
@@ -1814,7 +1955,7 @@ done:
 	if(e) {
 		StringCchPrintf(buf,500,_T("A problem was detected with the current file:\n\n%s\n\n")
 			_T("Do you want to save it anyway?"),m);
-		if(MessageBox(globals.hwndMain,buf,_T("Validity check"),MB_OKCANCEL|MB_ICONWARNING)!=IDOK)
+		if(twpng_MessageBox(globals.hwndMain,buf,_T("Validity check"),MB_OKCANCEL|MB_ICONWARNING)!=IDOK)
 		{
 			return 0;
 		}
@@ -2269,7 +2410,7 @@ int Png::split_idat(int n, int ssize, int repeat)
 
 	if(new_chunks>100) {
 		StringCchPrintf(buf,200,_T("This will create %d new chunks. Are you sure you want to continue?"),new_chunks);
-		i=MessageBox(globals.hwndMain,buf,_T("Warning"),MB_ICONQUESTION|MB_YESNO|MB_DEFBUTTON2);
+		i=twpng_MessageBox(globals.hwndMain,buf,_T("Warning"),MB_ICONQUESTION|MB_YESNO|MB_DEFBUTTON2);
 		if(i!=IDYES) return 0;
 	}
 
@@ -2722,14 +2863,165 @@ static void twpng_CreateUiFont(UINT dpi = 0)
 	}
 }
 
+// Subtle 1px border color for edit controls. Reads the active app theme so it looks
+// right whether the UI is dark (current default) or a light system theme.
+static COLORREF twpng_GetEditBorderColor()
+{
+	BOOL useLight = FALSE;
+	HKEY hKey;
+	if(RegOpenKeyEx(HKEY_CURRENT_USER,
+		_T("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+		0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+		DWORD val=0, sz=sizeof(val), type=0;
+		if(RegQueryValueEx(hKey, _T("AppsUseLightTheme"), NULL, &type,
+			(LPBYTE)&val, &sz)==ERROR_SUCCESS && type==REG_DWORD) {
+			useLight = (val != 0);
+		}
+		RegCloseKey(hKey);
+	}
+	return useLight ? RGB(171,171,171) : RGB(90,90,90);
+}
+
+// Paints a flat border over a control's non-client edge: outer 1px in the border
+// color, inner 1px in the dark UI background (covering the light sunken client edge).
+// Drawing only the perimeter leaves any scrollbar untouched.
+static void twpng_PaintFlatBorder(HWND hwnd, COLORREF borderColor)
+{
+	HDC hdc = GetWindowDC(hwnd);
+	if(!hdc) return;
+	RECT rc;
+	GetWindowRect(hwnd, &rc);
+	OffsetRect(&rc, -rc.left, -rc.top);
+	HBRUSH hbOuter = CreateSolidBrush(borderColor);
+	FrameRect(hdc, &rc, hbOuter);
+	DeleteObject(hbOuter);
+	if(globals.hUiBgBrush) {
+		InflateRect(&rc, -1, -1);
+		FrameRect(hdc, &rc, globals.hUiBgBrush);
+	}
+	ReleaseDC(hwnd, hdc);
+}
+
+// Draws a flat border around an edit control (color passed via dwRefData) and keeps it
+// visible across focus/hover repaints, which would otherwise restore the light edge.
+static LRESULT CALLBACK EditBorderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+	switch(msg) {
+	case WM_NCPAINT:
+	case WM_SETFOCUS:
+	case WM_KILLFOCUS:
+		{
+			LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
+			twpng_PaintFlatBorder(hwnd, (COLORREF)dwRefData);
+			return lr;
+		}
+	case WM_NCDESTROY:
+		RemoveWindowSubclass(hwnd, EditBorderSubclassProc, uIdSubclass);
+		break;
+	}
+	return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+// Owner-draws a radio button so its label uses light text in dark mode while still
+// drawing the modern themed (dark) radio glyph. The control's default proc still
+// handles checking/unchecking; we only take over painting.
+static LRESULT CALLBACK RadioSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+	(void)dwRefData;
+	switch(msg) {
+	case WM_NCDESTROY:
+		RemoveWindowSubclass(hwnd, RadioSubclassProc, uIdSubclass);
+		break;
+	case WM_SETFOCUS:
+	case WM_KILLFOCUS:
+		InvalidateRect(hwnd, NULL, FALSE);
+		break;
+	case WM_ERASEBKGND:
+		return 1;  // painted in WM_PAINT
+	case WM_PAINT:
+		{
+			PAINTSTRUCT ps;
+			HDC hdc = BeginPaint(hwnd, &ps);
+			RECT rc;
+			GetClientRect(hwnd, &rc);
+			if(globals.hUiBgBrush) FillRect(hdc, &rc, globals.hUiBgBrush);
+
+			BOOL checked = (SendMessage(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED);
+			BOOL enabled = IsWindowEnabled(hwnd);
+			int stateId = checked
+				? (enabled ? RBS_CHECKEDNORMAL   : RBS_CHECKEDDISABLED)
+				: (enabled ? RBS_UNCHECKEDNORMAL : RBS_UNCHECKEDDISABLED);
+
+			HTHEME ht = OpenThemeData(hwnd, _T("Button"));
+			SIZE gsz = {13,13};
+			if(ht) GetThemePartSize(ht, hdc, BP_RADIOBUTTON, stateId, NULL, TS_DRAW, &gsz);
+			int gy = (rc.bottom - gsz.cy)/2;
+			RECT gr = {rc.left, gy, rc.left+gsz.cx, gy+gsz.cy};
+			if(ht) DrawThemeBackground(ht, hdc, BP_RADIOBUTTON, stateId, &gr, NULL);
+			if(ht) CloseThemeData(ht);
+
+			RECT tr = rc;
+			tr.left = gr.right + 4;
+			TCHAR txt[256] = _T("");
+			GetWindowText(hwnd, txt, 256);
+			SetBkMode(hdc, TRANSPARENT);
+			SetTextColor(hdc, enabled ? RGB(255,255,255) : RGB(140,140,140));
+			HGDIOBJ oldFont = globals.hUiFont ? SelectObject(hdc, globals.hUiFont) : NULL;
+			DrawText(hdc, txt, -1, &tr, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+
+			if(GetFocus()==hwnd && txt[0]) {
+				RECT fr = tr;
+				fr.right = fr.left;
+				fr.top = 0; fr.bottom = 0;
+				DrawText(hdc, txt, -1, &fr, DT_LEFT|DT_SINGLELINE|DT_NOPREFIX|DT_CALCRECT);
+				RECT focus = tr;
+				focus.right = focus.left + (fr.right - fr.left) + 2;
+				InflateRect(&focus, 0, -1);
+				DrawFocusRect(hdc, &focus);
+			}
+			if(oldFont) SelectObject(hdc, oldFont);
+
+			EndPaint(hwnd, &ps);
+			return 0;
+		}
+	}
+	return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
 static BOOL CALLBACK DarkModeEnumChildProc(HWND hChild, LPARAM lParam)
 {
 	TCHAR classname[64];
 	GetClassName(hChild, classname, 64);
 
-	if(!_tcsicmp(classname, _T("Edit")) ||
-	   !_tcsicmp(classname, _T("ListBox")) ||
-	   !_tcsicmp(classname, _T("Button"))) {
+	if(!_tcsicmp(classname, _T("Edit"))) {
+		SetWindowTheme(hChild, _T("DarkMode_Explorer"), NULL);
+
+		// Skip the edit embedded inside a combo box; it shouldn't get its own border.
+		TCHAR parentClass[64] = _T("");
+		HWND hParent = GetParent(hChild);
+		if(hParent) GetClassName(hParent, parentClass, 64);
+
+		if(_tcsicmp(parentClass, _T("ComboBox"))) {
+			// Keep the sunken client edge (it preserves single-line text centering) but
+			// paint over its bright pixels with a flat dark border via the subclass.
+			SetWindowSubclass(hChild, EditBorderSubclassProc, 1,
+				(DWORD_PTR)twpng_GetEditBorderColor());
+			SetWindowPos(hChild, NULL, 0, 0, 0, 0,
+				SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
+		}
+	}
+	else if(!_tcsicmp(classname, _T("Button"))) {
+		SetWindowTheme(hChild, _T("DarkMode_Explorer"), NULL);
+		LONG bs = GetWindowLong(hChild, GWL_STYLE) & BS_TYPEMASK;
+		if(bs==BS_RADIOBUTTON || bs==BS_AUTORADIOBUTTON) {
+			// Themed radio buttons render their label black in dark mode, so owner-draw
+			// them: keep the dark themed glyph but paint the label in light text.
+			SetWindowSubclass(hChild, RadioSubclassProc, 1, 0);
+		}
+	}
+	else if(!_tcsicmp(classname, _T("ListBox"))) {
 		SetWindowTheme(hChild, _T("DarkMode_Explorer"), NULL);
 	}
 	else if(!_tcsicmp(classname, _T("ComboBox"))) {
@@ -2756,7 +3048,9 @@ void twpng_InitDarkDialog(HWND hwnd)
 	HMODULE hUxTheme = LoadLibrary(_T("uxtheme.dll"));
 	EnumChildWindows(hwnd, DarkModeEnumChildProc, (LPARAM)hUxTheme);
 	if(hUxTheme) FreeLibrary(hUxTheme);
-	InvalidateRect(hwnd, NULL, TRUE);
+	// Repaint the dialog AND every child control so freshly themed controls (radios,
+	// checkboxes, etc.) drop their stale light-theme text instead of keeping it.
+	RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_UPDATENOW|RDW_FRAME);
 }
 
 BOOL twpng_HandleDlgDarkMsg(UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR *result)
@@ -2860,6 +3154,21 @@ static LRESULT CALLBACK MainListSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 			}
 		}
 	}
+	else if(msg == WM_NCPAINT) {
+		// Draw a flat border around the chunk table, matching the edit borders.
+		LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
+		HDC hdc = GetWindowDC(hwnd);
+		if(hdc) {
+			RECT rc;
+			GetWindowRect(hwnd, &rc);
+			OffsetRect(&rc, -rc.left, -rc.top);
+			HBRUSH hbr = CreateSolidBrush(twpng_GetEditBorderColor());
+			FrameRect(hdc, &rc, hbr);
+			DeleteObject(hbr);
+			ReleaseDC(hwnd, hdc);
+		}
+		return lr;
+	}
 	else if(msg == WM_NCDESTROY) {
 		RemoveWindowSubclass(hwnd, MainListSubclassProc, 1);
 	}
@@ -2899,7 +3208,7 @@ static int CreateMainWindows(HWND hwnd)
 
 	globals.hwndMainList=CreateWindowEx(0,
 		WC_LISTVIEW, _T("main listview"),
-		WS_VISIBLE|WS_CHILD|LVS_REPORT|LVS_SHOWSELALWAYS|LVS_NOSORTHEADER,
+		WS_VISIBLE|WS_CHILD|WS_BORDER|LVS_REPORT|LVS_SHOWSELALWAYS|LVS_NOSORTHEADER,
 		r.left+12, r.top+TWPNG_TOP_MARGIN, r.right-r.left-24,
 		r.bottom-r.top-globals.stbar_height-TWPNG_TOP_MARGIN-12,
 		hwnd,NULL,globals.hInst,NULL);
@@ -3291,7 +3600,7 @@ static int OkToClosePNG()
 	if(png->m_dirty) {
 		SetForegroundWindow(globals.hwndMain);
 		StringCchPrintf(buf,500,_T("Save changes to %s?"),png->m_filename);
-		x=MessageBox(globals.hwndMain,buf,_T("TweakPNG"),MB_YESNOCANCEL|MB_ICONWARNING|MB_DEFBUTTON3);
+		x=twpng_MessageBox(globals.hwndMain,buf,_T("TweakPNG"),MB_YESNOCANCEL|MB_ICONWARNING|MB_DEFBUTTON3);
 		if(x==IDYES) {
 			ret=SavePng(globals.hwndMain);
 			return ret?1:0;
@@ -3751,7 +4060,7 @@ static void twpng_HandleAboutInitDialog(HWND hwnd)
 		TWEAKPNG_COPYRIGHT_DATE,globals.twpng_homepage,globals.twpng_homepage);
 
 	StringCchCat(buf,4000,_T("\r\nWindows 11 dark-mode fork:\r\n")
-		_T("<a href=\"https://") TWEAKPNG_FORK_HOMEPAGE _T("\">") TWEAKPNG_FORK_HOMEPAGE _T("</a>\r\n"));
+		_T("Website: <a href=\"") TWEAKPNG_FORK_HOMEPAGE _T("\">") TWEAKPNG_FORK_HOMEPAGE _T("</a>\r\n"));
 
 	StringCchCat(buf,4000,_T("\r\nThis program is distributed under the terms ")
 		_T("of the GNU General Public License, version 3 or higher. Please read the file tweakpng.txt for more information.\r\n"));
