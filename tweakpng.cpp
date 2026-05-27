@@ -1326,7 +1326,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 	INITCOMMONCONTROLSEX icc;
 	ZeroMemory(&icc,sizeof(icc));
 	icc.dwSize=sizeof(icc);
-	icc.dwICC=ICC_LISTVIEW_CLASSES|ICC_BAR_CLASSES|ICC_WIN95_CLASSES|ICC_USEREX_CLASSES;
+	icc.dwICC=ICC_LISTVIEW_CLASSES|ICC_BAR_CLASSES|ICC_WIN95_CLASSES|ICC_USEREX_CLASSES|ICC_LINK_CLASS;
 	InitCommonControlsEx(&icc);
 
 	globals.pngchunk_cf = RegisterClipboardFormat(_T("pngchunks"));
@@ -3729,8 +3729,8 @@ static void twpng_HandleAboutInitDialog(HWND hwnd)
 	TCHAR buf[4000],buf1[1000];
 	TCHAR buf2[200];
 
-	StringCbPrintf(buf1,sizeof(buf1),_T("Version %s %s %s %s %d-bit"),TWEAKPNG_VER_STRING,
-		SYM_MIDDOT,_T(__DATE__),SYM_MIDDOT,(int)(sizeof(void*)*8));
+	StringCbPrintf(buf1,sizeof(buf1),_T("Version %s %s %s %s %s %s %d-bit"),TWEAKPNG_VER_STRING,
+		SYM_MIDDOT,TWEAKPNG_FORK_VER_STRING,SYM_MIDDOT,_T(__DATE__),SYM_MIDDOT,(int)(sizeof(void*)*8));
 
 	//StringCbPrintf(buf2,sizeof(buf2),_T(" %s %s"),SYM_MIDDOT,_T(__DATE__));
 	//StringCbCat(buf1,sizeof(buf1),buf2);
@@ -3745,9 +3745,13 @@ static void twpng_HandleAboutInitDialog(HWND hwnd)
 #endif
 
 	StringCchPrintf(buf,4000,_T("TweakPNG %s A PNG image file manipulation utility\r\n\r\n%s\r\n")
-		_T("Copyright ") SYM_COPYRIGHT _T(" %s by Jason Summers\r\nWebsite: %s\r\n"),
+		_T("Copyright ") SYM_COPYRIGHT _T(" %s by Jason Summers\r\n")
+		_T("Website: <a href=\"%s\">%s</a>\r\n"),
 		SYM_MIDDOT,buf1,
-		TWEAKPNG_COPYRIGHT_DATE,globals.twpng_homepage);
+		TWEAKPNG_COPYRIGHT_DATE,globals.twpng_homepage,globals.twpng_homepage);
+
+	StringCchCat(buf,4000,_T("\r\nWindows 11 dark-mode fork:\r\n")
+		_T("<a href=\"https://") TWEAKPNG_FORK_HOMEPAGE _T("\">") TWEAKPNG_FORK_HOMEPAGE _T("</a>\r\n"));
 
 	StringCchCat(buf,4000,_T("\r\nThis program is distributed under the terms ")
 		_T("of the GNU General Public License, version 3 or higher. Please read the file tweakpng.txt for more information.\r\n"));
@@ -3779,6 +3783,18 @@ static INT_PTR CALLBACK DlgProcAbout(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 		twpng_InitDarkDialog(hwnd);
 		twpng_HandleAboutInitDialog(hwnd);
 		return 1;
+	case WM_NOTIFY:
+		{
+			LPNMHDR nmh = (LPNMHDR)lParam;
+			if(nmh->idFrom==IDC_ABOUTTEXT && (nmh->code==NM_CLICK || nmh->code==NM_RETURN)) {
+				PNMLINK pnml = (PNMLINK)lParam;
+				if(pnml->item.szUrl[0]) {
+					ShellExecuteW(hwnd, L"open", pnml->item.szUrl, NULL, NULL, SW_SHOWNORMAL);
+				}
+				return TRUE;
+			}
+		}
+		break;
 	case WM_COMMAND:
 		switch(id) {
 		case IDOK:

@@ -35,6 +35,10 @@
 #define TWEAKPNG_COPYRIGHT_DATE  _T("1999") SYM_ENDASH _T("2023")
 #define TWEAKPNG_HOMEPAGE        _T("https://entropymine.com/jason/tweakpng/")
 
+// This fork's own version, bumped independently of the upstream base version above.
+#define TWEAKPNG_FORK_VER_STRING _T("Dark Mode 1.0")
+#define TWEAKPNG_FORK_HOMEPAGE   _T("github.com/JappeF/tweakpng")
+
 #define ID_STBAR      19000
 //#define ID_IMGVIEWER     19100
 #define ID_UPDATEVIEWER  19101
