@@ -63,6 +63,13 @@
 #define UPDATE_DELAY 400  // milliseconds
 #define TWPNG_CMD_BAR_HEIGHT 54
 
+// Undocumented messages Windows sends when it wants the app to owner-draw the menu bar in dark mode
+#define WM_UAHDRAWMENU     0x0091
+#define WM_UAHDRAWMENUITEM 0x0092
+
+struct UAHMenu     { HMENU hmenu; HDC hdc; DWORD dwFlags; };
+struct UAHMenuItem { int iPosition; DWORD _metrics[8]; DRAWITEMSTRUCT dis; };
+
 static Png *png;
 Viewer *g_viewer;
 
@@ -3220,6 +3227,61 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 	id=LOWORD(wParam);
 
 	switch(msg) {
+	case WM_UAHDRAWMENU:
+		{
+			UAHMenu *p = (UAHMenu*)lParam;
+			if(globals.hUiBgBrush) {
+				MENUBARINFO mbi;
+				ZeroMemory(&mbi, sizeof(mbi));
+				mbi.cbSize = sizeof(mbi);
+				if(GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi)) {
+					RECT rcWnd;
+					GetWindowRect(hwnd, &rcWnd);
+					RECT rc = mbi.rcBar;
+					OffsetRect(&rc, -rcWnd.left, -rcWnd.top);
+					FillRect(p->hdc, &rc, globals.hUiBgBrush);
+				}
+			}
+			return TRUE;
+		}
+
+	case WM_UAHDRAWMENUITEM:
+		{
+			UAHMenuItem *p = (UAHMenuItem*)lParam;
+			DRAWITEMSTRUCT *pdis = &p->dis;
+			BOOL isHot = (pdis->itemState & ODS_HOTLIGHT) || (pdis->itemState & ODS_SELECTED);
+			HBRUSH hFill = NULL;
+			BOOL ownFill = FALSE;
+			COLORREF clrText;
+			if(pdis->itemState & ODS_GRAYED) {
+				hFill = globals.hUiBgBrush;
+				clrText = RGB(109, 109, 109);
+			} else if(isHot) {
+				hFill = CreateSolidBrush(RGB(55, 55, 55));
+				ownFill = TRUE;
+				clrText = RGB(255, 255, 255);
+			} else {
+				hFill = globals.hUiBgBrush;
+				clrText = RGB(210, 210, 210);
+			}
+			if(hFill) FillRect(pdis->hDC, &pdis->rcItem, hFill);
+			if(ownFill) DeleteObject(hFill);
+			MENUITEMINFO mii;
+			ZeroMemory(&mii, sizeof(mii));
+			mii.cbSize = sizeof(mii);
+			mii.fMask = MIIM_STRING;
+			TCHAR text[256] = {};
+			mii.dwTypeData = text;
+			mii.cch = 256;
+			GetMenuItemInfo(pdis->hwndItem, p->iPosition, TRUE, &mii);
+			SetBkMode(pdis->hDC, TRANSPARENT);
+			SetTextColor(pdis->hDC, clrText);
+			HGDIOBJ hOldFont = globals.hUiFont ? SelectObject(pdis->hDC, globals.hUiFont) : NULL;
+			DrawText(pdis->hDC, text, -1, &pdis->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+			if(hOldFont) SelectObject(pdis->hDC, hOldFont);
+			return TRUE;
+		}
+
 	case WM_ERASEBKGND:
 		if(globals.hUiBgBrush) {
 			GetClientRect(hwnd,&r);
@@ -3315,15 +3377,17 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 				HBRUSH hFill = NULL;
 
 				if(state & ODS_DISABLED) {
+					hFill = CreateSolidBrush(RGB(36, 36, 36));
 					textColor = RGB(100, 100, 100);
 				} else if(state & ODS_SELECTED) {
-					hFill = CreateSolidBrush(RGB(65, 65, 65));
+					hFill = CreateSolidBrush(RGB(68, 68, 68));
 					textColor = RGB(255, 255, 255);
 				} else if(state & ODS_HOTLIGHT) {
-					hFill = CreateSolidBrush(RGB(50, 50, 50));
+					hFill = CreateSolidBrush(RGB(58, 58, 58));
 					textColor = RGB(255, 255, 255);
 				} else {
-					textColor = RGB(210, 210, 210);
+					hFill = CreateSolidBrush(RGB(45, 45, 45));
+					textColor = RGB(220, 220, 220);
 				}
 
 				// Draw rounded fill only when needed (no border — flat Win11 style)
