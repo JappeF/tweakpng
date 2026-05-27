@@ -49,6 +49,7 @@
 #include <malloc.h>
 #include <stdarg.h>
 #include <commctrl.h>
+#include <uxtheme.h>
 
 #include "resource.h"
 #include "tweakpng.h"
@@ -60,6 +61,7 @@
 #include <strsafe.h>
 
 #define UPDATE_DELAY 400  // milliseconds
+#define TWPNG_CMD_BAR_HEIGHT 54
 
 static Png *png;
 Viewer *g_viewer;
@@ -72,6 +74,7 @@ static INT_PTR CALLBACK DlgProcPrefs(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
 static INT_PTR CALLBACK DlgProcSplitIDAT(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK DlgProcSetSig(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK DlgProcTools(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static void UpdateCommandBar();
 
 static int OkToClosePNG();
 static void SetTitle(Png *p);
@@ -291,6 +294,7 @@ done:
 		SetTimer(globals.hwndMain,1,UPDATE_DELAY,NULL);
 		globals.timer_set=1;
 	}
+	UpdateCommandBar();
 }
 
 void Png::modified()
@@ -993,7 +997,7 @@ static int RegisterClasses()
 	wc.hInstance = globals.hInst;
 	wc.hIcon = LoadIcon(globals.hInst,_T("ICONMAIN"));
 	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-	wc.hbrBackground = (HBRUSH)GetStockObject(DKGRAY_BRUSH);
+	wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
 	wc.lpszMenuName =  _T("MENUMAIN");
 	wc.lpszClassName = _T("TWEAKPNGMAIN");
 	if(!RegisterClass(&wc)) {
@@ -1241,6 +1245,21 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 	HACCEL hAccTable;
 	int p;
 
+	// Load uxtheme and force dark mode globally BEFORE any windows or controls are created
+	HMODULE hUxTheme = LoadLibrary(_T("uxtheme.dll"));
+	if(hUxTheme) {
+		typedef void (WINAPI *SetPreferredAppModeProc)(int);
+		typedef void (WINAPI *FlushMenuThemesProc)();
+		SetPreferredAppModeProc SetPreferredAppMode = (SetPreferredAppModeProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(135));
+		FlushMenuThemesProc FlushMenuThemes = (FlushMenuThemesProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(136));
+		if(SetPreferredAppMode) {
+			SetPreferredAppMode(2); // ForceDark = 2
+		}
+		if(FlushMenuThemes) {
+			FlushMenuThemes();
+		}
+	}
+
 	ZeroMemory(&globals,sizeof(struct globals_struct));
 
 	globals.hInst=hInstance;
@@ -1271,7 +1290,11 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 	globals.vsize=TWPNG_VS_FIT;
 	globals.viewer_correct_nonsquare=1;
 
-	InitCommonControls();
+	INITCOMMONCONTROLSEX icc;
+	ZeroMemory(&icc,sizeof(icc));
+	icc.dwSize=sizeof(icc);
+	icc.dwICC=ICC_LISTVIEW_CLASSES|ICC_BAR_CLASSES|ICC_WIN95_CLASSES|ICC_USEREX_CLASSES;
+	InitCommonControlsEx(&icc);
 
 	globals.pngchunk_cf = RegisterClipboardFormat(_T("pngchunks"));
 
@@ -2512,28 +2535,251 @@ static void DblClickOnList()
 	}
 }
 
+static void twpng_ApplyModernWindowStyle(HWND hwnd)
+{
+	typedef HRESULT (WINAPI *DwmSetWindowAttributeProc)(HWND,DWORD,LPCVOID,DWORD);
+	HMODULE hDwm;
+	DwmSetWindowAttributeProc pDwmSetWindowAttribute;
+	BOOL use_dark_title;
+	int corner_pref;
+	int backdrop_type;
+
+	// Enable deep dark mode for main window
+	HMODULE hUxTheme = LoadLibrary(_T("uxtheme.dll"));
+	if(hUxTheme) {
+		typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
+		typedef void (WINAPI *FlushMenuThemesProc)();
+		AllowDarkModeForWindowProc AllowDarkModeForWindow = (AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
+		FlushMenuThemesProc FlushMenuThemes = (FlushMenuThemesProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(136));
+		if(AllowDarkModeForWindow) {
+			AllowDarkModeForWindow(hwnd, TRUE);
+		}
+		if(FlushMenuThemes) {
+			FlushMenuThemes();
+		}
+		// Set dark window theme class to force standard Win32 menu bar to go dark
+		SetWindowTheme(hwnd, _T("DarkMode_Explorer"), NULL);
+		FreeLibrary(hUxTheme);
+	}
+
+	hDwm=LoadLibrary(_T("dwmapi.dll"));
+	if(!hDwm) return;
+	pDwmSetWindowAttribute=(DwmSetWindowAttributeProc)GetProcAddress(hDwm,"DwmSetWindowAttribute");
+	if(pDwmSetWindowAttribute) {
+		use_dark_title=TRUE;
+		pDwmSetWindowAttribute(hwnd,20,&use_dark_title,sizeof(use_dark_title));
+		corner_pref=2;
+		pDwmSetWindowAttribute(hwnd,33,&corner_pref,sizeof(corner_pref));
+		backdrop_type=2;
+		pDwmSetWindowAttribute(hwnd,38,&backdrop_type,sizeof(backdrop_type));
+	}
+	FreeLibrary(hDwm);
+
+	// Force menu bar to redraw using the dark theme attributes
+	DrawMenuBar(hwnd);
+}
+
+static void twpng_CreateUiFont(UINT dpi = 0)
+{
+	NONCLIENTMETRICS ncm;
+	BOOL ok = FALSE;
+
+	ZeroMemory(&ncm,sizeof(ncm));
+	ncm.cbSize=sizeof(ncm);
+
+	if(dpi > 0) {
+		typedef BOOL (WINAPI *SPI4DPI_t)(UINT, UINT, PVOID, UINT, UINT);
+		SPI4DPI_t pSPI4DPI = (SPI4DPI_t)GetProcAddress(
+			GetModuleHandle(_T("user32.dll")), "SystemParametersInfoForDpi");
+		if(pSPI4DPI) ok = pSPI4DPI(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, dpi);
+	}
+	if(!ok) ok = SystemParametersInfo(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+
+	if(ok) {
+		if(globals.hUiFont) DeleteObject(globals.hUiFont);
+		globals.hUiFont = CreateFontIndirect(&ncm.lfMessageFont);
+	}
+}
+
+static HWND twpng_CreateCommandButton(HWND parent, int id, const TCHAR *text, int x, int width)
+{
+	HWND hwnd;
+
+	hwnd=CreateWindowEx(0,_T("BUTTON"),text,
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_CLIPSIBLINGS|BS_OWNERDRAW,
+		x,12,width,30,parent,(HMENU)(INT_PTR)id,globals.hInst,NULL);
+	if(hwnd) {
+		SendMessage(hwnd,WM_SETFONT,(WPARAM)globals.hUiFont,TRUE);
+		HMODULE hUxTheme = LoadLibrary(_T("uxtheme.dll"));
+		if(hUxTheme) {
+			typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
+			AllowDarkModeForWindowProc AllowDarkModeForWindow = (AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
+			if(AllowDarkModeForWindow) AllowDarkModeForWindow(hwnd, TRUE);
+			FreeLibrary(hUxTheme);
+		}
+	}
+	return hwnd;
+}
+
+static BOOL CALLBACK DarkModeEnumChildProc(HWND hChild, LPARAM lParam)
+{
+	TCHAR classname[64];
+	GetClassName(hChild, classname, 64);
+
+	if(!_tcsicmp(classname, _T("Edit")) ||
+	   !_tcsicmp(classname, _T("ListBox")) ||
+	   !_tcsicmp(classname, _T("Button"))) {
+		SetWindowTheme(hChild, _T("DarkMode_Explorer"), NULL);
+	}
+	else if(!_tcsicmp(classname, _T("ComboBox"))) {
+		SetWindowTheme(hChild, _T("DarkMode_CFD"), NULL);
+	}
+
+	HMODULE hUxTheme = (HMODULE)lParam;
+	if(hUxTheme) {
+		typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
+		AllowDarkModeForWindowProc AllowDarkModeForWindow =
+			(AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
+		if(AllowDarkModeForWindow) AllowDarkModeForWindow(hChild, TRUE);
+	}
+
+	if(globals.hUiFont) {
+		SendMessage(hChild, WM_SETFONT, (WPARAM)globals.hUiFont, TRUE);
+	}
+	return TRUE;
+}
+
+void twpng_InitDarkDialog(HWND hwnd)
+{
+	twpng_ApplyModernWindowStyle(hwnd);
+	HMODULE hUxTheme = LoadLibrary(_T("uxtheme.dll"));
+	EnumChildWindows(hwnd, DarkModeEnumChildProc, (LPARAM)hUxTheme);
+	if(hUxTheme) FreeLibrary(hUxTheme);
+	InvalidateRect(hwnd, NULL, TRUE);
+}
+
+BOOL twpng_HandleDlgDarkMsg(UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR *result)
+{
+	(void)lParam;
+	switch(msg) {
+	case WM_CTLCOLORDLG:
+	case WM_CTLCOLORSTATIC:
+		if(globals.hUiBgBrush) {
+			SetBkColor((HDC)wParam, RGB(32, 32, 32));
+			SetTextColor((HDC)wParam, RGB(255, 255, 255));
+			*result = (INT_PTR)globals.hUiBgBrush;
+			return TRUE;
+		}
+		break;
+	case WM_CTLCOLOREDIT:
+	case WM_CTLCOLORLISTBOX:
+		if(globals.hDarkEditBrush) {
+			SetBkColor((HDC)wParam, RGB(45, 45, 45));
+			SetTextColor((HDC)wParam, RGB(220, 220, 220));
+			*result = (INT_PTR)globals.hDarkEditBrush;
+			return TRUE;
+		}
+		break;
+	case WM_CTLCOLORBTN:
+		if(globals.hUiBgBrush) {
+			SetBkColor((HDC)wParam, RGB(32, 32, 32));
+			SetTextColor((HDC)wParam, RGB(255, 255, 255));
+			*result = (INT_PTR)globals.hUiBgBrush;
+			return TRUE;
+		}
+		break;
+	}
+	return FALSE;
+}
+
+static void UpdateCommandBar()
+{
+	int has_png;
+	int sel_count;
+
+	if(!globals.hwndMain) return;
+	has_png = png ? 1 : 0;
+	sel_count = (png && globals.hwndMainList) ? ListView_GetSelectedCount(globals.hwndMainList) : 0;
+	if(GetDlgItem(globals.hwndMain,ID_SAVE)) EnableWindow(GetDlgItem(globals.hwndMain,ID_SAVE),has_png);
+	if(GetDlgItem(globals.hwndMain,ID_SAVEAS)) EnableWindow(GetDlgItem(globals.hwndMain,ID_SAVEAS),has_png);
+	if(GetDlgItem(globals.hwndMain,ID_EDITCHUNK)) EnableWindow(GetDlgItem(globals.hwndMain,ID_EDITCHUNK),sel_count==1);
+	if(GetDlgItem(globals.hwndMain,ID_DELCHUNK)) EnableWindow(GetDlgItem(globals.hwndMain,ID_DELCHUNK),sel_count>0);
+}
+
+static void LayoutMainWindows(HWND hwnd)
+{
+	RECT r;
+
+	GetClientRect(hwnd,&r);
+	if(globals.hwndCmdBar) {
+		SetWindowPos(globals.hwndCmdBar,NULL,
+			r.left,r.top,r.right-r.left,globals.cmdbar_height,
+			SWP_NOZORDER);
+	}
+	if(globals.hwndStBar) {
+		SetWindowPos(globals.hwndStBar,NULL,
+			r.left,r.bottom-globals.stbar_height,r.right-r.left,globals.stbar_height,
+			SWP_NOZORDER);
+	}
+	if(globals.hwndMainList) {
+		SetWindowPos(globals.hwndMainList,NULL,
+			r.left+12,r.top+globals.cmdbar_height,r.right-r.left-24,
+			r.bottom-r.top-globals.stbar_height-globals.cmdbar_height-12,
+			SWP_NOZORDER);
+	}
+}
+
 static int CreateMainWindows(HWND hwnd)
 {
 	LV_COLUMN lvc;
 	RECT r;
 	DWORD style;
 	TCHAR textbuf[50];
+	int x;
 
-	globals.hwndStBar=CreateStatusWindow(WS_CHILD|WS_VISIBLE,_T(""),hwnd,ID_STBAR);
+	// Create a modern flat dark status bar using a STATIC text control
+	globals.hwndStBar=CreateWindowEx(0,_T("STATIC"),_T("No file loaded"),
+		WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE,
+		0,0,10,24,hwnd,(HMENU)ID_STBAR,globals.hInst,NULL);
 	if(!globals.hwndStBar) {
 		mesg(MSG_S,_T("Cannot create status bar"));
 		return 0;
 	}
+	HMODULE hUxTheme = LoadLibrary(_T("uxtheme.dll"));
+	if(hUxTheme) {
+		typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
+		AllowDarkModeForWindowProc AllowDarkModeForWindow = (AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
+		if(AllowDarkModeForWindow) AllowDarkModeForWindow(globals.hwndStBar, TRUE);
+		FreeLibrary(hUxTheme);
+	}
+	SendMessage(globals.hwndStBar, WM_SETFONT, (WPARAM)globals.hUiFont, TRUE);
 
-	GetWindowRect(globals.hwndStBar,&r);
-	globals.stbar_height=r.bottom-r.top;
+	globals.stbar_height=24;
+	globals.cmdbar_height=TWPNG_CMD_BAR_HEIGHT;
+	twpng_CreateUiFont();
+	globals.hUiBgBrush=CreateSolidBrush(RGB(32,32,32));
+	globals.hDarkEditBrush=CreateSolidBrush(RGB(45,45,45));
+
+	globals.hwndCmdBar=NULL;
+
+	x=12;
+	twpng_CreateCommandButton(hwnd,ID_NEW,_T("New"),x,72); x+=80;
+	twpng_CreateCommandButton(hwnd,ID_OPEN,_T("Open"),x,72); x+=80;
+	twpng_CreateCommandButton(hwnd,ID_SAVE,_T("Save"),x,72); x+=80;
+	twpng_CreateCommandButton(hwnd,ID_SAVEAS,_T("Save As"),x,86); x+=98;
+	twpng_CreateCommandButton(hwnd,ID_EDITCHUNK,_T("Edit Chunk"),x,104); x+=116;
+	twpng_CreateCommandButton(hwnd,ID_DELCHUNK,_T("Delete"),x,82); x+=94;
+#ifdef TWPNG_SUPPORT_VIEWER
+	twpng_CreateCommandButton(hwnd,ID_IMGVIEWER,_T("Viewer"),x,82);
+#endif
 
 	GetClientRect(hwnd,&r);
 
-	globals.hwndMainList=CreateWindowEx(WS_EX_CLIENTEDGE,
+	globals.hwndMainList=CreateWindowEx(0,
 		WC_LISTVIEW, _T("main listview"),
 		WS_VISIBLE|WS_CHILD|LVS_REPORT|LVS_SHOWSELALWAYS|LVS_NOSORTHEADER,
-		r.left, r.top, r.right-r.left, r.bottom-r.top-globals.stbar_height,
+		r.left+12, r.top+globals.cmdbar_height, r.right-r.left-24,
+		r.bottom-r.top-globals.stbar_height-globals.cmdbar_height-12,
 		hwnd,NULL,globals.hInst,NULL);
 	if(!globals.hwndMainList) {
 		mesg(MSG_S,_T("Cannot create listview control"));
@@ -2541,7 +2787,37 @@ static int CreateMainWindows(HWND hwnd)
 	}
 
 	style=ListView_GetExtendedListViewStyle(globals.hwndMainList);
-	ListView_SetExtendedListViewStyle(globals.hwndMainList,style|LVS_EX_FULLROWSELECT);
+	ListView_SetExtendedListViewStyle(globals.hwndMainList,style|LVS_EX_FULLROWSELECT|0x00010000|LVS_EX_HEADERDRAGDROP);
+	SendMessage(globals.hwndMainList,WM_SETFONT,(WPARAM)globals.hUiFont,TRUE);
+	SetWindowTheme(globals.hwndMainList,_T("DarkMode_Explorer"),NULL);
+	ListView_SetBkColor(globals.hwndMainList, RGB(32,32,32));
+	ListView_SetTextBkColor(globals.hwndMainList, RGB(32,32,32));
+	ListView_SetTextColor(globals.hwndMainList, RGB(255,255,255));
+	
+	hUxTheme = LoadLibrary(_T("uxtheme.dll"));
+	if(hUxTheme) {
+		typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
+		AllowDarkModeForWindowProc AllowDarkModeForWindow = (AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
+		if(AllowDarkModeForWindow) AllowDarkModeForWindow(globals.hwndMainList, TRUE);
+		FreeLibrary(hUxTheme);
+	}
+
+	HWND hwndHeader = ListView_GetHeader(globals.hwndMainList);
+	if (hwndHeader) {
+		SetWindowTheme(hwndHeader, _T("DarkMode_ItemsView"), NULL);
+		hUxTheme = LoadLibrary(_T("uxtheme.dll"));
+		if(hUxTheme) {
+			typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
+			AllowDarkModeForWindowProc AllowDarkModeForWindow = (AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
+			if(AllowDarkModeForWindow) AllowDarkModeForWindow(hwndHeader, TRUE);
+			FreeLibrary(hUxTheme);
+		}
+	}
+
+	globals.hListRowImageList=ImageList_Create(1,28,ILC_COLOR32,1,1);
+	if(globals.hListRowImageList) {
+		ListView_SetImageList(globals.hwndMainList,(HIMAGELIST)globals.hListRowImageList,LVSIL_SMALL);
+	}
 
 	ZeroMemory((void*)&lvc, sizeof(LV_COLUMN));
 	lvc.mask= LVCF_FMT | LVCF_TEXT | LVCF_WIDTH;
@@ -2578,6 +2854,8 @@ static int CreateMainWindows(HWND hwnd)
 	lvc.fmt= LVCFMT_LEFT;
 	ListView_InsertColumn(globals.hwndMainList,4,&lvc);
 
+	UpdateCommandBar();
+	LayoutMainWindows(hwnd);
 	return 1;
 }
 
@@ -2943,10 +3221,15 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 	switch(msg) {
 	case WM_ERASEBKGND:
+		if(globals.hUiBgBrush) {
+			GetClientRect(hwnd,&r);
+			FillRect((HDC)wParam,&r,globals.hUiBgBrush);
+		}
 		return 1;
 
 	case WM_CREATE:
 		globals.hwndMain=hwnd;
+		twpng_ApplyModernWindowStyle(hwnd);
 
 		// create the listview control, statusbar, etc.
 		if(!CreateMainWindows(hwnd)) return -1;  // abort program
@@ -2972,6 +3255,22 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		SaveSettings();
 		if(png) delete png;
 		png=NULL;
+		if(globals.hListRowImageList) {
+			ImageList_Destroy((HIMAGELIST)globals.hListRowImageList);
+			globals.hListRowImageList=NULL;
+		}
+		if(globals.hUiFont) {
+			DeleteObject(globals.hUiFont);
+			globals.hUiFont=NULL;
+		}
+		if(globals.hUiBgBrush) {
+			DeleteObject(globals.hUiBgBrush);
+			globals.hUiBgBrush=NULL;
+		}
+		if(globals.hDarkEditBrush) {
+			DeleteObject(globals.hDarkEditBrush);
+			globals.hDarkEditBrush=NULL;
+		}
 		PostQuitMessage(0);
 		return 0;
 
@@ -2987,13 +3286,91 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		return 0;
 
 	case WM_SIZE:
-		GetClientRect(hwnd,&r);
-		SetWindowPos(globals.hwndStBar,NULL,  // this is probably not the right way to do this...
-			r.bottom-globals.stbar_height,r.left,r.right,r.bottom,
-			SWP_NOZORDER);
-		SetWindowPos(globals.hwndMainList,NULL,
-			r.left,r.top,r.right-r.left,r.bottom-r.top-globals.stbar_height,
-			SWP_NOZORDER);
+		// this is probably not the right way to do this...
+		LayoutMainWindows(hwnd);
+		return 0;
+
+	case WM_CTLCOLORSTATIC:
+		if(((HWND)lParam==globals.hwndCmdBar || (HWND)lParam==globals.hwndStBar) && globals.hUiBgBrush) {
+			SetBkColor((HDC)wParam,RGB(32,32,32));
+			SetTextColor((HDC)wParam,RGB(255,255,255));
+			return (LRESULT)globals.hUiBgBrush;
+		}
+		return 0;
+
+	case WM_DRAWITEM:
+		{
+			LPDRAWITEMSTRUCT pdis = (LPDRAWITEMSTRUCT)lParam;
+			if (pdis->CtlType == ODT_BUTTON) {
+				HDC hdc = pdis->hDC;
+				RECT rect = pdis->rcItem;
+				UINT state = pdis->itemState;
+
+				HBRUSH hBrush;
+				COLORREF textColor = RGB(255, 255, 255);
+				COLORREF borderColor = RGB(75, 75, 75);
+
+				if (state & ODS_DISABLED) {
+					hBrush = CreateSolidBrush(RGB(38, 38, 38));
+					textColor = RGB(110, 110, 110);
+					borderColor = RGB(50, 50, 50);
+				} else if (state & ODS_SELECTED) {
+					hBrush = CreateSolidBrush(RGB(55, 55, 55));
+					borderColor = RGB(130, 130, 130);
+				} else {
+					hBrush = CreateSolidBrush(RGB(45, 45, 45));
+				}
+
+				HPEN hPen = CreatePen(PS_SOLID, 1, borderColor);
+				HGDIOBJ hOldPen = SelectObject(hdc, hPen);
+				HGDIOBJ hOldBrush = SelectObject(hdc, hBrush);
+
+				RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 6, 6);
+
+				TCHAR text[128];
+				GetWindowText(pdis->hwndItem, text, 128);
+				SetBkMode(hdc, TRANSPARENT);
+				SetTextColor(hdc, textColor);
+
+				HGDIOBJ hOldFont = NULL;
+				if (globals.hUiFont) {
+					hOldFont = SelectObject(hdc, globals.hUiFont);
+				}
+
+				DrawText(hdc, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+				if (hOldFont) SelectObject(hdc, hOldFont);
+				SelectObject(hdc, hOldBrush);
+				SelectObject(hdc, hOldPen);
+				DeleteObject(hBrush);
+				DeleteObject(hPen);
+
+				return TRUE;
+			}
+		}
+		break;
+
+	case WM_DPICHANGED:
+		{
+			UINT newDpi = HIWORD(wParam);
+			RECT *prc = (RECT*)lParam;
+			SetWindowPos(hwnd, NULL, prc->left, prc->top,
+				prc->right - prc->left, prc->bottom - prc->top,
+				SWP_NOZORDER | SWP_NOACTIVATE);
+			twpng_CreateUiFont(newDpi);
+			if(globals.hwndMainList) SendMessage(globals.hwndMainList, WM_SETFONT, (WPARAM)globals.hUiFont, TRUE);
+			if(globals.hwndStBar) SendMessage(globals.hwndStBar, WM_SETFONT, (WPARAM)globals.hUiFont, TRUE);
+			HWND hChild = GetWindow(hwnd, GW_CHILD);
+			while(hChild) {
+				if(hChild != globals.hwndMainList && hChild != globals.hwndStBar) {
+					SendMessage(hChild, WM_SETFONT, (WPARAM)globals.hUiFont, TRUE);
+					InvalidateRect(hChild, NULL, TRUE);
+				}
+				hChild = GetWindow(hChild, GW_HWNDNEXT);
+			}
+			LayoutMainWindows(hwnd);
+			InvalidateRect(hwnd, NULL, TRUE);
+		}
 		return 0;
 
 	case WM_DROPFILES:
@@ -3101,6 +3478,9 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			LPNMHDR  lpnmh = (LPNMHDR) lParam;
 			if(!png) break;
 			switch(lpnmh->code) {
+			case LVN_ITEMCHANGED:
+				UpdateCommandBar();
+				break;
 			case NM_DBLCLK:
 			case NM_RETURN:
 				if(lpnmh->hwndFrom==globals.hwndMainList) {
@@ -3319,6 +3699,7 @@ static INT_PTR CALLBACK DlgProcAbout(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
 	switch (msg) {
 	case WM_INITDIALOG:
+		twpng_InitDarkDialog(hwnd);
 		twpng_HandleAboutInitDialog(hwnd);
 		return 1;
 	case WM_COMMAND:
@@ -3328,6 +3709,10 @@ static INT_PTR CALLBACK DlgProcAbout(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 			EndDialog(hwnd, 0);
 			return 1;
 		}
+	}
+	{
+		INT_PTR darkResult = 0;
+		if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &darkResult)) return darkResult;
 	}
 	return 0;
 }
@@ -3537,6 +3922,7 @@ static INT_PTR CALLBACK DlgProcPrefs(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 			prctx->remember_menusetting=x;
 		}
 
+		twpng_InitDarkDialog(hwnd);
 		return 1;
 	}
 	else {
@@ -3575,6 +3961,10 @@ static INT_PTR CALLBACK DlgProcPrefs(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 			return 1;
 		}
 	}
+	{
+		INT_PTR darkResult = 0;
+		if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &darkResult)) return darkResult;
+	}
 	return 0;
 }
 
@@ -3592,7 +3982,7 @@ static INT_PTR CALLBACK DlgProcSplitIDAT(HWND hwnd, UINT msg, WPARAM wParam, LPA
 		SetWindowLongPtr(hwnd,DWLP_USER,lParam);
 		StringCchPrintf(buf,500,_T("Size in bytes of first section (0") SYM_ENDASH _T("%d)"),ch->length);
 		SetDlgItemText(hwnd,IDC_SPLIT_TEXT,buf);
-
+		twpng_InitDarkDialog(hwnd);
 		return 1;
 	}
 	else {
@@ -3634,6 +4024,10 @@ static INT_PTR CALLBACK DlgProcSplitIDAT(HWND hwnd, UINT msg, WPARAM wParam, LPA
 			return 1;
 		}
 	}
+	{
+		INT_PTR darkResult = 0;
+		if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &darkResult)) return darkResult;
+	}
 	return 0;
 }
 
@@ -3657,7 +4051,7 @@ static INT_PTR CALLBACK DlgProcSetSig(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 		default: x=0;
 		}
 		if(x) CheckDlgButton(hwnd,x,BST_CHECKED);
-
+		twpng_InitDarkDialog(hwnd);
 		return 1;
 
 	}
@@ -3691,6 +4085,10 @@ static INT_PTR CALLBACK DlgProcSetSig(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 			EndDialog(hwnd, 0);
 			return 1;
 		}
+	}
+	{
+		INT_PTR darkResult = 0;
+		if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &darkResult)) return darkResult;
 	}
 	return 0;
 }
@@ -3749,6 +4147,7 @@ static INT_PTR CALLBACK DlgProcTools(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 			SendDlgItemMessage(hwnd,toolsc[i],EM_LIMITTEXT,MAX_TOOL_CMD   -1,0);
 			SendDlgItemMessage(hwnd,toolsp[i],EM_LIMITTEXT,MAX_TOOL_PARAMS-1,0);
 		}
+		twpng_InitDarkDialog(hwnd);
 		return 1;
 
 //	case WM_DESTROY:
@@ -3780,6 +4179,10 @@ static INT_PTR CALLBACK DlgProcTools(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 			EndDialog(hwnd, 0);
 			return 1;
 		}
+	}
+	{
+		INT_PTR darkResult = 0;
+		if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &darkResult)) return darkResult;
 	}
 	return 0;
 }

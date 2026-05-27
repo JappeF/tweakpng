@@ -2315,7 +2315,9 @@ static INT_PTR CALLBACK DlgProcEdit_tEXt(HWND hwnd, UINT msg, WPARAM wParam, LPA
 		ecctx = (struct edit_chunk_ctx*)lParam;
 		if(!ecctx) return 1;
 		SetWindowLongPtr(hwnd,DWLP_USER,lParam);
-		return Dlg_tEXt_InitDialog(hwnd,ecctx->ch,&ecctx->tdm);
+		INT_PTR r = Dlg_tEXt_InitDialog(hwnd,ecctx->ch,&ecctx->tdm);
+		twpng_InitDarkDialog(hwnd);
+		return r;
 	}
 	else {
 		ecctx = (struct edit_chunk_ctx*)GetWindowLongPtr(hwnd,DWLP_USER);
@@ -2378,6 +2380,10 @@ static INT_PTR CALLBACK DlgProcEdit_tEXt(HWND hwnd, UINT msg, WPARAM wParam, LPA
 			EndDialog(hwnd, 0);
 			return 1;
 		}
+	}
+	{
+		INT_PTR darkResult = 0;
+		if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &darkResult)) return darkResult;
 	}
 	return 0;
 }
@@ -2674,6 +2680,7 @@ INT_PTR CALLBACK Chunk::DlgProcEditChunk(HWND hwnd, UINT msg, WPARAM wParam, LPA
 			SetDlgItemInt(hwnd,IDC_EDIT3,(UINT)ch->data[8],FALSE);
 			break;
 		}
+		twpng_InitDarkDialog(hwnd);
 		return 1;
 	}
 	else {
@@ -2942,6 +2949,10 @@ INT_PTR CALLBACK Chunk::DlgProcEditChunk(HWND hwnd, UINT msg, WPARAM wParam, LPA
 			EndDialog(hwnd, 0);
 			return 1;
 		}
+	}
+	{
+		INT_PTR darkResult = 0;
+		if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &darkResult)) return darkResult;
 	}
 	return 0;
 }
@@ -3313,6 +3324,7 @@ static INT_PTR CALLBACK DlgProcEdit_PLTE(HWND hwnd, UINT msg, WPARAM wParam, LPA
 		twpng_SetWindowPos(hwnd,&globals.window_prefs.plte);
 		if(globals.window_prefs.plte.max) ShowWindow(hwnd,SW_SHOWMAXIMIZED);
 
+		twpng_InitDarkDialog(hwnd);
 		return TRUE;
 	}
 	else {
@@ -3432,6 +3444,10 @@ static INT_PTR CALLBACK DlgProcEdit_PLTE(HWND hwnd, UINT msg, WPARAM wParam, LPA
 			return 1;
 		}
 	}
+	{
+		INT_PTR darkResult = 0;
+		if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &darkResult)) return darkResult;
+	}
 	return 0;
 }
 
@@ -3449,6 +3465,7 @@ static INT_PTR CALLBACK DlgProcGetInt(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 		SetWindowText(hwnd,st->title);
 		SetDlgItemText(hwnd,IDC_LABEL1,st->label);
 		SetDlgItemInt(hwnd,IDC_EDIT1,st->value,TRUE);
+		twpng_InitDarkDialog(hwnd);
 		return 1;
 	}
 	else {
@@ -3471,6 +3488,10 @@ static INT_PTR CALLBACK DlgProcGetInt(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 			return 1;
 		}
 		break;
+	}
+	{
+		INT_PTR darkResult = 0;
+		if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &darkResult)) return darkResult;
 	}
 	return 0;
 }

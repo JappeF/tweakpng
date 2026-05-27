@@ -204,9 +204,15 @@ struct globals_struct {
 	struct windowprefs_struct window_prefs;
 	HWND hwndMainList;
 	HWND hwndStBar;
+	HWND hwndCmdBar;
 	int stbar_height;
+	int cmdbar_height;
 	int timer_set;
 	UINT pngchunk_cf;    // registered clipboard format
+	HFONT hUiFont;
+	HBRUSH hUiBgBrush;
+	HBRUSH hDarkEditBrush;
+	HANDLE hListRowImageList;
 
 	const TCHAR *twpng_homepage;
 	const TCHAR *twpng_reg_key;
@@ -246,6 +252,9 @@ int twpng_StoreWindowPos(HWND hwnd, struct windowpos_struct *q);
 void twpng_SetWindowPos(HWND hwnd, const struct windowpos_struct *q);
 
 void update_viewer();
+
+void twpng_InitDarkDialog(HWND hwnd);
+BOOL twpng_HandleDlgDarkMsg(UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR *result);
 
 int convert_tchar_to_latin1(const TCHAR *src, int srclen,
 								   char **pdst, int *pdstlen);
