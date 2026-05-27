@@ -3,12 +3,8 @@
 #ifndef TWPNG_CONFIG_H
 #define TWPNG_CONFIG_H
 
-#ifdef UNICODE
-#define _WIN32_WINNT   0x0500
-#else
-#define WINVER         0x0410
-#define _WIN32_WINDOWS 0x0410
-#endif
+#define WINVER         0x0A00
+#define _WIN32_WINNT   0x0A00
 
 #include <SDKDDKVer.h>
 
