@@ -204,9 +204,7 @@ struct globals_struct {
 	struct windowprefs_struct window_prefs;
 	HWND hwndMainList;
 	HWND hwndStBar;
-	HWND hwndCmdBar;
 	int stbar_height;
-	int cmdbar_height;
 	int timer_set;
 	UINT pngchunk_cf;    // registered clipboard format
 	HFONT hUiFont;

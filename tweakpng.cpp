@@ -61,14 +61,42 @@
 #include <strsafe.h>
 
 #define UPDATE_DELAY 400  // milliseconds
-#define TWPNG_CMD_BAR_HEIGHT 54
+#define TWPNG_TOP_MARGIN 8
 
-// Undocumented messages Windows sends when it wants the app to owner-draw the menu bar in dark mode
+// Undocumented messages Windows sends when it wants the app to owner-draw the menu bar in dark mode.
+// Struct layout must match the (undocumented) UAH menu structures exactly; see
+// adzm/win32-custom-menubar-aero-theme. The DRAWITEMSTRUCT is the FIRST member of the
+// item struct, not the last.
 #define WM_UAHDRAWMENU     0x0091
 #define WM_UAHDRAWMENUITEM 0x0092
 
-struct UAHMenu     { HMENU hmenu; HDC hdc; DWORD dwFlags; };
-struct UAHMenuItem { int iPosition; DWORD _metrics[8]; DRAWITEMSTRUCT dis; };
+typedef union tagUAHMENUITEMMETRICS {
+	struct { DWORD cx; DWORD cy; } rgsizeBar[2];
+	struct { DWORD cx; DWORD cy; } rgsizePopup[4];
+} UAHMENUITEMMETRICS;
+
+typedef struct tagUAHMENUPOPUPMETRICS {
+	DWORD rgcx[4];
+	DWORD fUpdateMaxWidths : 2;
+} UAHMENUPOPUPMETRICS;
+
+typedef struct tagUAHMENU {
+	HMENU hmenu;
+	HDC hdc;
+	DWORD dwFlags;
+} UAHMENU;
+
+typedef struct tagUAHMENUITEM {
+	int iPosition;
+	UAHMENUITEMMETRICS umim;
+	UAHMENUPOPUPMETRICS umpm;
+} UAHMENUITEM;
+
+typedef struct tagUAHDRAWMENUITEM {
+	DRAWITEMSTRUCT dis;
+	UAHMENU um;
+	UAHMENUITEM umi;
+} UAHDRAWMENUITEM;
 
 static Png *png;
 Viewer *g_viewer;
@@ -81,7 +109,6 @@ static INT_PTR CALLBACK DlgProcPrefs(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
 static INT_PTR CALLBACK DlgProcSplitIDAT(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK DlgProcSetSig(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK DlgProcTools(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-static void UpdateCommandBar();
 
 static int OkToClosePNG();
 static void SetTitle(Png *p);
@@ -301,7 +328,6 @@ done:
 		SetTimer(globals.hwndMain,1,UPDATE_DELAY,NULL);
 		globals.timer_set=1;
 	}
-	UpdateCommandBar();
 }
 
 void Png::modified()
@@ -2608,26 +2634,6 @@ static void twpng_CreateUiFont(UINT dpi = 0)
 	}
 }
 
-static HWND twpng_CreateCommandButton(HWND parent, int id, const TCHAR *text, int x, int width)
-{
-	HWND hwnd;
-
-	hwnd=CreateWindowEx(0,_T("BUTTON"),text,
-		WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_CLIPSIBLINGS|BS_OWNERDRAW,
-		x,12,width,30,parent,(HMENU)(INT_PTR)id,globals.hInst,NULL);
-	if(hwnd) {
-		SendMessage(hwnd,WM_SETFONT,(WPARAM)globals.hUiFont,TRUE);
-		HMODULE hUxTheme = LoadLibrary(_T("uxtheme.dll"));
-		if(hUxTheme) {
-			typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
-			AllowDarkModeForWindowProc AllowDarkModeForWindow = (AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
-			if(AllowDarkModeForWindow) AllowDarkModeForWindow(hwnd, TRUE);
-			FreeLibrary(hUxTheme);
-		}
-	}
-	return hwnd;
-}
-
 static BOOL CALLBACK DarkModeEnumChildProc(HWND hChild, LPARAM lParam)
 {
 	TCHAR classname[64];
@@ -2699,30 +2705,11 @@ BOOL twpng_HandleDlgDarkMsg(UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR *res
 	return FALSE;
 }
 
-static void UpdateCommandBar()
-{
-	int has_png;
-	int sel_count;
-
-	if(!globals.hwndMain) return;
-	has_png = png ? 1 : 0;
-	sel_count = (png && globals.hwndMainList) ? ListView_GetSelectedCount(globals.hwndMainList) : 0;
-	if(GetDlgItem(globals.hwndMain,ID_SAVE)) EnableWindow(GetDlgItem(globals.hwndMain,ID_SAVE),has_png);
-	if(GetDlgItem(globals.hwndMain,ID_SAVEAS)) EnableWindow(GetDlgItem(globals.hwndMain,ID_SAVEAS),has_png);
-	if(GetDlgItem(globals.hwndMain,ID_EDITCHUNK)) EnableWindow(GetDlgItem(globals.hwndMain,ID_EDITCHUNK),sel_count==1);
-	if(GetDlgItem(globals.hwndMain,ID_DELCHUNK)) EnableWindow(GetDlgItem(globals.hwndMain,ID_DELCHUNK),sel_count>0);
-}
-
 static void LayoutMainWindows(HWND hwnd)
 {
 	RECT r;
 
 	GetClientRect(hwnd,&r);
-	if(globals.hwndCmdBar) {
-		SetWindowPos(globals.hwndCmdBar,NULL,
-			r.left,r.top,r.right-r.left,globals.cmdbar_height,
-			SWP_NOZORDER);
-	}
 	if(globals.hwndStBar) {
 		SetWindowPos(globals.hwndStBar,NULL,
 			r.left,r.bottom-globals.stbar_height,r.right-r.left,globals.stbar_height,
@@ -2730,10 +2717,65 @@ static void LayoutMainWindows(HWND hwnd)
 	}
 	if(globals.hwndMainList) {
 		SetWindowPos(globals.hwndMainList,NULL,
-			r.left+12,r.top+globals.cmdbar_height,r.right-r.left-24,
-			r.bottom-r.top-globals.stbar_height-globals.cmdbar_height-12,
+			r.left+12,r.top+TWPNG_TOP_MARGIN,r.right-r.left-24,
+			r.bottom-r.top-globals.stbar_height-TWPNG_TOP_MARGIN-12,
 			SWP_NOZORDER);
 	}
+}
+
+// Subclass on the main listview so we can intercept the header control's
+// NM_CUSTOMDRAW (the header notifies its parent, the listview, not the main window).
+// DarkMode_ItemsView does not reliably set the header text color on Windows 11, so we
+// owner-draw each header item with a dark background and light text.
+static LRESULT CALLBACK MainListSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+	(void)uIdSubclass; (void)dwRefData;
+	if(msg == WM_NOTIFY) {
+		LPNMHDR pnmh = (LPNMHDR)lParam;
+		HWND hwndHdr = ListView_GetHeader(hwnd);
+		if(pnmh->code == NM_CUSTOMDRAW && pnmh->hwndFrom == hwndHdr) {
+			LPNMCUSTOMDRAW pcd = (LPNMCUSTOMDRAW)lParam;
+			switch(pcd->dwDrawStage) {
+			case CDDS_PREPAINT:
+				return CDRF_NOTIFYITEMDRAW;
+			case CDDS_ITEMPREPAINT:
+				{
+					HBRUSH hHdrBg = CreateSolidBrush(RGB(40, 40, 40));
+					FillRect(pcd->hdc, &pcd->rc, hHdrBg);
+					DeleteObject(hHdrBg);
+
+					TCHAR szHdrText[256] = {};
+					HDITEM hdi = {};
+					hdi.mask = HDI_TEXT;
+					hdi.pszText = szHdrText;
+					hdi.cchTextMax = 255;
+					Header_GetItem(hwndHdr, (int)pcd->dwItemSpec, &hdi);
+
+					SetBkMode(pcd->hdc, TRANSPARENT);
+					SetTextColor(pcd->hdc, RGB(200, 200, 200));
+					HGDIOBJ hOldFont = globals.hUiFont ? SelectObject(pcd->hdc, globals.hUiFont) : NULL;
+					RECT rcTxt = pcd->rc;
+					InflateRect(&rcTxt, -6, 0);
+					DrawText(pcd->hdc, szHdrText, -1, &rcTxt, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+					if(hOldFont) SelectObject(pcd->hdc, hOldFont);
+
+					HPEN hSepPen = CreatePen(PS_SOLID, 1, RGB(60, 60, 60));
+					HGDIOBJ hOldPen = SelectObject(pcd->hdc, hSepPen);
+					MoveToEx(pcd->hdc, pcd->rc.right - 1, pcd->rc.top + 4, NULL);
+					LineTo(pcd->hdc, pcd->rc.right - 1, pcd->rc.bottom - 4);
+					SelectObject(pcd->hdc, hOldPen);
+					DeleteObject(hSepPen);
+
+					return CDRF_SKIPDEFAULT;
+				}
+			}
+		}
+	}
+	else if(msg == WM_NCDESTROY) {
+		RemoveWindowSubclass(hwnd, MainListSubclassProc, 1);
+	}
+	return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
 static int CreateMainWindows(HWND hwnd)
@@ -2742,9 +2784,11 @@ static int CreateMainWindows(HWND hwnd)
 	RECT r;
 	DWORD style;
 	TCHAR textbuf[50];
-	int x;
 
 	// Create a modern flat dark status bar using a STATIC text control
+	globals.stbar_height=24;
+	twpng_CreateUiFont();
+
 	globals.hwndStBar=CreateWindowEx(0,_T("STATIC"),_T("No file loaded"),
 		WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE,
 		0,0,10,24,hwnd,(HMENU)ID_STBAR,globals.hInst,NULL);
@@ -2760,33 +2804,16 @@ static int CreateMainWindows(HWND hwnd)
 		FreeLibrary(hUxTheme);
 	}
 	SendMessage(globals.hwndStBar, WM_SETFONT, (WPARAM)globals.hUiFont, TRUE);
-
-	globals.stbar_height=24;
-	globals.cmdbar_height=TWPNG_CMD_BAR_HEIGHT;
-	twpng_CreateUiFont();
 	globals.hUiBgBrush=CreateSolidBrush(RGB(32,32,32));
 	globals.hDarkEditBrush=CreateSolidBrush(RGB(45,45,45));
-
-	globals.hwndCmdBar=NULL;
-
-	x=12;
-	twpng_CreateCommandButton(hwnd,ID_NEW,_T("New"),x,72); x+=80;
-	twpng_CreateCommandButton(hwnd,ID_OPEN,_T("Open"),x,72); x+=80;
-	twpng_CreateCommandButton(hwnd,ID_SAVE,_T("Save"),x,72); x+=80;
-	twpng_CreateCommandButton(hwnd,ID_SAVEAS,_T("Save As"),x,86); x+=98;
-	twpng_CreateCommandButton(hwnd,ID_EDITCHUNK,_T("Edit Chunk"),x,104); x+=116;
-	twpng_CreateCommandButton(hwnd,ID_DELCHUNK,_T("Delete"),x,82); x+=94;
-#ifdef TWPNG_SUPPORT_VIEWER
-	twpng_CreateCommandButton(hwnd,ID_IMGVIEWER,_T("Viewer"),x,82);
-#endif
 
 	GetClientRect(hwnd,&r);
 
 	globals.hwndMainList=CreateWindowEx(0,
 		WC_LISTVIEW, _T("main listview"),
 		WS_VISIBLE|WS_CHILD|LVS_REPORT|LVS_SHOWSELALWAYS|LVS_NOSORTHEADER,
-		r.left+12, r.top+globals.cmdbar_height, r.right-r.left-24,
-		r.bottom-r.top-globals.stbar_height-globals.cmdbar_height-12,
+		r.left+12, r.top+TWPNG_TOP_MARGIN, r.right-r.left-24,
+		r.bottom-r.top-globals.stbar_height-TWPNG_TOP_MARGIN-12,
 		hwnd,NULL,globals.hInst,NULL);
 	if(!globals.hwndMainList) {
 		mesg(MSG_S,_T("Cannot create listview control"));
@@ -2796,6 +2823,7 @@ static int CreateMainWindows(HWND hwnd)
 	style=ListView_GetExtendedListViewStyle(globals.hwndMainList);
 	ListView_SetExtendedListViewStyle(globals.hwndMainList,style|LVS_EX_FULLROWSELECT|0x00010000|LVS_EX_HEADERDRAGDROP);
 	SendMessage(globals.hwndMainList,WM_SETFONT,(WPARAM)globals.hUiFont,TRUE);
+	SetWindowSubclass(globals.hwndMainList, MainListSubclassProc, 1, 0);
 	SetWindowTheme(globals.hwndMainList,_T("DarkMode_Explorer"),NULL);
 	ListView_SetBkColor(globals.hwndMainList, RGB(32,32,32));
 	ListView_SetTextBkColor(globals.hwndMainList, RGB(32,32,32));
@@ -2861,7 +2889,6 @@ static int CreateMainWindows(HWND hwnd)
 	lvc.fmt= LVCFMT_LEFT;
 	ListView_InsertColumn(globals.hwndMainList,4,&lvc);
 
-	UpdateCommandBar();
 	LayoutMainWindows(hwnd);
 	return 1;
 }
@@ -3229,57 +3256,78 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 	switch(msg) {
 	case WM_UAHDRAWMENU:
 		{
-			UAHMenu *p = (UAHMenu*)lParam;
-			if(globals.hUiBgBrush) {
-				MENUBARINFO mbi;
-				ZeroMemory(&mbi, sizeof(mbi));
-				mbi.cbSize = sizeof(mbi);
-				if(GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi)) {
-					RECT rcWnd;
-					GetWindowRect(hwnd, &rcWnd);
-					RECT rc = mbi.rcBar;
-					OffsetRect(&rc, -rcWnd.left, -rcWnd.top);
-					FillRect(p->hdc, &rc, globals.hUiBgBrush);
-				}
-			}
+			UAHMENU *pUDM = (UAHMENU*)lParam;
+			MENUBARINFO mbi = {};
+			mbi.cbSize = sizeof(mbi);
+			GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi);
+			RECT rcWindow = {};
+			GetWindowRect(hwnd, &rcWindow);
+			RECT rc = mbi.rcBar;
+			OffsetRect(&rc, -rcWindow.left, -rcWindow.top);
+			if(globals.hUiBgBrush) FillRect(pUDM->hdc, &rc, globals.hUiBgBrush);
 			return TRUE;
 		}
 
 	case WM_UAHDRAWMENUITEM:
 		{
-			UAHMenuItem *p = (UAHMenuItem*)lParam;
-			DRAWITEMSTRUCT *pdis = &p->dis;
-			BOOL isHot = (pdis->itemState & ODS_HOTLIGHT) || (pdis->itemState & ODS_SELECTED);
-			HBRUSH hFill = NULL;
-			BOOL ownFill = FALSE;
-			COLORREF clrText;
-			if(pdis->itemState & ODS_GRAYED) {
-				hFill = globals.hUiBgBrush;
-				clrText = RGB(109, 109, 109);
-			} else if(isHot) {
-				hFill = CreateSolidBrush(RGB(55, 55, 55));
-				ownFill = TRUE;
-				clrText = RGB(255, 255, 255);
+			UAHDRAWMENUITEM *pUDMI = (UAHDRAWMENUITEM*)lParam;
+			HDC hdc = pUDMI->um.hdc;
+			RECT rcItem = pUDMI->dis.rcItem;
+
+			BOOL created = FALSE;
+			HBRUSH hFill;
+			if(pUDMI->dis.itemState & (ODS_HOTLIGHT | ODS_SELECTED)) {
+				hFill = CreateSolidBrush(RGB(58, 58, 58));
+				created = TRUE;
 			} else {
 				hFill = globals.hUiBgBrush;
-				clrText = RGB(210, 210, 210);
 			}
-			if(hFill) FillRect(pdis->hDC, &pdis->rcItem, hFill);
-			if(ownFill) DeleteObject(hFill);
-			MENUITEMINFO mii;
-			ZeroMemory(&mii, sizeof(mii));
+			FillRect(hdc, &rcItem, hFill ? hFill : (HBRUSH)GetStockObject(BLACK_BRUSH));
+			if(created) DeleteObject(hFill);
+
+			MENUITEMINFO mii = {};
 			mii.cbSize = sizeof(mii);
 			mii.fMask = MIIM_STRING;
-			TCHAR text[256] = {};
-			mii.dwTypeData = text;
-			mii.cch = 256;
-			GetMenuItemInfo(pdis->hwndItem, p->iPosition, TRUE, &mii);
-			SetBkMode(pdis->hDC, TRANSPARENT);
-			SetTextColor(pdis->hDC, clrText);
-			HGDIOBJ hOldFont = globals.hUiFont ? SelectObject(pdis->hDC, globals.hUiFont) : NULL;
-			DrawText(pdis->hDC, text, -1, &pdis->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-			if(hOldFont) SelectObject(pdis->hDC, hOldFont);
+			TCHAR szMenuText[256] = {};
+			mii.dwTypeData = szMenuText;
+			mii.cch = 255;
+			GetMenuItemInfo(pUDMI->um.hmenu, pUDMI->umi.iPosition, TRUE, &mii);
+
+			DWORD dtFlags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
+			if(pUDMI->dis.itemState & ODS_NOACCEL) dtFlags |= DT_HIDEPREFIX;
+
+			SetBkMode(hdc, TRANSPARENT);
+			SetTextColor(hdc, (pUDMI->dis.itemState & ODS_GRAYED) ? RGB(120, 120, 120) : RGB(220, 220, 220));
+			HGDIOBJ hOldFont2 = globals.hUiFont ? SelectObject(hdc, globals.hUiFont) : NULL;
+			DrawText(hdc, szMenuText, -1, &rcItem, dtFlags);
+			if(hOldFont2) SelectObject(hdc, hOldFont2);
 			return TRUE;
+		}
+
+	case WM_NCACTIVATE:
+	case WM_NCPAINT:
+		{
+			// Let Windows draw the title bar / frame normally, then paint over the
+			// 1px light line Windows leaves at the bottom of the (dark) menu bar.
+			LRESULT lr = DefWindowProc(hwnd, msg, wParam, lParam);
+			if(globals.hUiBgBrush) {
+				MENUBARINFO mbi = {};
+				mbi.cbSize = sizeof(mbi);
+				if(GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi)) {
+					RECT rcWindow = {};
+					GetWindowRect(hwnd, &rcWindow);
+					RECT rcLine = mbi.rcBar;
+					OffsetRect(&rcLine, -rcWindow.left, -rcWindow.top);
+					rcLine.top = rcLine.bottom;
+					rcLine.bottom = rcLine.top + 1;
+					HDC hdc = GetWindowDC(hwnd);
+					if(hdc) {
+						FillRect(hdc, &rcLine, globals.hUiBgBrush);
+						ReleaseDC(hwnd, hdc);
+					}
+				}
+			}
+			return lr;
 		}
 
 	case WM_ERASEBKGND:
@@ -3353,72 +3401,12 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		return 0;
 
 	case WM_CTLCOLORSTATIC:
-		if(((HWND)lParam==globals.hwndCmdBar || (HWND)lParam==globals.hwndStBar) && globals.hUiBgBrush) {
+		if((HWND)lParam==globals.hwndStBar && globals.hUiBgBrush) {
 			SetBkColor((HDC)wParam,RGB(32,32,32));
 			SetTextColor((HDC)wParam,RGB(255,255,255));
 			return (LRESULT)globals.hUiBgBrush;
 		}
 		return 0;
-
-	case WM_DRAWITEM:
-		{
-			LPDRAWITEMSTRUCT pdis = (LPDRAWITEMSTRUCT)lParam;
-			if (pdis->CtlType == ODT_BUTTON) {
-				HDC hdc = pdis->hDC;
-				RECT rc = pdis->rcItem;
-				UINT state = pdis->itemState;
-
-				// Always fill the whole rect with the window bg first — this
-				// eliminates the gray artifacts that appear in the corners
-				// outside the RoundRect clip region.
-				if(globals.hUiBgBrush) FillRect(hdc, &rc, globals.hUiBgBrush);
-
-				COLORREF textColor;
-				HBRUSH hFill = NULL;
-
-				if(state & ODS_DISABLED) {
-					hFill = CreateSolidBrush(RGB(36, 36, 36));
-					textColor = RGB(100, 100, 100);
-				} else if(state & ODS_SELECTED) {
-					hFill = CreateSolidBrush(RGB(68, 68, 68));
-					textColor = RGB(255, 255, 255);
-				} else if(state & ODS_HOTLIGHT) {
-					hFill = CreateSolidBrush(RGB(58, 58, 58));
-					textColor = RGB(255, 255, 255);
-				} else {
-					hFill = CreateSolidBrush(RGB(45, 45, 45));
-					textColor = RGB(220, 220, 220);
-				}
-
-				// Draw rounded fill only when needed (no border — flat Win11 style)
-				if(hFill) {
-					HPEN hNullPen = (HPEN)GetStockObject(NULL_PEN);
-					HGDIOBJ hOldPen = SelectObject(hdc, hNullPen);
-					HGDIOBJ hOldBrush = SelectObject(hdc, hFill);
-					RoundRect(hdc, rc.left, rc.top, rc.right+1, rc.bottom+1, 6, 6);
-					SelectObject(hdc, hOldPen);
-					SelectObject(hdc, hOldBrush);
-					DeleteObject(hFill);
-				}
-
-				TCHAR text[128];
-				GetWindowText(pdis->hwndItem, text, 128);
-				SetBkMode(hdc, TRANSPARENT);
-				SetTextColor(hdc, textColor);
-				HGDIOBJ hOldFont = globals.hUiFont ? SelectObject(hdc, globals.hUiFont) : NULL;
-				DrawText(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-				if(hOldFont) SelectObject(hdc, hOldFont);
-
-				if(state & ODS_FOCUS) {
-					RECT rcFocus = rc;
-					InflateRect(&rcFocus, -3, -3);
-					DrawFocusRect(hdc, &rcFocus);
-				}
-
-				return TRUE;
-			}
-		}
-		break;
 
 	case WM_DPICHANGED:
 		{
@@ -3548,9 +3536,6 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			LPNMHDR  lpnmh = (LPNMHDR) lParam;
 			if(!png) break;
 			switch(lpnmh->code) {
-			case LVN_ITEMCHANGED:
-				UpdateCommandBar();
-				break;
 			case NM_DBLCLK:
 			case NM_RETURN:
 				if(lpnmh->hwndFrom==globals.hwndMainList) {
