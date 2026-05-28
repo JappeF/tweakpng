@@ -119,6 +119,9 @@ static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx);
 // and status bar can show its info. Empty when no foreign file is loaded.
 static TCHAR g_foreignFn[MAX_PATH] = _T("");
 static int   g_foreignKind = 0;   // 1=JPEG, 2=WebP
+// Generator badge for the currently-loaded foreign file, or NULL. Cached on open so the
+// status bar doesn't re-read EXIF on every redraw.
+static const TCHAR *g_foreignGen = NULL;
 
 static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK DlgProcAbout(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -475,6 +478,19 @@ static const TCHAR *twpng_DetectGenerator(Png *p)
 	return NULL;
 }
 
+// Same detection but against raw EXIF text (JPEG/WebP). The text we get from the readers
+// is usually A1111-formatted (Steps:/Negative prompt:) — even ComfyUI workflows are
+// converted to A1111 shape by twpng_ParseComfyJson before being shown. NovelAI's
+// "Comment" is JSON with "prompt" + "uc" keys.
+static const TCHAR *twpng_DetectGeneratorFromText(const TCHAR *t)
+{
+	if(!t) return NULL;
+	if(_tcsstr(t,_T("\"class_type\"")))               return _T("ComfyUI");
+	if(_tcsstr(t,_T("\"uc\"")) && _tcsstr(t,_T("\"prompt\""))) return _T("NovelAI");
+	if(_tcsstr(t,_T("Steps:")))                        return _T("Stable Diffusion ") SYM_MIDDOT _T(" A1111");
+	return NULL;
+}
+
 static void update_status_bar_and_viewer()
 {
 	TCHAR buf[200];
@@ -498,6 +514,11 @@ static void update_status_bar_and_viewer()
 			else                     fbuf[0]=0;
 			TCHAR sbuf[200];
 			StringCchPrintf(sbuf,200,_T("%s file size: %u bytes%s"),label,(unsigned int)fs,fbuf);
+			if(g_foreignGen) {
+				TCHAR genbuf[80];
+				StringCchPrintf(genbuf,80,_T("     %s  %s"),SYM_MIDDOT,g_foreignGen);
+				StringCchCat(sbuf,200,genbuf);
+			}
 			SetWindowText(globals.hwndStBar,sbuf);
 		} else {
 			SetWindowText(globals.hwndStBar,_T("No file loaded"));
@@ -1683,12 +1704,23 @@ static void SetTitle(Png *p)
 static void ClosePngDocument()
 {
 	if(png) {
+		// ~Png() also closes the modeless editor and AI params viewer.
 		delete png;
 		png=NULL;
+	}
+	else if(g_foreignFn[0]) {
+		// No Png to destruct, but the AI params viewer may still be up showing this
+		// foreign file's text — close it for consistency with the PNG case.
+		twpng_CloseAIParamsView();
 	}
 	if(globals.hwndMainList) {
 		ListView_DeleteAllItems(globals.hwndMainList);
 	}
+	// Also clear any foreign (JPEG/WebP) state so the title, status bar, and the
+	// View AI Parameters menu item all return to the "no document" state together.
+	g_foreignFn[0] = 0;
+	g_foreignKind = 0;
+	g_foreignGen = NULL;
 	SetTitle(NULL);
 	update_viewer_filename();
 	update_status_bar_and_viewer();
@@ -1754,6 +1786,11 @@ static int OpenPngByName(const TCHAR *fn)
 	else if(got>=12 && !memcmp(hdr,"RIFF",4) && !memcmp(hdr+8,"WEBP",4)) foreignKind = 2;
 
 	if(png) { delete png; png=NULL; }
+	else if(g_foreignFn[0]) {
+		// Replacing a foreign file with another file — ~Png() didn't run, so close any
+		// stale AI viewer left over from the previous foreign file.
+		twpng_CloseAIParamsView();
+	}
 	ListView_DeleteAllItems(globals.hwndMainList);
 
 	if(foreignKind) {
@@ -1776,17 +1813,20 @@ static int OpenPngByName(const TCHAR *fn)
 		TCHAR *aiText = NULL;
 		if(foreignKind==1) twpng_ReadJpegAIParams(fn, &aiText);
 		else               twpng_ReadWebpAIParams(fn, &aiText);
+		g_foreignGen = twpng_DetectGeneratorFromText(aiText);
 		if(aiText) {
 			if(globals.open_params_on_load)
 				twpng_OpenAIParamsViewerFromText(aiText, lstrlen(aiText));
 			free(aiText);
 		}
+		update_status_bar_and_viewer();   // refresh now that g_foreignGen is set
 		return 1;
 	}
 
 	// PNG / MNG / JNG path.
 	g_foreignFn[0] = 0;
 	g_foreignKind = 0;
+	g_foreignGen = NULL;
 	png = new Png(fn, fn);
 
 	if(!png->m_valid) {
@@ -5076,7 +5116,7 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			int sel;
 
 			// commands requiring an open file
-			static const UINT cmdlist1[] = {ID_SAVE,ID_SAVEAS,ID_CLOSEDOCUMENT,
+			static const UINT cmdlist1[] = {ID_SAVE,ID_SAVEAS,
 				ID_NEWTEXT,ID_NEWBKGD,ID_NEWGAMA,ID_NEWIEND,ID_NEWPHYS,
 				ID_NEWIHDR,
 				ID_NEWSRGB,ID_NEWTIME,ID_NEWCHRM,ID_NEWTRNS,ID_NEWSBIT,
@@ -5133,6 +5173,10 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			// "View AI Parameters" also works for a loaded JPEG/WebP (no PNG document).
 			if(!png && g_foreignFn[0])
 				EnableMenuItem(m,ID_VIEWAIPARAMS,MF_BYCOMMAND|MF_ENABLED);
+
+			// Close Document is enabled for either a PNG or a foreign (JPEG/WebP) file.
+			EnableMenuItem(m,ID_CLOSEDOCUMENT,MF_BYCOMMAND |
+				((png || g_foreignFn[0]) ? MF_ENABLED : MF_GRAYED));
 
 			x= MF_BYCOMMAND | ( (sel==1)?MF_ENABLED:MF_GRAYED );
 			for(i=0;cmdlist2[i];i++) {
@@ -5224,6 +5268,11 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 					ClosePngDocument();
 				}
 			}
+			else if(g_foreignFn[0]) {
+				// No PNG document, just a foreign (JPEG/WebP) file — nothing to prompt
+				// about (we never modify the file), so close immediately.
+				ClosePngDocument();
+			}
 			return 0;
 
 		case ID_PREFS:
@@ -5242,6 +5291,12 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 		case ID_READAIFROMFILE:
 			twpng_ReadAIFromFile(hwnd);
+			return 0;
+
+		// View AI Parameters works both for an open PNG and for a loaded JPEG/WebP
+		// (g_foreignFn). twpng_ViewAIParams handles both cases internally.
+		case ID_VIEWAIPARAMS:
+			twpng_ViewAIParams(hwnd);
 			return 0;
 
 		case ID_ABOUT:
@@ -5288,7 +5343,6 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		case ID_SAVEAS:       SavePngAs(hwnd);   return 0;
 		case ID_CHECKPNG:     png->check_validity(0);  return 0;
 		case ID_STRIPAIMETA:  StripAIMetadata(); return 0;
-		case ID_VIEWAIPARAMS: twpng_ViewAIParams(hwnd); return 0;
 
 		case ID_EDITCHUNK:    DblClickOnList();  return 0;
 		case ID_DELCHUNK:     DeleteChunks();    return 0;

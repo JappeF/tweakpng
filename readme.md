@@ -11,15 +11,20 @@ goals:
 message boxes, and color picker, plus PerMonitorV2 DPI awareness, rounded corners, and a
 Mica backdrop.
 
-**Quality-of-life features for AI-generated images** (Automatic1111 / Stable Diffusion):
+**Quality-of-life features for AI-generated images** (Automatic1111, ComfyUI, NovelAI,
+Civitai):
 
-- **Auto-open parameters** — opening an image that has a `parameters` tEXt chunk pops up
-  a viewer automatically (toggle in Options → Preferences).
+- **Auto-open parameters** — opening an image that has AI generation parameters pops
+  up a viewer automatically (toggle in Options → Preferences). Works for PNG
+  (`parameters`/`prompt` tEXt chunks) and for JPEG/WebP (EXIF UserComment).
 - **AI Generation Parameters viewer** (Edit → View AI Parameters) — splits the metadata
   into Prompt, Negative prompt, and Settings, each with a Copy button (plus Copy All).
+- **Read AI parameters from JPEG/WebP** (Tools menu) — one-shot file picker that opens
+  the parsed viewer without loading the file as a document.
 - **Strip AI Metadata** (Edit → Strip AI Metadata) — removes prompt/seed/workflow/EXIF
-  metadata so an image can be shared privately.
-- **Generator badge** — the status bar identifies A1111, ComfyUI, or NovelAI images.
+  metadata so an image can be shared privately. PNG only.
+- **Generator badge** — the status bar identifies A1111, ComfyUI, or NovelAI images
+  (both for PNG and for foreign JPEG/WebP files).
 
 Building
 --------

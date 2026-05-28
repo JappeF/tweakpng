@@ -109,20 +109,69 @@ safe regardless.
 
 ## A1111 / AI image features
 
-All keyed off text chunks (mainly tEXt keyword `parameters`):
+For PNGs, all keyed off text chunks (mainly tEXt keyword `parameters`); for JPEG/WebP,
+keyed off the EXIF UserComment tag (see "Foreign image formats" below).
 
 - **Auto-open** (`twpng_AutoOpenParamsText`, end of `OpenPngByName`): if the Preferences
   option `open_params_on_load` is set (default on), opening an image with a `parameters`
   chunk pops up the parsed viewer. The option persists in the registry (`open_params`).
+  The foreign (JPEG/WebP) path triggers the same auto-open from its branch in
+  `OpenPngByName`.
 - **Parsed viewer** (`DLG_AIPARAMS`): splits the A1111 string into Prompt / Negative
   prompt / Settings with copy buttons. Parser `twpng_ParseA1111` splits on the
   `Negative prompt:` and `Steps:` line markers; `twpng_SettingsToLines` reformats the
   settings one-per-line while respecting double-quoted values (e.g. `Lora hashes: "..."`).
+- **ComfyUI parser** (`twpng_ParseComfyJson`): ComfyUI stores its graph as JSON in
+  a `prompt` tEXt chunk or EXIF UserComment; this walks the node graph with brace-aware
+  substring scans (not a full JSON parser) and synthesizes an A1111-style string the
+  parsed viewer can consume.
+- **View AI Parameters** (`twpng_ViewAIParams`, Edit + Tools menus): re-opens the parsed
+  viewer for the current document. Handles both PNG (looks up the `parameters`/`prompt`
+  chunk) and foreign files (re-reads EXIF via `twpng_ReadJpegAIParams` /
+  `twpng_ReadWebpAIParams`). Menu enabling lives in `WM_INITMENU` and explicitly
+  re-enables the item when only a foreign file is loaded (the standard `cmdlist1` loop
+  greys everything that requires `png != NULL`).
+- **Read AI parameters from JPEG/WebP** (Tools menu, `ID_READAIFROMFILE`): one-shot file
+  picker that pops the parsed viewer without loading the file as a document.
 - **Strip AI Metadata** (`StripAIMetadata`, Edit menu): removes AI metadata chunks
   (`twpng_IsAIMetadataChunk`: parameters/workflow/prompt/NovelAI keys/`eXIf`...) after a
-  confirm, for sharing without leaking prompts.
-- **Generator badge** (`twpng_DetectGenerator`): appends "Stable Diffusion · A1111" /
-  "ComfyUI" / "NovelAI" to the status-bar size line.
+  confirm, for sharing without leaking prompts. PNG-only — JPEG/WebP EXIF stripping is
+  not implemented.
+- **Generator badge**: `twpng_DetectGenerator(Png*)` walks tEXt keywords for the PNG
+  path; `twpng_DetectGeneratorFromText(const TCHAR*)` sniffs the raw EXIF text
+  (`"class_type"` → ComfyUI, `"uc"`+`"prompt"` → NovelAI, `Steps:` → A1111) for the
+  foreign path. The result is cached in `g_foreignGen` at load time and appended to the
+  status-bar size line.
+
+## Foreign image formats (JPEG / WebP)
+
+The app is still PNG-first — no decoder, no chunk table, no editing for JPEG/WebP. But
+opening one of these files from the menu/drag-drop/command line goes through a
+metadata-only path so AI prompts can be inspected.
+
+- **State**: three globals in `tweakpng.cpp` — `g_foreignFn` (path), `g_foreignKind`
+  (1=JPEG, 2=WebP), `g_foreignGen` (cached badge string). When set, `png == NULL` but
+  the title bar, status bar, View AI Parameters, and Close Document all treat the
+  foreign file as "the current document."
+- **Open path**: `OpenPngByName` sniffs the first bytes (`FF D8` for JPEG,
+  `RIFF....WEBP` for WebP), routes foreign files through a branch that sets the globals,
+  updates the title/status, runs the EXIF reader, and triggers auto-open if enabled.
+- **Close path**: `ClosePngDocument` clears all three globals and also calls
+  `twpng_CloseAIParamsView()` (the PNG path gets that for free from `Png::~Png`).
+  `OpenPngByName` does the same close-stale-viewer dance when replacing one foreign
+  file with another.
+- **EXIF readers**: `twpng_ReadJpegAIParams` walks JPEG markers via `twpng_FindJpegExif`
+  to locate the APP1 EXIF segment; `twpng_ReadWebpAIParams` walks RIFF chunks for an
+  `EXIF` chunk. Both call `twpng_ExtractFromExifTiff` → TIFF IFD walker → ExifIFD
+  (`0x8769`) → UserComment (`0x9286`) → `twpng_DecodeUserComment`.
+- **Civitai quirks the readers handle**: (1) some writers (Civitai, A1111 exporters)
+  emit a tiny APP1 segment whose declared length doesn't cover the actual UserComment
+  payload — `twpng_FindJpegExif` deliberately reports the TIFF length as
+  `len - tiffOff` (rest of file) rather than the segment's declared length, so the TIFF
+  parser can still reach the data. (2) UTF-16 UserComment byte order can differ from
+  the enclosing TIFF byte order, so `twpng_DecodeUserComment` auto-detects BE vs LE
+  from the count of zero bytes at even vs odd positions instead of trusting the TIFF
+  header.
 
 ## Conventions
 
