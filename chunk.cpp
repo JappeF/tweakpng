@@ -346,7 +346,7 @@ int choose_color_dialog(HWND hwnd, unsigned char *redp,
 	cc.lpfnHook=NULL;
 	cc.lpTemplateName=NULL;
 
-	if(ChooseColor(&cc)) {
+	if(twpng_ChooseColorDark(&cc)) {
 		(*redp)   = GetRValue(cc.rgbResult);
 		(*greenp) = GetGValue(cc.rgbResult);
 		(*bluep)  = GetBValue(cc.rgbResult);

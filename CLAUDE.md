@@ -5,12 +5,17 @@ Guidance for working in this repository.
 ## What this is
 
 TweakPNG is a low-level Win32 GUI utility (C++) for viewing and editing the chunk
-structure of PNG files. This repo is a fork (origin: `jsummers/tweakpng`) whose focus is
-**modernizing the UI for Windows 10/11** — dark mode title bar, menu bar, list view, and
-dialogs; PerMonitorV2 DPI awareness; rounded corners and Mica backdrop.
+structure of PNG files. This repo is a fork (origin: `jsummers/tweakpng`) with two themes:
+
+1. **Modernizing the UI for Windows 10/11** — dark title bar, menu bar, list view, all
+   dialogs, message boxes, and the color picker; PerMonitorV2 DPI awareness; rounded
+   corners and Mica backdrop.
+2. **Quality-of-life features for AI-generated images** (Automatic1111 / Stable
+   Diffusion), centered on the `parameters` tEXt chunk.
 
 It is a pure Win32 application: no framework, direct `WndProc` message handling, GDI
 drawing, and the Windows common controls (`ListView`, `Header`, dialogs from `.rc`).
+The fork version is `TWEAKPNG_FORK_VER_STRING` in `tweakpng.h` (shown in the About box).
 
 ## Build
 
@@ -70,10 +75,54 @@ When touching this, the canonical reference is `adzm/win32-custom-menubar-aero-t
   **subclassed** (`MainListSubclassProc`) to intercept `NM_CUSTOMDRAW` and owner-draw
   header items.
 - Dialogs: `twpng_InitDarkDialog` + `twpng_HandleDlgDarkMsg` apply theming and handle
-  `WM_CTLCOLOR*`.
+  `WM_CTLCOLOR*`. `twpng_InitDarkDialog` repaints with `RDW_ALLCHILDREN` so freshly themed
+  child controls don't keep stale light-theme text.
+- **Radio buttons** render their label black even when themed, so they're owner-drawn by
+  `RadioSubclassProc` (themed dark glyph via `DrawThemeBackground` + light label). Edit
+  controls get a flat dark border via `EditBorderSubclassProc` (the sunken client edge is
+  painted over, not removed, to keep single-line text centered).
+- **Message boxes**: the OS `MessageBox` can't be fully darkened (it paints a light footer
+  in `WM_PAINT`), so `twpng_MessageBox` is a custom dark dialog (`DLG_MSGBOX`) used by
+  `mesg()` and every other call site. Supports MB_OK/OKCANCEL/YESNO/YESNOCANCEL + icons.
+- **System common dialogs** (the `ChooseColor` picker) are dark-themed via a scoped
+  `WH_CBT` hook in `twpng_ChooseColorDark`, which themes the chrome on activation while
+  leaving owner-drawn swatches/spectrum colorful.
 
 The main window has a real menu (`MENUMAIN`); commands are dispatched in `WM_COMMAND` and
 enabled/disabled in `WM_INITMENU`. There is no separate toolbar.
+
+## Modeless editors
+
+Two windows run modeless and **unowned** (so they minimize independently of the main
+window and get their own taskbar buttons), one instance each:
+
+- the tEXt/zTXt/iTXt editor (`DlgProcEdit_tEXt`, opened from `Chunk::edit()`), and
+- the AI parameters viewer (`DlgProcAIParams` / `twpng_ViewAIParams`).
+
+The main message loop routes their messages via `IsDialogMessage`
+(`twpng_IsModelessEditorMessage` for the editor; a direct `g_hwndAIParams` check for the
+viewer). Both are force-closed when the document is torn down — `Png::~Png` calls
+`twpng_CloseModelessEditors()` and `twpng_CloseAIParamsView()` — and free their
+heap context in `WM_NCDESTROY`. The tEXt editor edits live chunk data, so deleting its
+chunk also closes it (`twpng_CloseEditorForChunk`); the AI viewer holds a copy, so it is
+safe regardless.
+
+## A1111 / AI image features
+
+All keyed off text chunks (mainly tEXt keyword `parameters`):
+
+- **Auto-open** (`twpng_AutoOpenParamsText`, end of `OpenPngByName`): if the Preferences
+  option `open_params_on_load` is set (default on), opening an image with a `parameters`
+  chunk pops up the parsed viewer. The option persists in the registry (`open_params`).
+- **Parsed viewer** (`DLG_AIPARAMS`): splits the A1111 string into Prompt / Negative
+  prompt / Settings with copy buttons. Parser `twpng_ParseA1111` splits on the
+  `Negative prompt:` and `Steps:` line markers; `twpng_SettingsToLines` reformats the
+  settings one-per-line while respecting double-quoted values (e.g. `Lora hashes: "..."`).
+- **Strip AI Metadata** (`StripAIMetadata`, Edit menu): removes AI metadata chunks
+  (`twpng_IsAIMetadataChunk`: parameters/workflow/prompt/NovelAI keys/`eXIf`...) after a
+  confirm, for sharing without leaking prompts.
+- **Generator badge** (`twpng_DetectGenerator`): appends "Stable Diffusion · A1111" /
+  "ComfyUI" / "NovelAI" to the status-bar size line.
 
 ## Conventions
 

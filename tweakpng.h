@@ -5,6 +5,7 @@
 
 #include <windows.h>
 #include <tchar.h>
+#include <commdlg.h>
 
 // Symbols, characters, etc., that are different when Unicode is disabled.
 #ifdef UNICODE
@@ -163,6 +164,9 @@ struct windowprefs_struct {
 	struct windowpos_struct text;
 	struct windowpos_struct plte;
 	struct windowpos_struct viewer;
+	// New members must be appended at the end (saved as a binary blob; older saved
+	// data simply lacks the tail, which keeps its default).
+	struct windowpos_struct aiparams;
 };
 
 #define MAX_TOOL_NAME   80
@@ -263,6 +267,7 @@ void twpng_InitDarkDialog(HWND hwnd);
 BOOL twpng_HandleDlgDarkMsg(UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR *result);
 void twpng_ApplyModernWindowStyle(HWND hwnd);
 BOOL twpng_HandleDarkMenuMsg(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT *result);
+BOOL twpng_ChooseColorDark(LPCHOOSECOLOR cc);
 
 // Modeless chunk editor (currently the tEXt/zTXt/iTXt editor) support.
 BOOL twpng_IsModelessEditorMessage(MSG *pmsg);

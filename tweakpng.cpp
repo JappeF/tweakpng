@@ -104,6 +104,11 @@ Viewer *g_viewer;
 
 struct globals_struct globals;
 
+// Modeless "AI Generation Parameters" viewer (one instance at a time).
+static HWND g_hwndAIParams = NULL;
+static void twpng_ViewAIParams(HWND owner);
+static void twpng_CloseAIParamsView();
+
 static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK DlgProcAbout(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK DlgProcPrefs(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -435,11 +440,36 @@ static void update_viewer_filename()
 #endif
 }
 
+// Identify the AI image generator from the text chunks, or NULL if none recognized.
+static const TCHAR *twpng_DetectGenerator(Png *p)
+{
+	int a1111=0, comfy=0, hasSoftware=0, hasComment=0;
+	if(!p) return NULL;
+	for(int i=0;i<p->m_num_chunks;i++) {
+		Chunk *c = p->chunk[i];
+		if(!c) continue;
+		if(c->m_chunktype_id!=CHUNK_tEXt && c->m_chunktype_id!=CHUNK_zTXt &&
+		   c->m_chunktype_id!=CHUNK_iTXt) continue;
+		struct keyword_info_struct kw;
+		if(!c->get_keyword_info(&kw)) continue;
+		if(!lstrcmp(kw.keyword,_T("parameters")))      a1111=1;
+		else if(!lstrcmp(kw.keyword,_T("workflow")) ||
+		        !lstrcmp(kw.keyword,_T("prompt")))     comfy=1;
+		else if(!lstrcmp(kw.keyword,_T("Software")))   hasSoftware=1;
+		else if(!lstrcmp(kw.keyword,_T("Comment")))    hasComment=1;
+	}
+	if(a1111) return _T("Stable Diffusion ") SYM_MIDDOT _T(" A1111");
+	if(comfy) return _T("ComfyUI");
+	if(hasSoftware && hasComment) return _T("NovelAI");
+	return NULL;
+}
+
 static void update_status_bar_and_viewer()
 {
-	TCHAR buf[100];
+	TCHAR buf[200];
 	DWORD s;
 	const TCHAR *type;
+	const TCHAR *gen;
 
 	if(!globals.hwndStBar) { goto done; }
 	if(!png) {
@@ -456,7 +486,20 @@ static void update_status_bar_and_viewer()
 
 	s=png->get_file_size();
 
-	StringCchPrintf(buf,100,_T("%s file size: %u bytes"),type,(unsigned int)s);
+	TCHAR humanbuf[40];
+	if(s >= 1073741824UL)   StringCchPrintf(humanbuf,40,_T(" (%.2f GB)"),(double)s/1073741824.0);
+	else if(s >= 1048576UL) StringCchPrintf(humanbuf,40,_T(" (%.2f MB)"),(double)s/1048576.0);
+	else if(s >= 1024UL)    StringCchPrintf(humanbuf,40,_T(" (%.2f KB)"),(double)s/1024.0);
+	else                    humanbuf[0]=_T('\0');
+
+	StringCchPrintf(buf,200,_T("%s file size: %u bytes%s"),type,(unsigned int)s,humanbuf);
+
+	gen = twpng_DetectGenerator(png);
+	if(gen) {
+		TCHAR genbuf[80];
+		StringCchPrintf(genbuf,80,_T("     %s  %s"),SYM_MIDDOT,gen);
+		StringCchCat(buf,200,genbuf);
+	}
 	SetWindowText(globals.hwndStBar,buf);
 
 done:
@@ -1141,8 +1184,9 @@ Png::~Png()
 {
 	int i;
 
-	// This document is going away; close the modeless editor before its chunks are freed.
+	// This document is going away; close the modeless editor and parameters viewer.
 	twpng_CloseModelessEditors();
+	twpng_CloseAIParamsView();
 
 	if(chunk) {
 		// free individual chunks
@@ -1259,6 +1303,7 @@ static int SaveSettings()
 	r=RegSetValueEx(key,_T("use_imagebg"),0,REG_DWORD,(LPBYTE)&globals.use_imagebg,sizeof(DWORD));
 	r=RegSetValueEx(key,_T("windowbg"),0,REG_DWORD,(LPBYTE)&globals.window_bgcolor,sizeof(DWORD));
 	r=RegSetValueEx(key,_T("zoom"),0,REG_DWORD,(LPBYTE)&globals.vsize,sizeof(DWORD));
+	r=RegSetValueEx(key,_T("open_params"),0,REG_DWORD,(LPBYTE)&globals.open_params_on_load,sizeof(DWORD));
 
 	if(IsWindow(globals.hwndMainList)) {
 		for(i=0;i<5;i++) {
@@ -1334,6 +1379,12 @@ static void ReadSettings()
 	globals.window_prefs.viewer.h=250;
 	globals.window_prefs.viewer.max=0;
 
+	globals.window_prefs.aiparams.x=0;
+	globals.window_prefs.aiparams.y=0;
+	globals.window_prefs.aiparams.w=0;   // 0 => use the dialog's default size/centering
+	globals.window_prefs.aiparams.h=0;
+	globals.window_prefs.aiparams.max=0;
+
 	if(RegOpenKeyEx(HKEY_CURRENT_USER,globals.twpng_reg_key,0,KEY_READ,&key)
 		!= ERROR_SUCCESS) return;
 
@@ -1370,6 +1421,8 @@ static void ReadSettings()
 	r=RegQueryValueEx(key,_T("windowbg"),NULL,NULL,(LPBYTE)(&globals.window_bgcolor),&datasize);
 	datasize=sizeof(DWORD);
 	r=RegQueryValueEx(key,_T("zoom"),NULL,NULL,(LPBYTE)(&globals.vsize),&datasize);
+	datasize=sizeof(DWORD);
+	r=RegQueryValueEx(key,_T("open_params"),NULL,NULL,(LPBYTE)(&globals.open_params_on_load),&datasize);
 
 	datasize=sizeof(DWORD);
 	tmpd = 0;
@@ -1462,6 +1515,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 	globals.vborder=4;
 	globals.vsize=TWPNG_VS_FIT;
 	globals.viewer_correct_nonsquare=1;
+	globals.open_params_on_load=1;
 
 	INITCOMMONCONTROLSEX icc;
 	ZeroMemory(&icc,sizeof(icc));
@@ -1516,6 +1570,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 
 	while(GetMessage(&msg,NULL,0,0)){
 		if(twpng_IsModelessEditorMessage(&msg)) continue;
+		if(g_hwndAIParams && IsDialogMessage(g_hwndAIParams,&msg)) continue;
 		if (!TranslateAccelerator(globals.hwndMain, hAccTable, &msg)) {
 			TranslateMessage(&msg);
 			DispatchMessage(&msg);
@@ -1627,6 +1682,24 @@ static void NewPng()
 	update_status_bar_and_viewer();
 }
 
+// If enabled, find the first tEXt chunk whose keyword is "parameters" (the keyword used
+// by AI image generators) and open its editor automatically.
+static void twpng_AutoOpenParamsText()
+{
+	if(!globals.open_params_on_load || !png) return;
+	for(int i=0; i<png->m_num_chunks; i++) {
+		Chunk *c = png->chunk[i];
+		if(c && c->m_chunktype_id==CHUNK_tEXt) {
+			struct keyword_info_struct kw;
+			if(c->get_keyword_info(&kw) && !lstrcmp(kw.keyword,_T("parameters"))) {
+				twpng_SetLVSelection(globals.hwndMainList,i,1);
+				twpng_ViewAIParams(globals.hwndMain);
+				return;
+			}
+		}
+	}
+}
+
 // handles loading a new png file
 static int OpenPngByName(const TCHAR *fn)
 {
@@ -1650,6 +1723,8 @@ static int OpenPngByName(const TCHAR *fn)
 	SetTitle(png);
 	update_viewer_filename();
 	update_status_bar_and_viewer();
+
+	twpng_AutoOpenParamsText();
 
 	return 1;
 }
@@ -2054,6 +2129,335 @@ static void DeleteChunks()          // delete all selected items
 	if(firstdeleted>(png->m_num_chunks-1)) firstdeleted=png->m_num_chunks-1;
 	twpng_SetLVSelection(globals.hwndMainList,firstdeleted,1);
 	png->modified();
+}
+
+// Returns 1 if the chunk holds AI-generation metadata (prompts, workflow, EXIF, etc.).
+static int twpng_IsAIMetadataChunk(Chunk *c)
+{
+	if(!c) return 0;
+	if(c->m_chunktype_id==CHUNK_eXIf) return 1;
+	if(c->m_chunktype_id==CHUNK_tEXt || c->m_chunktype_id==CHUNK_zTXt ||
+	   c->m_chunktype_id==CHUNK_iTXt) {
+		static const TCHAR *aiKeys[] = {
+			_T("parameters"), _T("workflow"), _T("prompt"), _T("Comment"),
+			_T("Software"), _T("Source"), _T("Title"), _T("Description"),
+			_T("Generation time"), _T("Dream"), _T("sd-metadata"),
+			_T("negative_prompt"), NULL };
+		struct keyword_info_struct kw;
+		if(c->get_keyword_info(&kw)) {
+			for(int k=0; aiKeys[k]; k++)
+				if(!lstrcmp(kw.keyword, aiKeys[k])) return 1;
+		}
+	}
+	return 0;
+}
+
+// Remove all AI-generation metadata chunks (so an image can be shared without leaking
+// prompts, seed, workflow, etc.).
+static void StripAIMetadata()
+{
+	int i, count=0;
+	TCHAR buf[200];
+
+	if(!png) return;
+	for(i=0;i<png->m_num_chunks;i++)
+		if(twpng_IsAIMetadataChunk(png->chunk[i])) count++;
+
+	if(count<1) {
+		mesg(MSG_I,_T("No AI metadata chunks were found in this file."));
+		return;
+	}
+
+	StringCchPrintf(buf,200,
+		_T("Remove %d AI metadata chunk%s (prompts, settings, workflow, etc.)?\r\n\r\n")
+		_T("This cannot be undone."),count,(count==1)?_T(""):_T("s"));
+	if(twpng_MessageBox(globals.hwndMain,buf,_T("Strip AI Metadata"),
+		MB_OKCANCEL|MB_ICONWARNING)!=IDOK) return;
+
+	for(i=png->m_num_chunks-1;i>=0;i--)
+		if(twpng_IsAIMetadataChunk(png->chunk[i]))
+			png->delete_chunk(i);
+
+	png->fill_listbox(globals.hwndMainList);
+	png->modified();
+}
+
+// ---- A1111 "parameters" parsed viewer -----------------------------------------------
+
+static void twpng_SetClipboardText(HWND owner, const TCHAR *text)
+{
+	if(!text || !OpenClipboard(owner)) return;
+	EmptyClipboard();
+	SIZE_T n = (SIZE_T)(lstrlen(text)+1)*sizeof(TCHAR);
+	HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, n);
+	if(h) {
+		void *p = GlobalLock(h);
+		if(p) {
+			memcpy(p, text, n);
+			GlobalUnlock(h);
+#ifdef UNICODE
+			SetClipboardData(CF_UNICODETEXT, h);
+#else
+			SetClipboardData(CF_TEXT, h);
+#endif
+		}
+	}
+	CloseClipboard();
+}
+
+static int twpng_FindLineStart(const TCHAR *s, int from, int limit, const TCHAR *marker)
+{
+	int mlen = lstrlen(marker);
+	for(int i=from; i+mlen<=limit; i++)
+		if((i==0 || s[i-1]==_T('\n')) && !_tcsncmp(&s[i], marker, mlen))
+			return i;
+	return -1;
+}
+
+// Allocate a NUL-terminated copy of s[a,b), trimming trailing whitespace/newlines.
+static TCHAR *twpng_DupTrim(const TCHAR *s, int a, int b)
+{
+	while(b>a && (s[b-1]==_T('\n')||s[b-1]==_T('\r')||s[b-1]==_T(' ')||s[b-1]==_T('\t'))) b--;
+	int n = (b>a)?(b-a):0;
+	TCHAR *out = (TCHAR*)malloc(((size_t)n+1)*sizeof(TCHAR));
+	if(!out) return NULL;
+	if(n>0) memcpy(out, &s[a], (size_t)n*sizeof(TCHAR));
+	out[n]=0;
+	return out;
+}
+
+// Convert lone \n to \r\n so edit controls / the clipboard show line breaks.
+static TCHAR *twpng_LfToCrlf(const TCHAR *s)
+{
+	if(!s) return NULL;
+	int len=lstrlen(s), extra=0, i;
+	for(i=0;i<len;i++) if(s[i]==_T('\n') && (i==0 || s[i-1]!=_T('\r'))) extra++;
+	TCHAR *out=(TCHAR*)malloc(((size_t)len+extra+1)*sizeof(TCHAR));
+	if(!out) return NULL;
+	int o=0;
+	for(i=0;i<len;i++){
+		if(s[i]==_T('\n') && (i==0 || s[i-1]!=_T('\r'))) out[o++]=_T('\r');
+		out[o++]=s[i];
+	}
+	out[o]=0;
+	return out;
+}
+
+// Reformat "k: v, k: v" settings into one pair per line (respecting quoted values).
+static TCHAR *twpng_SettingsToLines(const TCHAR *s)
+{
+	if(!s) return NULL;
+	int len=lstrlen(s), i;
+	TCHAR *out=(TCHAR*)malloc(((size_t)len*2+2)*sizeof(TCHAR));
+	if(!out) return NULL;
+	int o=0, inq=0;
+	for(i=0;i<len;i++){
+		TCHAR ch=s[i];
+		if(ch==_T('"')) inq=!inq;
+		if(!inq && ch==_T(',') && s[i+1]==_T(' ')){ out[o++]=_T('\r'); out[o++]=_T('\n'); i++; continue; }
+		out[o++]=ch;
+	}
+	out[o]=0;
+	return out;
+}
+
+struct aiparams_ctx {
+	TCHAR *full;    // full original parameters text
+	TCHAR *pos;     // positive prompt
+	TCHAR *neg;     // negative prompt (NULL if none)
+	TCHAR *setRaw;  // settings line, original single line (NULL if none)
+};
+
+static void twpng_ParseA1111(const TCHAR *full, struct aiparams_ctx *c)
+{
+	c->pos=c->neg=c->setRaw=NULL;
+	if(!full) return;
+	int len=lstrlen(full);
+	int setStart = twpng_FindLineStart(full,0,len,_T("Steps:"));
+	int region = (setStart>=0)? setStart : len;
+	int negPos = twpng_FindLineStart(full,0,region,_T("Negative prompt:"));
+	if(negPos>=0){
+		c->pos = twpng_DupTrim(full,0,negPos);
+		int na = negPos + lstrlen(_T("Negative prompt:"));
+		while(na<region && (full[na]==_T(' ')||full[na]==_T('\t'))) na++;
+		c->neg = twpng_DupTrim(full,na,region);
+	} else {
+		c->pos = twpng_DupTrim(full,0,region);
+	}
+	if(setStart>=0) c->setRaw = twpng_DupTrim(full,setStart,len);
+}
+
+static struct aiparams_ctx *g_aiParamsCtx = NULL;
+
+// Lay out the AI params controls to fill the (resizable) client area.
+static void twpng_LayoutAIParams(HWND hwnd)
+{
+	RECT rc;
+	GetClientRect(hwnd,&rc);
+	int W=rc.right, H=rc.bottom;
+	int m=10, gap=8, labelH=16, copyW=52, copyH=24, btnH=24;
+	int editX=m, editW=W-2*m-copyW-gap;
+	if(editW<80) editW=80;
+	int copyX=editX+editW+gap;
+
+	int bottomY=H-m-btnH;
+	int top=m;
+	int avail=bottomY-gap-top-3*labelH-2*gap;   // vertical space shared by 3 edits
+	if(avail<90) avail=90;
+	int promptH=(int)(avail*0.50);              // prompt is the largest box
+	int negH=(int)(avail*0.22);
+	int setH=avail-promptH-negH;
+
+	int y=top;
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_LBLPROMPT),NULL,editX,y,editW,labelH,SWP_NOZORDER);
+	y+=labelH;
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_PROMPT),NULL,editX,y,editW,promptH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYPROMPT),NULL,copyX,y,copyW,copyH,SWP_NOZORDER);
+	y+=promptH+gap;
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_LBLNEG),NULL,editX,y,editW,labelH,SWP_NOZORDER);
+	y+=labelH;
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_NEG),NULL,editX,y,editW,negH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYNEG),NULL,copyX,y,copyW,copyH,SWP_NOZORDER);
+	y+=negH+gap;
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_LBLSET),NULL,editX,y,editW,labelH,SWP_NOZORDER);
+	y+=labelH;
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SETTINGS),NULL,editX,y,editW,setH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYSET),NULL,copyX,y,copyW,copyH,SWP_NOZORDER);
+
+	int closeX=W-m-copyW, copyAllX=closeX-gap-58;
+	SetWindowPos(GetDlgItem(hwnd,IDOK),NULL,closeX,bottomY,copyW,btnH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYALL),NULL,copyAllX,bottomY,58,btnH,SWP_NOZORDER);
+}
+
+static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	WORD id = LOWORD(wParam);
+	struct aiparams_ctx *c;
+
+	if(msg==WM_INITDIALOG){
+		c = (struct aiparams_ctx*)lParam;
+		SetWindowLongPtr(hwnd,DWLP_USER,lParam);
+		SendMessage(hwnd,WM_SETICON,ICON_BIG,(LPARAM)LoadIcon(globals.hInst,_T("ICONMAIN")));
+		if(c){
+			TCHAR *t;
+			t=twpng_LfToCrlf(c->pos);            if(t){ SetDlgItemText(hwnd,IDC_AIP_PROMPT,t);   free(t); }
+			t=twpng_LfToCrlf(c->neg);            if(t){ SetDlgItemText(hwnd,IDC_AIP_NEG,t);      free(t); }
+			t=twpng_SettingsToLines(c->setRaw);  if(t){ SetDlgItemText(hwnd,IDC_AIP_SETTINGS,t); free(t); }
+			if(!c->neg)    EnableWindow(GetDlgItem(hwnd,IDC_AIP_COPYNEG),FALSE);
+			if(!c->setRaw) EnableWindow(GetDlgItem(hwnd,IDC_AIP_COPYSET),FALSE);
+		}
+		twpng_LayoutAIParams(hwnd);
+		twpng_InitDarkDialog(hwnd);
+		return 1;
+	}
+	c = (struct aiparams_ctx*)GetWindowLongPtr(hwnd,DWLP_USER);
+
+	switch(msg){
+	case WM_SIZE:
+		twpng_LayoutAIParams(hwnd);
+		return 0;
+
+	case WM_GETMINMAXINFO:
+		{
+			LPMINMAXINFO mm=(LPMINMAXINFO)lParam;
+			mm->ptMinTrackSize.x=360;
+			mm->ptMinTrackSize.y=300;
+			return 0;
+		}
+
+	case WM_EXITSIZEMOVE:
+	case WM_DESTROY:
+		// Remember the window position/size (kept current so it survives app exit too).
+		twpng_StoreWindowPos(hwnd,&globals.window_prefs.aiparams);
+		break;
+
+	case WM_COMMAND:
+		switch(id){
+		case IDC_AIP_COPYPROMPT: if(c){TCHAR*t=twpng_LfToCrlf(c->pos);twpng_SetClipboardText(hwnd,t);free(t);} return 1;
+		case IDC_AIP_COPYNEG:    if(c){TCHAR*t=twpng_LfToCrlf(c->neg);twpng_SetClipboardText(hwnd,t);free(t);} return 1;
+		case IDC_AIP_COPYSET:    if(c) twpng_SetClipboardText(hwnd,c->setRaw); return 1;
+		case IDC_AIP_COPYALL:    if(c){TCHAR*t=twpng_LfToCrlf(c->full);twpng_SetClipboardText(hwnd,t);free(t);} return 1;
+		case IDOK: case IDCANCEL: DestroyWindow(hwnd); return 1;
+		}
+		break;
+
+	case WM_NCDESTROY:
+		if(g_hwndAIParams==hwnd){
+			g_hwndAIParams=NULL;
+			if(g_aiParamsCtx){
+				free(g_aiParamsCtx->full); free(g_aiParamsCtx->pos);
+				free(g_aiParamsCtx->neg);  free(g_aiParamsCtx->setRaw);
+				free(g_aiParamsCtx); g_aiParamsCtx=NULL;
+			}
+		}
+		SetWindowLongPtr(hwnd,DWLP_USER,0);
+		return 0;
+	}
+	{
+		INT_PTR dr=0;
+		if(twpng_HandleDlgDarkMsg(msg,wParam,lParam,&dr)) return dr;
+	}
+	return 0;
+}
+
+// Force-close the parameters viewer (e.g. when the document changes).
+static void twpng_CloseAIParamsView()
+{
+	if(g_hwndAIParams) DestroyWindow(g_hwndAIParams);
+}
+
+// Find the "parameters" tEXt chunk and show the modeless parsed viewer.
+static void twpng_ViewAIParams(HWND owner)
+{
+	Chunk *found=NULL;
+	int i;
+	(void)owner;
+
+	if(!png) return;
+
+	// Already open: just bring it to the front.
+	if(g_hwndAIParams) { SetForegroundWindow(g_hwndAIParams); return; }
+
+	for(i=0;i<png->m_num_chunks;i++){
+		Chunk *c=png->chunk[i];
+		if(c && c->m_chunktype_id==CHUNK_tEXt){
+			struct keyword_info_struct kw;
+			if(c->get_keyword_info(&kw) && !lstrcmp(kw.keyword,_T("parameters"))){ found=c; break; }
+		}
+	}
+	if(!found){
+		mesg(MSG_I,_T("No A1111 \"parameters\" tEXt chunk was found in this file."));
+		return;
+	}
+	if(!found->get_text_info() || !found->m_text_info.text){
+		mesg(MSG_S,_T("Could not read the parameters chunk."));
+		return;
+	}
+
+	int n = found->m_text_info.text_size_in_tchars;
+	if(n<0) n=0;
+	g_aiParamsCtx = (struct aiparams_ctx*)calloc(1,sizeof(struct aiparams_ctx));
+	if(!g_aiParamsCtx) return;
+	g_aiParamsCtx->full=(TCHAR*)malloc(((size_t)n+1)*sizeof(TCHAR));
+	if(!g_aiParamsCtx->full) { free(g_aiParamsCtx); g_aiParamsCtx=NULL; return; }
+	if(n>0) memcpy(g_aiParamsCtx->full, found->m_text_info.text, (size_t)n*sizeof(TCHAR));
+	g_aiParamsCtx->full[n]=0;
+
+	twpng_ParseA1111(g_aiParamsCtx->full, g_aiParamsCtx);
+
+	// No owner window, so it minimizes independently and gets its own taskbar button.
+	g_hwndAIParams = CreateDialogParam(globals.hInst,_T("DLG_AIPARAMS"),
+		NULL, DlgProcAIParams, (LPARAM)g_aiParamsCtx);
+	if(!g_hwndAIParams){
+		free(g_aiParamsCtx->full); free(g_aiParamsCtx->pos);
+		free(g_aiParamsCtx->neg);  free(g_aiParamsCtx->setRaw);
+		free(g_aiParamsCtx); g_aiParamsCtx=NULL;
+		return;
+	}
+	if(globals.window_prefs.aiparams.w>0 && globals.window_prefs.aiparams.h>0)
+		twpng_SetWindowPos(g_hwndAIParams,&globals.window_prefs.aiparams);
+	ShowWindow(g_hwndAIParams, SW_SHOW);
+	SetForegroundWindow(g_hwndAIParams);
 }
 
 // selects a range of items, and sets the focus to the first of that range
@@ -3053,6 +3457,88 @@ void twpng_InitDarkDialog(HWND hwnd)
 	RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_UPDATENOW|RDW_FRAME);
 }
 
+// ---- Dark theming for system common dialogs (e.g. ChooseColor) ----------------------
+// These can't host our dialog proc, so we briefly hook window activation and dark-theme
+// the dialog chrome (title bar, labels, edits, buttons). Owner-drawn color swatches and
+// the spectrum keep their own colors. Font is left alone so the layout isn't disturbed.
+
+static HHOOK g_sysDlgCbtHook = NULL;
+
+static BOOL CALLBACK SysDlgDarkChildProc(HWND hChild, LPARAM lParam)
+{
+	TCHAR cls[32];
+	GetClassName(hChild, cls, 32);
+	if(!_tcsicmp(cls,_T("Edit")) || !_tcsicmp(cls,_T("Button")) || !_tcsicmp(cls,_T("ListBox")))
+		SetWindowTheme(hChild, _T("DarkMode_Explorer"), NULL);
+	else if(!_tcsicmp(cls,_T("ComboBox")))
+		SetWindowTheme(hChild, _T("DarkMode_CFD"), NULL);
+	HMODULE hUx = (HMODULE)lParam;
+	if(hUx) {
+		typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
+		AllowDarkModeForWindowProc f =
+			(AllowDarkModeForWindowProc)GetProcAddress(hUx, MAKEINTRESOURCEA(133));
+		if(f) f(hChild, TRUE);
+	}
+	return TRUE;
+}
+
+static LRESULT CALLBACK SysDlgDarkSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+	(void)dwRefData;
+	switch(msg) {
+	case WM_CTLCOLORDLG:
+	case WM_CTLCOLORSTATIC:
+	case WM_CTLCOLORBTN:
+		if(globals.hUiBgBrush) {
+			SetBkColor((HDC)wParam, RGB(32,32,32));
+			SetTextColor((HDC)wParam, RGB(255,255,255));
+			return (LRESULT)globals.hUiBgBrush;
+		}
+		break;
+	case WM_CTLCOLOREDIT:
+	case WM_CTLCOLORLISTBOX:
+		if(globals.hDarkEditBrush) {
+			SetBkColor((HDC)wParam, RGB(45,45,45));
+			SetTextColor((HDC)wParam, RGB(220,220,220));
+			return (LRESULT)globals.hDarkEditBrush;
+		}
+		break;
+	case WM_NCDESTROY:
+		RemoveWindowSubclass(hwnd, SysDlgDarkSubclassProc, uIdSubclass);
+		break;
+	}
+	return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK SysDlgDarkCbtProc(int code, WPARAM wParam, LPARAM lParam)
+{
+	if(code == HCBT_ACTIVATE) {
+		HWND hwnd = (HWND)wParam;
+		TCHAR cls[16];
+		if(GetClassName(hwnd, cls, 16) && !_tcscmp(cls, _T("#32770"))) {
+			twpng_ApplyModernWindowStyle(hwnd);
+			HMODULE hUx = LoadLibrary(_T("uxtheme.dll"));
+			EnumChildWindows(hwnd, SysDlgDarkChildProc, (LPARAM)hUx);
+			if(hUx) FreeLibrary(hUx);
+			SetWindowSubclass(hwnd, SysDlgDarkSubclassProc, 1, 0);
+			RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_UPDATENOW|RDW_FRAME);
+		}
+	}
+	return CallNextHookEx(g_sysDlgCbtHook, code, wParam, lParam);
+}
+
+BOOL twpng_ChooseColorDark(LPCHOOSECOLOR cc)
+{
+	g_sysDlgCbtHook = SetWindowsHookEx(WH_CBT, SysDlgDarkCbtProc, NULL, GetCurrentThreadId());
+	BOOL r = ChooseColor(cc);
+	if(g_sysDlgCbtHook) {
+		UnhookWindowsHookEx(g_sysDlgCbtHook);
+		g_sysDlgCbtHook = NULL;
+	}
+	return r;
+}
+
 BOOL twpng_HandleDlgDarkMsg(UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR *result)
 {
 	(void)lParam;
@@ -3093,8 +3579,9 @@ static void LayoutMainWindows(HWND hwnd)
 
 	GetClientRect(hwnd,&r);
 	if(globals.hwndStBar) {
+		// Inset the status text by 12px so it lines up with the table's left margin.
 		SetWindowPos(globals.hwndStBar,NULL,
-			r.left,r.bottom-globals.stbar_height,r.right-r.left,globals.stbar_height,
+			r.left+12,r.bottom-globals.stbar_height,r.right-r.left-12,globals.stbar_height,
 			SWP_NOZORDER);
 	}
 	if(globals.hwndMainList) {
@@ -3789,6 +4276,7 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 				ID_NEWSCAL,ID_NEWVPAG,
 				ID_COMBINEALLIDAT,
 				ID_IMPORTCHUNK,ID_IMPORTICCPROF,ID_SIGNATURE,ID_CHECKPNG,
+				ID_STRIPAIMETA,ID_VIEWAIPARAMS,
 				ID_TOOL_1,ID_TOOL_2,ID_TOOL_3,ID_TOOL_4,ID_TOOL_5,ID_TOOL_6,
 				0};
 			// commands requiring exactly 1 selected chunk
@@ -3809,6 +4297,8 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_IMGVIEWER,_T("&Image Viewer\tF7"));
 			AppendMenu(mtools,MF_SEPARATOR,0,NULL);
 #endif
+			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_VIEWAIPARAMS,_T("&View AI Parameters..."));
+			AppendMenu(mtools,MF_SEPARATOR,0,NULL);
 			for(i=0;i<TWPNG_NUMTOOLS;i++) {
 				if(lstrlen(globals.tools[i].name)) {
 					StringCchPrintf(buf,150,_T("&%d  %s\tCtrl+%d"),i+1,globals.tools[i].name,i+1);
@@ -3980,6 +4470,8 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		case ID_SAVE:         SavePng(hwnd);     return 0;
 		case ID_SAVEAS:       SavePngAs(hwnd);   return 0;
 		case ID_CHECKPNG:     png->check_validity(0);  return 0;
+		case ID_STRIPAIMETA:  StripAIMetadata(); return 0;
+		case ID_VIEWAIPARAMS: twpng_ViewAIParams(hwnd); return 0;
 
 		case ID_EDITCHUNK:    DblClickOnList();  return 0;
 		case ID_DELCHUNK:     DeleteChunks();    return 0;
@@ -4324,6 +4816,9 @@ static INT_PTR CALLBACK DlgProcPrefs(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 			prctx->remember_menusetting=x;
 		}
 
+		CheckDlgButton(hwnd,IDC_OPENPARAMS,
+			globals.open_params_on_load?BST_CHECKED:BST_UNCHECKED);
+
 		twpng_InitDarkDialog(hwnd);
 		return 1;
 	}
@@ -4349,6 +4844,8 @@ static INT_PTR CALLBACK DlgProcPrefs(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 					}
 				}
 			}
+
+			globals.open_params_on_load= (IsDlgButtonChecked(hwnd,IDC_OPENPARAMS)==BST_CHECKED);
 
 			i=(int)SendDlgItemMessage(hwnd,IDC_CMPRLEVEL,CB_GETCURSEL,0,0);
 			if(i==CB_ERR) i=0;

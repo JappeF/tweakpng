@@ -85,6 +85,16 @@
 #define IDC_MSGBOX_ICON                 1100
 #define IDC_MSGBOX_TEXT                 1101
 #define IDC_OPENPARAMS                  1102
+#define IDC_AIP_PROMPT                  1103
+#define IDC_AIP_NEG                     1104
+#define IDC_AIP_SETTINGS                1105
+#define IDC_AIP_COPYPROMPT              1106
+#define IDC_AIP_COPYNEG                 1107
+#define IDC_AIP_COPYSET                 1108
+#define IDC_AIP_COPYALL                 1109
+#define IDC_AIP_LBLPROMPT               1110
+#define IDC_AIP_LBLNEG                  1111
+#define IDC_AIP_LBLSET                  1112
 #define ID_EXIT                         40001
 #define ID_OPEN                         40002
 #define ID_SAVEAS                       40003
@@ -150,6 +160,8 @@
 #define ID_NEWVPAG                      40068
 #define ID_COPYIMAGE                    40069
 #define ID_CORRECTNONSQUARE             40070
+#define ID_STRIPAIMETA                  40101
+#define ID_VIEWAIPARAMS                 40102
 
 // Next default values for new objects
 //
