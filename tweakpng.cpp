@@ -108,6 +108,17 @@ struct globals_struct globals;
 static HWND g_hwndAIParams = NULL;
 static void twpng_ViewAIParams(HWND owner);
 static void twpng_CloseAIParamsView();
+static int  twpng_OpenAIParamsViewerFromText(const TCHAR *text, int len);
+static int  twpng_ReadJpegAIParams(const TCHAR *fn, TCHAR **outText);
+static int  twpng_ReadWebpAIParams(const TCHAR *fn, TCHAR **outText);
+static BOOL twpng_LooksLikeComfyJson(const TCHAR *s);
+struct aiparams_ctx;
+static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx);
+
+// When a JPEG/WebP is opened, png stays NULL but we remember the filename so the title
+// and status bar can show its info. Empty when no foreign file is loaded.
+static TCHAR g_foreignFn[MAX_PATH] = _T("");
+static int   g_foreignKind = 0;   // 1=JPEG, 2=WebP
 
 static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK DlgProcAbout(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -473,7 +484,24 @@ static void update_status_bar_and_viewer()
 
 	if(!globals.hwndStBar) { goto done; }
 	if(!png) {
-		SetWindowText(globals.hwndStBar,_T("No file loaded"));
+		if(g_foreignFn[0]) {
+			HANDLE fh = CreateFile(g_foreignFn, GENERIC_READ, FILE_SHARE_READ, NULL,
+				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+			DWORD fs = 0;
+			if(fh != INVALID_HANDLE_VALUE) { fs = GetFileSize(fh, NULL); CloseHandle(fh); }
+			const TCHAR *label = (g_foreignKind==1) ? _T("JPEG") :
+			                     (g_foreignKind==2) ? _T("WebP") : _T("File");
+			TCHAR fbuf[40];
+			if(fs >= 1073741824UL)   StringCchPrintf(fbuf,40,_T(" (%.2f GB)"),(double)fs/1073741824.0);
+			else if(fs >= 1048576UL) StringCchPrintf(fbuf,40,_T(" (%.2f MB)"),(double)fs/1048576.0);
+			else if(fs >= 1024UL)    StringCchPrintf(fbuf,40,_T(" (%.2f KB)"),(double)fs/1024.0);
+			else                     fbuf[0]=0;
+			TCHAR sbuf[200];
+			StringCchPrintf(sbuf,200,_T("%s file size: %u bytes%s"),label,(unsigned int)fs,fbuf);
+			SetWindowText(globals.hwndStBar,sbuf);
+		} else {
+			SetWindowText(globals.hwndStBar,_T("No file loaded"));
+		}
 		goto done;
 	}
 
@@ -1687,14 +1715,20 @@ static void NewPng()
 static void twpng_AutoOpenParamsText()
 {
 	if(!globals.open_params_on_load || !png) return;
-	for(int i=0; i<png->m_num_chunks; i++) {
-		Chunk *c = png->chunk[i];
-		if(c && c->m_chunktype_id==CHUNK_tEXt) {
-			struct keyword_info_struct kw;
-			if(c->get_keyword_info(&kw) && !lstrcmp(kw.keyword,_T("parameters"))) {
-				twpng_SetLVSelection(globals.hwndMainList,i,1);
-				twpng_ViewAIParams(globals.hwndMain);
-				return;
+	// First match wins: A1111 "parameters", then ComfyUI "prompt".
+	static const TCHAR *keys[] = { _T("parameters"), _T("prompt"), NULL };
+	for(int ki=0; keys[ki]; ki++) {
+		for(int i=0; i<png->m_num_chunks; i++) {
+			Chunk *c = png->chunk[i];
+			if(c && (c->m_chunktype_id==CHUNK_tEXt ||
+			         c->m_chunktype_id==CHUNK_zTXt ||
+			         c->m_chunktype_id==CHUNK_iTXt)) {
+				struct keyword_info_struct kw;
+				if(c->get_keyword_info(&kw) && !lstrcmp(kw.keyword,keys[ki])) {
+					twpng_SetLVSelection(globals.hwndMainList,i,1);
+					twpng_ViewAIParams(globals.hwndMain);
+					return;
+				}
 			}
 		}
 	}
@@ -1703,12 +1737,57 @@ static void twpng_AutoOpenParamsText()
 // handles loading a new png file
 static int OpenPngByName(const TCHAR *fn)
 {
-	if(png) {
-		delete png;
-		png=NULL;
+	// Sniff the file format first so we can route JPEG/WebP through a metadata-only
+	// path that leaves the chunk table empty.
+	HANDLE fh = CreateFile(fn, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL, NULL);
+	if(fh==INVALID_HANDLE_VALUE) {
+		mesg(MSG_E,_T("Can") SYM_RSQUO _T("t open file (%s)"),fn);
+		return 0;
 	}
+	unsigned char hdr[16] = {0};
+	DWORD got = 0;
+	ReadFile(fh, hdr, sizeof(hdr), &got, NULL);
+	CloseHandle(fh);
+	int foreignKind = 0;
+	if(got>=2 && hdr[0]==0xFF && hdr[1]==0xD8) foreignKind = 1;
+	else if(got>=12 && !memcmp(hdr,"RIFF",4) && !memcmp(hdr+8,"WEBP",4)) foreignKind = 2;
+
+	if(png) { delete png; png=NULL; }
 	ListView_DeleteAllItems(globals.hwndMainList);
-	png=new Png(fn, fn);
+
+	if(foreignKind) {
+		// JPEG / WebP: no PNG document, just show the filename and try to extract AI
+		// metadata from EXIF UserComment.
+		StringCbCopy(g_foreignFn, sizeof(g_foreignFn), fn);
+		g_foreignKind = foreignKind;
+		TCHAR titleBuf[1024];
+		struct filename_path_struct fnp;
+		ZeroMemory(&fnp, sizeof(fnp));
+		fnp.full_fn = (TCHAR*)fn;
+		if(parse_filename_path(&fnp))
+			StringCbPrintf(titleBuf, sizeof(titleBuf), _T("%s (%s) - TweakPNG"), fnp.base_fn, fnp.path);
+		else
+			StringCbPrintf(titleBuf, sizeof(titleBuf), _T("%s - TweakPNG"), fn);
+		SetWindowText(globals.hwndMain, titleBuf);
+		update_viewer_filename();
+		update_status_bar_and_viewer();
+
+		TCHAR *aiText = NULL;
+		if(foreignKind==1) twpng_ReadJpegAIParams(fn, &aiText);
+		else               twpng_ReadWebpAIParams(fn, &aiText);
+		if(aiText) {
+			if(globals.open_params_on_load)
+				twpng_OpenAIParamsViewerFromText(aiText, lstrlen(aiText));
+			free(aiText);
+		}
+		return 1;
+	}
+
+	// PNG / MNG / JNG path.
+	g_foreignFn[0] = 0;
+	g_foreignKind = 0;
+	png = new Png(fn, fn);
 
 	if(!png->m_valid) {
 		delete png;
@@ -1742,7 +1821,7 @@ static int OpenPngFromMenu(HWND hwnd)
 	ofn.lStructSize=sizeof(OPENFILENAME);
 	ofn.hwndOwner=hwnd;
 	ofn.hInstance=NULL;
-	ofn.lpstrFilter=_T("PNG, MNG, JNG\0*.png;*.mng;*.jng\0PNG\0*.png\0MNG\0*.mng\0JNG\0*.jng\0All files\0*.*\0\0");
+	ofn.lpstrFilter=_T("Images\0*.png;*.mng;*.jng;*.jpg;*.jpeg;*.webp\0PNG, MNG, JNG\0*.png;*.mng;*.jng\0JPEG\0*.jpg;*.jpeg\0WebP\0*.webp\0All files\0*.*\0\0");
 	ofn.nFilterIndex=1;
 	ofn.lpstrTitle=_T("Open image file");
 	if(lstrlen(globals.last_open_dir))
@@ -2406,27 +2485,81 @@ static void twpng_CloseAIParamsView()
 	if(g_hwndAIParams) DestroyWindow(g_hwndAIParams);
 }
 
-// Find the "parameters" tEXt chunk and show the modeless parsed viewer.
+// Show the modeless parsed viewer for an already-extracted parameters string.
+// `text` is copied; pass len in TCHARs (excluding terminator). Returns 1 on success.
+static int twpng_OpenAIParamsViewerFromText(const TCHAR *text, int len)
+{
+	if(g_hwndAIParams) { SetForegroundWindow(g_hwndAIParams); return 1; }
+	if(!text || len<=0) return 0;
+
+	g_aiParamsCtx = (struct aiparams_ctx*)calloc(1,sizeof(struct aiparams_ctx));
+	if(!g_aiParamsCtx) return 0;
+	g_aiParamsCtx->full=(TCHAR*)malloc(((size_t)len+1)*sizeof(TCHAR));
+	if(!g_aiParamsCtx->full) { free(g_aiParamsCtx); g_aiParamsCtx=NULL; return 0; }
+	memcpy(g_aiParamsCtx->full, text, (size_t)len*sizeof(TCHAR));
+	g_aiParamsCtx->full[len]=0;
+
+	if(twpng_LooksLikeComfyJson(g_aiParamsCtx->full))
+		twpng_ParseComfyJson(g_aiParamsCtx->full, g_aiParamsCtx);
+	else
+		twpng_ParseA1111(g_aiParamsCtx->full, g_aiParamsCtx);
+
+	// No owner window, so it minimizes independently and gets its own taskbar button.
+	g_hwndAIParams = CreateDialogParam(globals.hInst,_T("DLG_AIPARAMS"),
+		NULL, DlgProcAIParams, (LPARAM)g_aiParamsCtx);
+	if(!g_hwndAIParams){
+		free(g_aiParamsCtx->full); free(g_aiParamsCtx->pos);
+		free(g_aiParamsCtx->neg);  free(g_aiParamsCtx->setRaw);
+		free(g_aiParamsCtx); g_aiParamsCtx=NULL;
+		return 0;
+	}
+	if(globals.window_prefs.aiparams.w>0 && globals.window_prefs.aiparams.h>0)
+		twpng_SetWindowPos(g_hwndAIParams,&globals.window_prefs.aiparams);
+	ShowWindow(g_hwndAIParams, SW_SHOW);
+	SetForegroundWindow(g_hwndAIParams);
+	return 1;
+}
+
+// Find the "parameters" tEXt chunk in the current document and show the parsed viewer.
+// Also handles foreign (JPEG/WebP) files: re-reads their EXIF metadata.
 static void twpng_ViewAIParams(HWND owner)
 {
 	Chunk *found=NULL;
 	int i;
 	(void)owner;
 
-	if(!png) return;
-
-	// Already open: just bring it to the front.
 	if(g_hwndAIParams) { SetForegroundWindow(g_hwndAIParams); return; }
 
-	for(i=0;i<png->m_num_chunks;i++){
-		Chunk *c=png->chunk[i];
-		if(c && c->m_chunktype_id==CHUNK_tEXt){
-			struct keyword_info_struct kw;
-			if(c->get_keyword_info(&kw) && !lstrcmp(kw.keyword,_T("parameters"))){ found=c; break; }
+	// Foreign (JPEG/WebP) file loaded — re-extract from EXIF.
+	if(!png && g_foreignFn[0]) {
+		TCHAR *text = NULL;
+		if(g_foreignKind == 1)      twpng_ReadJpegAIParams(g_foreignFn, &text);
+		else if(g_foreignKind == 2) twpng_ReadWebpAIParams(g_foreignFn, &text);
+		if(text) {
+			twpng_OpenAIParamsViewerFromText(text, lstrlen(text));
+			free(text);
+		} else {
+			mesg(MSG_I, _T("No AI parameters were found in this file."));
+		}
+		return;
+	}
+
+	if(!png) return;
+
+	static const TCHAR *keys[] = { _T("parameters"), _T("prompt"), NULL };
+	for(int ki=0; keys[ki] && !found; ki++) {
+		for(i=0;i<png->m_num_chunks;i++){
+			Chunk *c=png->chunk[i];
+			if(c && (c->m_chunktype_id==CHUNK_tEXt ||
+			         c->m_chunktype_id==CHUNK_zTXt ||
+			         c->m_chunktype_id==CHUNK_iTXt)){
+				struct keyword_info_struct kw;
+				if(c->get_keyword_info(&kw) && !lstrcmp(kw.keyword,keys[ki])){ found=c; break; }
+			}
 		}
 	}
 	if(!found){
-		mesg(MSG_I,_T("No A1111 \"parameters\" tEXt chunk was found in this file."));
+		mesg(MSG_I,_T("No AI parameters (tEXt \"parameters\" or \"prompt\") were found."));
 		return;
 	}
 	if(!found->get_text_info() || !found->m_text_info.text){
@@ -2436,28 +2569,703 @@ static void twpng_ViewAIParams(HWND owner)
 
 	int n = found->m_text_info.text_size_in_tchars;
 	if(n<0) n=0;
-	g_aiParamsCtx = (struct aiparams_ctx*)calloc(1,sizeof(struct aiparams_ctx));
-	if(!g_aiParamsCtx) return;
-	g_aiParamsCtx->full=(TCHAR*)malloc(((size_t)n+1)*sizeof(TCHAR));
-	if(!g_aiParamsCtx->full) { free(g_aiParamsCtx); g_aiParamsCtx=NULL; return; }
-	if(n>0) memcpy(g_aiParamsCtx->full, found->m_text_info.text, (size_t)n*sizeof(TCHAR));
-	g_aiParamsCtx->full[n]=0;
+	twpng_OpenAIParamsViewerFromText(found->m_text_info.text, n);
+}
 
-	twpng_ParseA1111(g_aiParamsCtx->full, g_aiParamsCtx);
+// ---- Minimal ComfyUI prompt-JSON extractor -------------------------------------------
+// ComfyUI stores its graph as { "<nodeId>": { "inputs": {...}, "class_type": "..." }, ... }.
+// We don't write a full JSON parser; we do brace-aware substring scans for the few keys
+// we care about and synthesize an A1111-style "Prompt\nNegative prompt: ...\nSteps: ..."
+// string that the existing twpng_ParseA1111 / DLG_AIPARAMS viewer can consume.
 
-	// No owner window, so it minimizes independently and gets its own taskbar button.
-	g_hwndAIParams = CreateDialogParam(globals.hInst,_T("DLG_AIPARAMS"),
-		NULL, DlgProcAIParams, (LPARAM)g_aiParamsCtx);
-	if(!g_hwndAIParams){
-		free(g_aiParamsCtx->full); free(g_aiParamsCtx->pos);
-		free(g_aiParamsCtx->neg);  free(g_aiParamsCtx->setRaw);
-		free(g_aiParamsCtx); g_aiParamsCtx=NULL;
+// Skip ASCII whitespace.
+static int cf_skip_ws(const TCHAR *s, int i, int len) {
+	while(i<len && (s[i]==_T(' ')||s[i]==_T('\t')||s[i]==_T('\n')||s[i]==_T('\r'))) i++;
+	return i;
+}
+
+// Given the index of a '{' (or '[') in s, return the index just past its matching close.
+// Returns -1 on unbalanced input.
+static int cf_match_brace(const TCHAR *s, int start, int len) {
+	if(start>=len) return -1;
+	TCHAR open = s[start];
+	TCHAR close = (open==_T('{')) ? _T('}') : (open==_T('[')) ? _T(']') : 0;
+	if(!close) return -1;
+	int depth = 0; BOOL inStr=FALSE, esc=FALSE;
+	for(int i=start;i<len;i++){
+		TCHAR c = s[i];
+		if(inStr){
+			if(esc) esc=FALSE;
+			else if(c==_T('\\')) esc=TRUE;
+			else if(c==_T('"')) inStr=FALSE;
+			continue;
+		}
+		if(c==_T('"')) { inStr=TRUE; continue; }
+		if(c==open) depth++;
+		else if(c==close) { depth--; if(depth==0) return i+1; }
+	}
+	return -1;
+}
+
+// Parse a JSON string starting at s[i]=='"'. Returns allocated TCHAR (caller frees) and
+// sets *outAfter to the index just past the closing quote. NULL on failure.
+static TCHAR *cf_parse_string(const TCHAR *s, int i, int len, int *outAfter) {
+	if(i>=len || s[i]!=_T('"')) return NULL;
+	i++;
+	int j=i, n=0;
+	while(j<len) {
+		TCHAR c = s[j];
+		if(c==_T('\\')) { if(j+1>=len) return NULL; j+=2; n++; }
+		else if(c==_T('"')) break;
+		else { j++; n++; }
+	}
+	if(j>=len) return NULL;
+	TCHAR *out = (TCHAR*)malloc(((size_t)n+1)*sizeof(TCHAR));
+	if(!out) return NULL;
+	int k=0, p=i;
+	while(p<j) {
+		TCHAR c = s[p];
+		if(c==_T('\\') && p+1<j) {
+			TCHAR e = s[p+1];
+			switch(e){
+			case _T('n'): out[k++]=_T('\n'); p+=2; break;
+			case _T('r'): out[k++]=_T('\r'); p+=2; break;
+			case _T('t'): out[k++]=_T('\t'); p+=2; break;
+			case _T('"'): out[k++]=_T('"'); p+=2; break;
+			case _T('\\'): out[k++]=_T('\\'); p+=2; break;
+			case _T('/'): out[k++]=_T('/'); p+=2; break;
+			case _T('u'): {
+				if(p+5>=j){ p+=2; break; }
+				unsigned u=0; BOOL ok=TRUE;
+				for(int h=0; h<4; h++){
+					TCHAR d = s[p+2+h]; u <<= 4;
+					if(d>=_T('0')&&d<=_T('9')) u |= d-_T('0');
+					else if(d>=_T('a')&&d<=_T('f')) u |= d-_T('a')+10;
+					else if(d>=_T('A')&&d<=_T('F')) u |= d-_T('A')+10;
+					else { ok=FALSE; break; }
+				}
+				if(ok) out[k++] = (TCHAR)u;
+				p += 6;
+				break;
+			}
+			default: out[k++]=e; p+=2; break;
+			}
+		}
+		else { out[k++]=c; p++; }
+	}
+	out[k]=0;
+	*outAfter = j+1;
+	return out;
+}
+
+// Within object body [start, end), find "key" and return TRUE with *valueStart pointing
+// to the first non-whitespace character of the value (just past the colon).
+static BOOL cf_find_key(const TCHAR *s, int start, int end, const TCHAR *key, int *valueStart) {
+	int klen = lstrlen(key);
+	int depth = 0; BOOL inStr=FALSE, esc=FALSE;
+	for(int i=start; i<end; i++) {
+		TCHAR c = s[i];
+		if(inStr) {
+			if(esc) esc=FALSE;
+			else if(c==_T('\\')) esc=TRUE;
+			else if(c==_T('"')) {
+				inStr=FALSE;
+				// Only check at top level of this object: depth==0.
+				if(depth==0 && i-start >= klen) {
+					int kstart = i-klen;
+					if(kstart>0 && s[kstart-1]==_T('"') && !_tcsncmp(&s[kstart],key,klen)) {
+						// after the closing quote, expect optional ws then ':'
+						int p = cf_skip_ws(s, i+1, end);
+						if(p<end && s[p]==_T(':')) {
+							p = cf_skip_ws(s, p+1, end);
+							*valueStart = p;
+							return TRUE;
+						}
+					}
+				}
+			}
+			continue;
+		}
+		if(c==_T('"')) inStr=TRUE;
+		else if(c==_T('{') || c==_T('[')) depth++;
+		else if(c==_T('}') || c==_T(']')) depth--;
+	}
+	return FALSE;
+}
+
+static TCHAR *cf_get_string(const TCHAR *s, int start, int end, const TCHAR *key) {
+	int v;
+	if(!cf_find_key(s,start,end,key,&v)) return NULL;
+	int after;
+	return cf_parse_string(s, v, end, &after);
+}
+
+// "key": ["nodeId", n] → returns "nodeId".
+static TCHAR *cf_get_ref(const TCHAR *s, int start, int end, const TCHAR *key) {
+	int v;
+	if(!cf_find_key(s,start,end,key,&v)) return NULL;
+	if(v>=end || s[v]!=_T('[')) return NULL;
+	int p = cf_skip_ws(s, v+1, end);
+	int after;
+	return cf_parse_string(s, p, end, &after);
+}
+
+// "key": <number>. Reads the raw digits/'.'/'-'/etc into out (NUL-term, max outCap).
+// Returns TRUE if found.
+static BOOL cf_get_number_str(const TCHAR *s, int start, int end, const TCHAR *key, TCHAR *out, int outCap) {
+	int v;
+	if(!cf_find_key(s,start,end,key,&v)) return FALSE;
+	int p=v, q=v;
+	while(q<end) {
+		TCHAR c = s[q];
+		if((c>=_T('0')&&c<=_T('9'))||c==_T('.')||c==_T('-')||c==_T('+')||c==_T('e')||c==_T('E')) q++;
+		else break;
+	}
+	int n = q-p;
+	if(n<=0 || n>=outCap) return FALSE;
+	memcpy(out, &s[p], (size_t)n*sizeof(TCHAR));
+	out[n]=0;
+	return TRUE;
+}
+
+// Find the value range (start..end) of a top-level node by id, i.e. "<id>": { ... }.
+// Returns TRUE; on success sets *nodeStart/*nodeEnd to the inside of the braces.
+static BOOL cf_find_node_by_id(const TCHAR *s, int len, const TCHAR *id, int *nodeStart, int *nodeEnd) {
+	int idlen = lstrlen(id);
+	int depth = 0; BOOL inStr=FALSE, esc=FALSE;
+	for(int i=0; i<len; i++) {
+		TCHAR c = s[i];
+		if(inStr) {
+			if(esc) esc=FALSE;
+			else if(c==_T('\\')) esc=TRUE;
+			else if(c==_T('"')) {
+				inStr=FALSE;
+				if(depth==1 && i-idlen-1 >= 0) {
+					int kstart = i-idlen;
+					if(s[kstart-1]==_T('"') && !_tcsncmp(&s[kstart],id,idlen) && (i-kstart)==idlen) {
+						int p = cf_skip_ws(s,i+1,len);
+						if(p<len && s[p]==_T(':')) {
+							p = cf_skip_ws(s,p+1,len);
+							if(p<len && s[p]==_T('{')) {
+								int after = cf_match_brace(s, p, len);
+								if(after>0) {
+									*nodeStart = p+1;
+									*nodeEnd = after-1;
+									return TRUE;
+								}
+							}
+						}
+					}
+				}
+			}
+			continue;
+		}
+		if(c==_T('"')) inStr=TRUE;
+		else if(c==_T('{') || c==_T('[')) depth++;
+		else if(c==_T('}') || c==_T(']')) depth--;
+	}
+	return FALSE;
+}
+
+// True if a node's class_type matches `wanted`.
+static BOOL cf_class_is(const TCHAR *s, int nodeStart, int nodeEnd, const TCHAR *wanted) {
+	TCHAR *ct = cf_get_string(s, nodeStart, nodeEnd, _T("class_type"));
+	if(!ct) return FALSE;
+	BOOL eq = (!lstrcmp(ct, wanted));
+	free(ct);
+	return eq;
+}
+
+// Detect ComfyUI format by content (first non-ws char is '{' and the text contains
+// "class_type"). Returns TRUE if it looks like a ComfyUI prompt graph.
+static BOOL twpng_LooksLikeComfyJson(const TCHAR *s) {
+	if(!s) return FALSE;
+	int len = lstrlen(s);
+	int i = cf_skip_ws(s, 0, len);
+	if(i>=len || s[i]!=_T('{')) return FALSE;
+	return _tcsstr(s, _T("\"class_type\"")) != NULL;
+}
+
+// Parse a ComfyUI prompt JSON and fill aiparams_ctx (pos, neg, setRaw). Returns TRUE
+// on success. The caller still owns ctx->full.
+static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
+	int len = lstrlen(full);
+
+	// Locate the inputs subobject of the first KSampler-like sampler.
+	// Try a few known class_type names in order.
+	static const TCHAR *samplerTypes[] = {
+		_T("KSampler"), _T("KSamplerAdvanced"), _T("KSampler (Efficient)"),
+		_T("SamplerCustom"), _T("SamplerCustomAdvanced"), NULL };
+
+	int samplerStart=-1, samplerEnd=-1;
+	for(int t=0; samplerTypes[t] && samplerStart<0; t++) {
+		// scan for "\"class_type\": \"<name>\"" inside a top-level node body.
+		TCHAR needle[80];
+		StringCchPrintf(needle, 80, _T("\"class_type\": \"%s\""), samplerTypes[t]);
+		int alt2 = lstrlen(needle);
+		const TCHAR *hit = _tcsstr(full, needle);
+		if(!hit) {
+			StringCchPrintf(needle, 80, _T("\"class_type\":\"%s\""), samplerTypes[t]);
+			hit = _tcsstr(full, needle);
+		}
+		if(!hit) continue;
+		// Walk backward to the enclosing node '{' (depth 1).
+		int pos = (int)(hit - full);
+		int depth=0; BOOL inStr=FALSE;
+		// Easier: search forward from pos for the end of this node's containing object.
+		// And backward for its start. Use simple brace count.
+		int back = pos;
+		depth = 0; inStr=FALSE;
+		while(back > 0) {
+			back--;
+			TCHAR c = full[back];
+			// crude: don't handle strings on the way back, but JSON node bodies don't
+			// have unbalanced braces inside strings in practice for ComfyUI graphs.
+			if(c==_T('}')||c==_T(']')) depth++;
+			else if(c==_T('{')||c==_T('[')) {
+				if(depth==0) { samplerStart = back+1; break; }
+				depth--;
+			}
+		}
+		if(samplerStart>=0) {
+			int after = cf_match_brace(full, samplerStart-1, len);
+			if(after>0) samplerEnd = after-1;
+			else samplerStart = -1;
+		}
+	}
+	if(samplerStart<0) return FALSE;
+
+	// Pull the sampler's "inputs" subobject.
+	int inputsVal;
+	if(!cf_find_key(full, samplerStart, samplerEnd, _T("inputs"), &inputsVal)) return FALSE;
+	if(inputsVal>=samplerEnd || full[inputsVal]!=_T('{')) return FALSE;
+	int inputsEnd = cf_match_brace(full, inputsVal, len);
+	if(inputsEnd<0) return FALSE;
+	int iStart = inputsVal+1, iEnd = inputsEnd-1;
+
+	TCHAR seed[64]=_T(""), steps[32]=_T(""), cfg[32]=_T(""), denoise[32]=_T("");
+	cf_get_number_str(full, iStart, iEnd, _T("seed"), seed, 64);
+	if(!seed[0]) cf_get_number_str(full, iStart, iEnd, _T("noise_seed"), seed, 64);
+	cf_get_number_str(full, iStart, iEnd, _T("steps"), steps, 32);
+	cf_get_number_str(full, iStart, iEnd, _T("cfg"), cfg, 32);
+	cf_get_number_str(full, iStart, iEnd, _T("denoise"), denoise, 32);
+	TCHAR *sampler   = cf_get_string(full, iStart, iEnd, _T("sampler_name"));
+	TCHAR *scheduler = cf_get_string(full, iStart, iEnd, _T("scheduler"));
+	TCHAR *posRef    = cf_get_ref(full, iStart, iEnd, _T("positive"));
+	TCHAR *negRef    = cf_get_ref(full, iStart, iEnd, _T("negative"));
+
+	// Resolve positive/negative to CLIPTextEncode "text" by recursively walking the
+	// graph until we find a node with a "text" input (skipping ConditioningSet* etc.).
+	TCHAR *positive = NULL, *negative = NULL;
+	const TCHAR *refKeys[] = { _T("conditioning"), _T("conditioning_1"), _T("clip"), NULL };
+	for(int side=0; side<2; side++) {
+		TCHAR *ref = (side==0) ? posRef : negRef;
+		TCHAR **outp = (side==0) ? &positive : &negative;
+		for(int hop=0; ref && hop<6 && !*outp; hop++) {
+			int ns,ne;
+			if(!cf_find_node_by_id(full, len, ref, &ns, &ne)) break;
+			int ivStart;
+			if(cf_find_key(full,ns,ne,_T("inputs"),&ivStart) && full[ivStart]==_T('{')) {
+				int ivEnd = cf_match_brace(full, ivStart, len);
+				if(ivEnd>0) {
+					TCHAR *txt = cf_get_string(full, ivStart+1, ivEnd-1, _T("text"));
+					if(txt) { *outp = txt; break; }
+					// no text here — follow first ref-style input that points to another node
+					TCHAR *next = NULL;
+					for(int k=0; refKeys[k] && !next; k++)
+						next = cf_get_ref(full, ivStart+1, ivEnd-1, refKeys[k]);
+					if(!next) break;
+					free(ref);
+					ref = next;
+					if(side==0) posRef = ref; else negRef = ref;
+				}
+			}
+		}
+	}
+	if(posRef) free(posRef);
+	if(negRef) free(negRef);
+
+	// Find first size-bearing node (EmptyLatentImage / EmptySD3LatentImage / EmptyHunyuan*).
+	TCHAR width[16]=_T(""), height[16]=_T("");
+	static const TCHAR *latentTypes[] = {
+		_T("EmptyLatentImage"), _T("EmptySD3LatentImage"),
+		_T("EmptyHunyuanLatentVideo"), _T("EmptyMochiLatentVideo"), NULL };
+	for(int t=0; latentTypes[t] && !width[0]; t++) {
+		TCHAR needle[64];
+		StringCchPrintf(needle,64,_T("\"class_type\": \"%s\""),latentTypes[t]);
+		const TCHAR *hit = _tcsstr(full, needle);
+		if(!hit) { StringCchPrintf(needle,64,_T("\"class_type\":\"%s\""),latentTypes[t]); hit=_tcsstr(full,needle); }
+		if(!hit) continue;
+		// Walk back to find this node's body.
+		int pos = (int)(hit - full), back=pos, depth=0;
+		int ns=-1;
+		while(back>0){ back--; TCHAR c=full[back];
+			if(c==_T('}')||c==_T(']')) depth++;
+			else if(c==_T('{')||c==_T('[')){ if(depth==0){ ns=back+1; break; } depth--; }
+		}
+		if(ns<0) continue;
+		int after = cf_match_brace(full, ns-1, len);
+		if(after<0) continue;
+		int ne = after-1;
+		int ivStart;
+		if(cf_find_key(full,ns,ne,_T("inputs"),&ivStart) && full[ivStart]==_T('{')) {
+			int ivEnd = cf_match_brace(full, ivStart, len);
+			if(ivEnd>0) {
+				cf_get_number_str(full, ivStart+1, ivEnd-1, _T("width"), width, 16);
+				cf_get_number_str(full, ivStart+1, ivEnd-1, _T("height"), height, 16);
+			}
+		}
+	}
+
+	// Find a model name from common loader class types.
+	TCHAR *model = NULL;
+	static const struct { const TCHAR *cls; const TCHAR *key; } loaders[] = {
+		{ _T("UNETLoader"),             _T("unet_name") },
+		{ _T("UnetLoaderGGUF"),         _T("unet_name") },
+		{ _T("CheckpointLoaderSimple"), _T("ckpt_name") },
+		{ _T("CheckpointLoader"),       _T("ckpt_name") },
+		{ NULL, NULL } };
+	for(int t=0; loaders[t].cls && !model; t++) {
+		TCHAR needle[64];
+		StringCchPrintf(needle,64,_T("\"class_type\": \"%s\""),loaders[t].cls);
+		const TCHAR *hit = _tcsstr(full, needle);
+		if(!hit) { StringCchPrintf(needle,64,_T("\"class_type\":\"%s\""),loaders[t].cls); hit=_tcsstr(full,needle); }
+		if(!hit) continue;
+		int pos = (int)(hit-full), back=pos, depth=0, ns=-1;
+		while(back>0){ back--; TCHAR c=full[back];
+			if(c==_T('}')||c==_T(']')) depth++;
+			else if(c==_T('{')||c==_T('[')){ if(depth==0){ ns=back+1; break; } depth--; }
+		}
+		if(ns<0) continue;
+		int after = cf_match_brace(full, ns-1, len);
+		if(after<0) continue;
+		int ivStart;
+		if(cf_find_key(full,ns,after-1,_T("inputs"),&ivStart) && full[ivStart]==_T('{')) {
+			int ivEnd = cf_match_brace(full, ivStart, len);
+			if(ivEnd>0) model = cf_get_string(full, ivStart+1, ivEnd-1, loaders[t].key);
+		}
+	}
+
+	// Build settings line.
+	TCHAR setbuf[1500] = _T("");
+	if(steps[0])    { StringCchCat(setbuf,1500,_T("Steps: "));         StringCchCat(setbuf,1500,steps); }
+	if(sampler)     { StringCchCat(setbuf,1500,_T(", Sampler: "));     StringCchCat(setbuf,1500,sampler); }
+	if(scheduler)   { StringCchCat(setbuf,1500,_T(", Schedule type: ")); StringCchCat(setbuf,1500,scheduler); }
+	if(cfg[0])      { StringCchCat(setbuf,1500,_T(", CFG scale: "));   StringCchCat(setbuf,1500,cfg); }
+	if(seed[0])     { StringCchCat(setbuf,1500,_T(", Seed: "));        StringCchCat(setbuf,1500,seed); }
+	if(width[0] && height[0]) {
+		StringCchCat(setbuf,1500,_T(", Size: "));
+		StringCchCat(setbuf,1500,width); StringCchCat(setbuf,1500,_T("x")); StringCchCat(setbuf,1500,height);
+	}
+	if(model)       { StringCchCat(setbuf,1500,_T(", Model: "));       StringCchCat(setbuf,1500,model); }
+	if(denoise[0])  { StringCchCat(setbuf,1500,_T(", Denoising strength: ")); StringCchCat(setbuf,1500,denoise); }
+	// "Steps:" must come first in the settings line for the A1111 parser to find it.
+	if(setbuf[0]==_T(',')) memmove(setbuf,setbuf+2,(lstrlen(setbuf+2)+1)*sizeof(TCHAR));
+
+	if(sampler) free(sampler);
+	if(scheduler) free(scheduler);
+	if(model) free(model);
+
+	if(positive) ctx->pos = positive;
+	else ctx->pos = NULL;
+	ctx->neg = negative;  // may be NULL
+	ctx->setRaw = NULL;
+	if(setbuf[0]) {
+		int sl = lstrlen(setbuf);
+		ctx->setRaw = (TCHAR*)malloc(((size_t)sl+1)*sizeof(TCHAR));
+		if(ctx->setRaw) memcpy(ctx->setRaw, setbuf, ((size_t)sl+1)*sizeof(TCHAR));
+	}
+	return (ctx->pos || ctx->neg || ctx->setRaw);
+}
+
+// ---- EXIF UserComment extraction from JPEG / WebP files ------------------------------
+
+struct tiff_ctx { const unsigned char *base; DWORD len; BOOL be; };
+
+static WORD tiff_read16(const struct tiff_ctx *t, DWORD off)
+{
+	if(off+2 > t->len) return 0;
+	return t->be ? (WORD)((t->base[off]<<8) | t->base[off+1])
+	             : (WORD)(t->base[off] | (t->base[off+1]<<8));
+}
+
+static DWORD tiff_read32(const struct tiff_ctx *t, DWORD off)
+{
+	if(off+4 > t->len) return 0;
+	if(t->be) return ((DWORD)t->base[off]<<24)   | ((DWORD)t->base[off+1]<<16) |
+	                 ((DWORD)t->base[off+2]<<8)  |  (DWORD)t->base[off+3];
+	else      return ((DWORD)t->base[off+3]<<24) | ((DWORD)t->base[off+2]<<16) |
+	                 ((DWORD)t->base[off+1]<<8)  |  (DWORD)t->base[off];
+}
+
+// In the IFD at ifdOff find `tag`; on success fills outType/outCount and
+// outValOff (offset of the 4-byte value-or-offset field within the TIFF).
+static BOOL tiff_find_tag(const struct tiff_ctx *t, DWORD ifdOff, WORD tag,
+	WORD *outType, DWORD *outCount, DWORD *outValOff)
+{
+	if(ifdOff+2 > t->len) return FALSE;
+	WORD n = tiff_read16(t, ifdOff);
+	if(ifdOff+2+(DWORD)n*12 > t->len) return FALSE;
+	for(WORD i=0;i<n;i++) {
+		DWORD eo = ifdOff + 2 + (DWORD)i*12;
+		if(tiff_read16(t, eo) == tag) {
+			*outType   = tiff_read16(t, eo+2);
+			*outCount  = tiff_read32(t, eo+4);
+			*outValOff = eo+8;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+// Convert the EXIF UserComment byte buffer (raw, including the 8-byte charset prefix)
+// into an allocated TCHAR string. `tiff_be` indicates the TIFF's byte order; UNICODE
+// data follows that byte order (UTF-16BE for "MM", UTF-16LE for "II").
+static TCHAR *twpng_DecodeUserComment(const unsigned char *data, DWORD len, BOOL tiff_be)
+{
+	if(!data || len < 1) return NULL;
+	const unsigned char *body = data;
+	DWORD bodyLen = len;
+	int charset = 0;   // 0=ASCII/Latin-1, 1=UTF-16, 2=UTF-8 (heuristic)
+	if(len >= 8) {
+		if(!memcmp(data,"UNICODE\0",8))         { charset=1; body+=8; bodyLen-=8; }
+		else if(!memcmp(data,"ASCII\0\0\0",8))  { charset=0; body+=8; bodyLen-=8; }
+		else if(!memcmp(data,"\0\0\0\0\0\0\0\0",8)) { charset=0; body+=8; bodyLen-=8; }
+	}
+	while(bodyLen>0 && body[bodyLen-1]==0) bodyLen--;
+	if(bodyLen==0) return NULL;
+
+	// "UNICODE" can be UTF-16 in either byte order (writers are inconsistent: the
+	// Civitai/A1111 JPEG exporter writes UTF-16BE even though the TIFF is LE) or
+	// occasionally UTF-8 with a mistagged marker. Detect from the data itself: count
+	// zeros at even vs odd positions in the first ~32 bytes — LE has zero at the high
+	// byte (odd position for ASCII), BE at the high byte (even position for ASCII).
+	BOOL be_for_decode = tiff_be;
+	if(charset==1) {
+		int probe = (bodyLen<32) ? (int)bodyLen : 32;
+		int zEven=0, zOdd=0;
+		for(int i=0; i<probe; i++) {
+			if(body[i]==0) { if(i & 1) zOdd++; else zEven++; }
+		}
+		if(zEven > zOdd*2)       be_for_decode = TRUE;
+		else if(zOdd > zEven*2)  be_for_decode = FALSE;
+		// Almost no zeros: definitely not UTF-16 ASCII text → treat as UTF-8.
+		if(probe >= 8 && (zEven + zOdd) * 4 < probe) charset = 2;
+	}
+
+#ifdef UNICODE
+	if(charset==1) {
+		if(bodyLen%2) bodyLen--;
+		int nchars = (int)(bodyLen/2);
+		TCHAR *out = (TCHAR*)malloc(((size_t)nchars+1)*sizeof(TCHAR));
+		if(!out) return NULL;
+		if(be_for_decode) {
+			for(int i=0; i<nchars; i++)
+				out[i] = (TCHAR)(((unsigned)body[i*2]<<8) | (unsigned)body[i*2+1]);
+		} else {
+			memcpy(out, body, (size_t)nchars*2);
+		}
+		out[nchars]=0;
+		return out;
+	}
+	// ASCII/UTF-8: try UTF-8, fall back to Windows-1252.
+	UINT cp = (charset==2) ? CP_UTF8 : CP_UTF8;
+	int wlen = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, (const char*)body, (int)bodyLen, NULL, 0);
+	if(wlen<=0) {
+		cp = 1252;
+		wlen = MultiByteToWideChar(cp, 0, (const char*)body, (int)bodyLen, NULL, 0);
+		if(wlen<=0) return NULL;
+	}
+	TCHAR *out = (TCHAR*)malloc(((size_t)wlen+1)*sizeof(TCHAR));
+	if(!out) return NULL;
+	MultiByteToWideChar(cp, 0, (const char*)body, (int)bodyLen, out, wlen);
+	out[wlen]=0;
+	return out;
+#else
+	(void)charset;
+	TCHAR *out = (TCHAR*)malloc(((size_t)bodyLen+1)*sizeof(TCHAR));
+	if(!out) return NULL;
+	memcpy(out, body, bodyLen);
+	out[bodyLen]=0;
+	return out;
+#endif
+}
+
+// Given a TIFF stream (the bytes immediately after "Exif\0\0" in a JPEG APP1, or the
+// payload of a WebP EXIF chunk), extract the EXIF UserComment as a TCHAR string.
+static int twpng_ExtractFromExifTiff(const unsigned char *tiff, DWORD tiffLen, TCHAR **outText)
+{
+	*outText = NULL;
+	if(tiffLen < 8) return 0;
+	BOOL be;
+	if(tiff[0]=='I' && tiff[1]=='I')      be=FALSE;
+	else if(tiff[0]=='M' && tiff[1]=='M') be=TRUE;
+	else return 0;
+
+	struct tiff_ctx ctx = { tiff, tiffLen, be };
+	if(tiff_read16(&ctx, 2) != 0x002A) return 0;
+	DWORD ifd0 = tiff_read32(&ctx, 4);
+	if(ifd0+2 > tiffLen) return 0;
+
+	WORD type; DWORD count, valOff;
+	if(!tiff_find_tag(&ctx, ifd0, 0x8769, &type, &count, &valOff)) return 0; // ExifIFDPointer
+	DWORD exifIfdOff = tiff_read32(&ctx, valOff);
+	if(exifIfdOff+2 > tiffLen) return 0;
+
+	if(!tiff_find_tag(&ctx, exifIfdOff, 0x9286, &type, &count, &valOff)) return 0; // UserComment
+	if(type != 7 || count < 1) return 0; // UNDEFINED
+
+	DWORD dataOff = (count<=4) ? valOff : tiff_read32(&ctx, valOff);
+	if(dataOff+count > tiffLen) return 0;
+
+	*outText = twpng_DecodeUserComment(tiff+dataOff, count, be);
+	return *outText ? 1 : 0;
+}
+
+// Read a whole file into memory (capped). Caller frees with free().
+static int twpng_SlurpFile(const TCHAR *fn, DWORD cap, unsigned char **outBuf, DWORD *outSize)
+{
+	*outBuf=NULL; *outSize=0;
+	HANDLE fh = CreateFile(fn, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL, NULL);
+	if(fh==INVALID_HANDLE_VALUE) return 0;
+	DWORD fsz = GetFileSize(fh, NULL);
+	if(fsz==INVALID_FILE_SIZE) { CloseHandle(fh); return 0; }
+	if(fsz > cap) fsz = cap;
+	if(fsz < 4) { CloseHandle(fh); return 0; }
+	unsigned char *buf = (unsigned char*)malloc(fsz);
+	if(!buf) { CloseHandle(fh); return 0; }
+	DWORD got = 0;
+	if(!ReadFile(fh, buf, fsz, &got, NULL) || got<4) { free(buf); CloseHandle(fh); return 0; }
+	CloseHandle(fh);
+	*outBuf = buf; *outSize = got;
+	return 1;
+}
+
+// Locate the EXIF TIFF payload in a JPEG (APP1 marker, "Exif\0\0" prefix).
+// We deliberately report the TIFF length as "rest of file from the TIFF start" rather
+// than the APP1 segment's declared length, because some AI image writers (Civitai etc.)
+// write a small APP1 header whose declared length doesn't cover the full UserComment —
+// the TIFF offsets reference data beyond the segment boundary. The TIFF parser will
+// still bounds-check against the value we return.
+static int twpng_FindJpegExif(const unsigned char *buf, DWORD len,
+	const unsigned char **outTiff, DWORD *outTiffLen)
+{
+	if(len<4 || buf[0]!=0xFF || buf[1]!=0xD8) return 0;
+	DWORD p = 2;
+	while(p+4 <= len) {
+		if(buf[p] != 0xFF) return 0;
+		while(p<len && buf[p]==0xFF) p++;
+		if(p>=len) return 0;
+		BYTE marker = buf[p++];
+		if(marker==0x00 || marker==0xFF) continue;
+		if(marker==0xD8 || marker==0xD9 || marker==0x01 ||
+		   (marker>=0xD0 && marker<=0xD7)) continue;          // standalone markers
+		if(marker==0xDA) return 0;                            // SOS: scan data follows
+		if(p+2 > len) return 0;
+		WORD seglen = (WORD)((buf[p]<<8) | buf[p+1]);
+		if(seglen<2) return 0;
+		// Don't bail out if seglen would exceed len — some writers lie about seglen.
+		// We only need enough bytes inside the segment to recognize the EXIF prefix.
+		DWORD declaredEnd = p + seglen;
+		DWORD segDataAvail = (declaredEnd > len ? len : declaredEnd) - p - 2;
+		const unsigned char *seg = &buf[p+2];
+		if(marker==0xE1 && segDataAvail>=6 && !memcmp(seg,"Exif\0\0",6)) {
+			DWORD tiffOff = p + 2 + 6;
+			*outTiff = &buf[tiffOff];
+			*outTiffLen = len - tiffOff;   // up to end of file, not end of segment
+			return 1;
+		}
+		if(p + seglen > len) return 0;
+		p += seglen;
+	}
+	return 0;
+}
+
+static int twpng_ReadJpegAIParams(const TCHAR *fn, TCHAR **outText)
+{
+	*outText = NULL;
+	unsigned char *buf; DWORD size;
+	if(!twpng_SlurpFile(fn, 32UL*1024*1024, &buf, &size)) return 0;
+	const unsigned char *tiff; DWORD tiffLen;
+	int ok = twpng_FindJpegExif(buf, size, &tiff, &tiffLen) &&
+	         twpng_ExtractFromExifTiff(tiff, tiffLen, outText);
+	free(buf);
+	return ok;
+}
+
+static int twpng_ReadWebpAIParams(const TCHAR *fn, TCHAR **outText)
+{
+	*outText = NULL;
+	unsigned char *buf; DWORD size;
+	if(!twpng_SlurpFile(fn, 128UL*1024*1024, &buf, &size)) return 0;
+	int ok = 0;
+	if(size>=12 && !memcmp(buf,"RIFF",4) && !memcmp(buf+8,"WEBP",4)) {
+		DWORD p = 12;
+		while(p+8 <= size) {
+			DWORD chunkSize = (DWORD)buf[p+4] | ((DWORD)buf[p+5]<<8) |
+			                  ((DWORD)buf[p+6]<<16) | ((DWORD)buf[p+7]<<24);
+			DWORD bodyAt = p+8;
+			if(bodyAt+chunkSize > size) break;
+			if(!memcmp(buf+p,"EXIF",4)) {
+				ok = twpng_ExtractFromExifTiff(buf+bodyAt, chunkSize, outText);
+				break;
+			}
+			p = bodyAt + chunkSize + (chunkSize & 1);   // chunks are padded to even
+		}
+	}
+	free(buf);
+	return ok;
+}
+
+// File-open command: read AI params from a JPEG or WebP and show the parsed viewer.
+static void twpng_ReadAIFromFile(HWND owner)
+{
+	OPENFILENAME ofn;
+	TCHAR fn[MAX_PATH];
+	StringCchCopy(fn, MAX_PATH, _T(""));
+	ZeroMemory(&ofn, sizeof(ofn));
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner   = owner;
+	ofn.lpstrFilter = _T("JPEG and WebP images\0*.jpg;*.jpeg;*.webp\0All files (*.*)\0*.*\0\0");
+	ofn.nFilterIndex= 1;
+	ofn.lpstrFile   = fn;
+	ofn.nMaxFile    = MAX_PATH;
+	ofn.lpstrTitle  = _T("Read AI parameters from JPEG or WebP");
+	ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+	if(!GetOpenFileName(&ofn)) return;
+
+	// Sniff format by magic bytes.
+	HANDLE fh = CreateFile(fn, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL, NULL);
+	if(fh==INVALID_HANDLE_VALUE) { mesg(MSG_S,_T("Cannot open file.")); return; }
+	unsigned char hdr[16]; DWORD got=0;
+	ReadFile(fh, hdr, sizeof(hdr), &got, NULL);
+	CloseHandle(fh);
+
+	TCHAR *text = NULL;
+	int kind = 0;   // 1=JPEG, 2=WebP, 3=PNG
+	if(got>=2 && hdr[0]==0xFF && hdr[1]==0xD8) kind=1;
+	else if(got>=12 && !memcmp(hdr,"RIFF",4) && !memcmp(hdr+8,"WEBP",4)) kind=2;
+	else if(got>=8 && !memcmp(hdr,"\x89PNG\r\n\x1a\n",8)) kind=3;
+
+	if(kind==1)      twpng_ReadJpegAIParams(fn, &text);
+	else if(kind==2) twpng_ReadWebpAIParams(fn, &text);
+	else if(kind==3) {
+		mesg(MSG_I,_T("For PNG files, use File \xb7 Open and the viewer will pop up automatically."));
 		return;
 	}
-	if(globals.window_prefs.aiparams.w>0 && globals.window_prefs.aiparams.h>0)
-		twpng_SetWindowPos(g_hwndAIParams,&globals.window_prefs.aiparams);
-	ShowWindow(g_hwndAIParams, SW_SHOW);
-	SetForegroundWindow(g_hwndAIParams);
+	else {
+		mesg(MSG_W,_T("Unrecognized file format. Expected JPEG, WebP, or PNG."));
+		return;
+	}
+
+	if(!text) {
+		mesg(MSG_I,_T("No AI parameters were found in this file."));
+		return;
+	}
+	twpng_OpenAIParamsViewerFromText(text, lstrlen(text));
+	free(text);
 }
 
 // selects a range of items, and sets the focus to the first of that range
@@ -4298,6 +5106,7 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			AppendMenu(mtools,MF_SEPARATOR,0,NULL);
 #endif
 			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_VIEWAIPARAMS,_T("&View AI Parameters..."));
+			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_READAIFROMFILE,_T("Read AI parameters from &JPEG/WebP..."));
 			AppendMenu(mtools,MF_SEPARATOR,0,NULL);
 			for(i=0;i<TWPNG_NUMTOOLS;i++) {
 				if(lstrlen(globals.tools[i].name)) {
@@ -4320,6 +5129,10 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			for(i=0;cmdlist1[i];i++) {
 				EnableMenuItem(m,cmdlist1[i],x);
 			}
+
+			// "View AI Parameters" also works for a loaded JPEG/WebP (no PNG document).
+			if(!png && g_foreignFn[0])
+				EnableMenuItem(m,ID_VIEWAIPARAMS,MF_BYCOMMAND|MF_ENABLED);
 
 			x= MF_BYCOMMAND | ( (sel==1)?MF_ENABLED:MF_GRAYED );
 			for(i=0;cmdlist2[i];i++) {
@@ -4425,6 +5238,10 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			globals.dlgs_open++;
 			DialogBox(globals.hInst,_T("DLG_TOOLS"),globals.hwndMain,DlgProcTools);
 			globals.dlgs_open--;
+			return 0;
+
+		case ID_READAIFROMFILE:
+			twpng_ReadAIFromFile(hwnd);
 			return 0;
 
 		case ID_ABOUT:
@@ -4551,7 +5368,7 @@ static void twpng_HandleAboutInitDialog(HWND hwnd)
 		SYM_MIDDOT,buf1,
 		TWEAKPNG_COPYRIGHT_DATE,globals.twpng_homepage,globals.twpng_homepage);
 
-	StringCchCat(buf,4000,_T("\r\nWindows 11 dark-mode fork:\r\n")
+	StringCchCat(buf,4000,_T("\r\nWindows 11 Modern UI fork:\r\n")
 		_T("Website: <a href=\"") TWEAKPNG_FORK_HOMEPAGE _T("\">") TWEAKPNG_FORK_HOMEPAGE _T("</a>\r\n"));
 
 	StringCchCat(buf,4000,_T("\r\nThis program is distributed under the terms ")

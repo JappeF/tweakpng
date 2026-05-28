@@ -162,6 +162,7 @@
 #define ID_CORRECTNONSQUARE             40070
 #define ID_STRIPAIMETA                  40101
 #define ID_VIEWAIPARAMS                 40102
+#define ID_READAIFROMFILE               40103
 
 // Next default values for new objects
 //
