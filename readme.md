@@ -4,7 +4,8 @@ TweakPNG
 A Windows application for viewing and editing the low-level chunk structure of PNG
 image files.
 
-This is a fork of [jsummers/tweakpng](https://github.com/jsummers/tweakpng) with two
+This is a fork of [jsummers/tweakpng](https://github.com/jsummers/tweakpng)
+([project homepage](https://entropymine.com/jason/tweakpng/)) by Jason Summers, with two
 goals:
 
 **Modern Windows 10/11 UI** — a dark-mode title bar, menu bar, chunk list, dialogs,
@@ -25,6 +26,29 @@ Civitai):
   metadata so an image can be shared privately. PNG only.
 - **Generator badge** — the status bar identifies A1111, ComfyUI, or NovelAI images
   (both for PNG and for foreign JPEG/WebP files).
+
+Download
+--------
+
+Grab the latest prebuilt 64-bit Windows binary from the
+[**Releases**](https://github.com/JappeF/tweakpng/releases/latest) page — no installer,
+just run `tweakpng.exe`.
+
+Screenshots
+-----------
+
+The main chunk view with the modern dark UI:
+
+![Main window](docs/main.jpg)
+
+The AI Generation Parameters viewer (prompt / negative prompt / settings, with copy
+buttons):
+
+![AI parameters viewer](docs/aiprompt.jpg)
+
+Editing a chunk:
+
+![Chunk editor](docs/imgedit.jpg)
 
 Building
 --------
