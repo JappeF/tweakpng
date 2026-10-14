@@ -1588,6 +1588,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 	globals.pngchunk_cf = RegisterClipboardFormat(_T("pngchunks"));
 
 	if(!RegisterClasses()) return 0;
+	BufferedPaintInit();
 #ifdef TWPNG_SUPPORT_VIEWER
 	Viewer::GlobalInit();
 #endif
@@ -1645,6 +1646,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 #ifdef TWPNG_SUPPORT_VIEWER
 	Viewer::GlobalDestroy();
 #endif
+	BufferedPaintUnInit();
 	return (int)msg.wParam;
 }
 
@@ -6838,6 +6840,61 @@ static void twpng_ApplyAcrylic(HWND hwnd)
 	FreeLibrary(hDwm);
 }
 
+// Light acrylic: GDI leaves alpha at 0, so dark text vanishes on the see-through client.
+// Paint the control onto white in a buffer, then turn the white into transparency
+// (premultiplied alpha), which keeps text, links and the icon visible over the blur.
+static LRESULT CALLBACK GlassChildSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+	(void)dwRefData;
+	switch(msg) {
+	case WM_ERASEBKGND:
+		return 1;
+	case WM_PAINT:
+		{
+			PAINTSTRUCT ps;
+			HDC hdc = BeginPaint(hwnd, &ps);
+			RECT rc;
+			GetClientRect(hwnd, &rc);
+			HDC mdc;
+			HPAINTBUFFER pb = BeginBufferedPaint(hdc, &rc, BPBF_TOPDOWNDIB, NULL, &mdc);
+			if(pb) {
+				FillRect(mdc, &rc, (HBRUSH)GetStockObject(WHITE_BRUSH));
+				DefSubclassProc(hwnd, WM_PRINTCLIENT, (WPARAM)mdc, PRF_CLIENT);
+				RGBQUAD *bits;
+				int row;
+				if(SUCCEEDED(GetBufferedPaintBits(pb, &bits, &row))) {
+					for(int y=0; y<rc.bottom; y++) {
+						RGBQUAD *q = bits + (size_t)y*row;
+						for(int x=0; x<rc.right; x++, q++) {
+							// pixel = color*a + white*(1-a); for colors with a 0 channel
+							// (black text, blue links) the smallest channel is white*(1-a).
+							BYTE mn = q->rgbRed < q->rgbGreen ? q->rgbRed : q->rgbGreen;
+							if(q->rgbBlue < mn) mn = q->rgbBlue;
+							q->rgbRed -= mn; q->rgbGreen -= mn; q->rgbBlue -= mn;
+							q->rgbReserved = (BYTE)(255 - mn);
+						}
+					}
+				}
+				EndBufferedPaint(pb, TRUE);
+			}
+			EndPaint(hwnd, &ps);
+			return 0;
+		}
+	case WM_NCDESTROY:
+		RemoveWindowSubclass(hwnd, GlassChildSubclassProc, uIdSubclass);
+		break;
+	}
+	return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static BOOL CALLBACK twpng_GlassChild(HWND hChild, LPARAM lParam)
+{
+	(void)lParam;
+	SetWindowSubclass(hChild, GlassChildSubclassProc, 1, 0);
+	return TRUE;
+}
+
 static INT_PTR CALLBACK DlgProcAbout(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	WORD id;
@@ -6846,14 +6903,20 @@ static INT_PTR CALLBACK DlgProcAbout(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 	switch (msg) {
 	case WM_INITDIALOG:
 		twpng_InitDarkDialog(hwnd);
-		// Light text on a black (see-through) client only reads well on dark acrylic.
-		if(globals.dark) twpng_ApplyAcrylic(hwnd);
+		twpng_ApplyAcrylic(hwnd);
+		if(!globals.dark) EnumChildWindows(hwnd, twpng_GlassChild, 0);
 		twpng_HandleAboutInitDialog(hwnd);
 		return 1;
 	case WM_CTLCOLORDLG:
 	case WM_CTLCOLORSTATIC:
 	case WM_CTLCOLORBTN:
-		if(!globals.dark) break;
+		if(!globals.dark && msg!=WM_CTLCOLORDLG) {
+			// Children paint on white, which GlassChildSubclassProc turns transparent.
+			SetBkMode((HDC)wParam, TRANSPARENT);
+			SetBkColor((HDC)wParam, RGB(255,255,255));
+			SetTextColor((HDC)wParam, RGB(0,0,0));
+			return (INT_PTR)GetStockObject(WHITE_BRUSH);
+		}
 		// Black is "transparent" on the extended frame, letting the acrylic show through.
 		SetBkMode((HDC)wParam, TRANSPARENT);
 		SetBkColor((HDC)wParam, RGB(0,0,0));

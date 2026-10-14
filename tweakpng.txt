@@ -2,6 +2,13 @@ TweakPNG:  A low-level PNG image file manipulation utility
 Version 1.4.6+
 Copyright (c) 1999-2023 Jason Summers  <jason1@pobox.com>
 
+Windows 10/11 fork with a modern UI and an AI prompt reader:
+<https://github.com/JappeF/tweakpng>
+The fork's version number is shown in Help > About. The fork's additions are
+described in the sections "AI image and video metadata", "Theme" and the
+Preferences entries below; the rest of this file is the original
+documentation.
+
 *** 2023-03-22: This file contains some outdated information.
 *** Updates are planned.
 
@@ -31,10 +38,14 @@ To get the latest version of TweakPNG, visit the TweakPNG home page at
 
 ==================== Requirements ====================
 
-- Windows 2000 or newer (XP, Vista, 7, etc.), or a compatible Windows
-environment. With suitable compiler (probably Visual C++ 2003 or 2005),
-it should be possible to compile a version that works as far back as
-Windows 95.
+- This fork: Windows 10 or newer (64-bit). Rounded corners and the
+Mica/acrylic backdrops need Windows 11; on Windows 10 windows stay square
+and plain.
+
+- Original TweakPNG: Windows 2000 or newer (XP, Vista, 7, etc.), or a
+compatible Windows environment. With suitable compiler (probably Visual
+C++ 2003 or 2005), it should be possible to compile a version that works
+as far back as Windows 95.
 
 - Some knowledge of the PNG file format.
 
@@ -320,8 +331,40 @@ Preferences -> "Add TweakPNG to Explorer context menu"
 When you right-click on a file in Windows Explorer, a menu is displayed 
 with various options. If you enable this, a "TweakPNG" option will be 
 added to all files with a ".png" or ".mng" or ".jng" extension, and 
-selecting it will run TweakPNG. Note that double-clicking on a file will 
+selecting it will run TweakPNG. Note that double-clicking on a file will
 still run your default PNG viewer, if you have one, instead of TweakPNG.
+
+
+Preferences -> "Add View AI parameters to the Explorer menu"
+------------------------------------------------------------
+
+Adds a "View AI parameters" item to the right-click menu of .png, .jpg,
+.jpeg, .webp, .mp4, .mov and .m4v files. It opens only the AI parameters
+viewer for that file (the main window stays hidden), and closing the
+viewer closes TweakPNG. The entry is registered for the current user
+only, under HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations.
+Uncheck the option to remove it again. If you move tweakpng.exe, uncheck
+and re-check the option so the menu points at the new location.
+
+The same viewer-only mode is available from the command line:
+
+    tweakpng.exe /aiparams "C:\path\to\file.mp4"
+
+
+Preferences -> "Open the AI parameters viewer when a file has them"
+-------------------------------------------------------------------
+
+When checked (the default), opening a file that contains AI generation
+parameters pops up the AI parameters viewer automatically.
+
+
+Options -> Theme
+----------------
+
+Choose "System default", "Light" or "Dark". The choice takes effect
+immediately and is remembered. "System default" follows the Windows
+setting (Settings > Personalization > Colors > Choose your app mode) and
+switches along when you change it.
 
 Tools -> Show Image Viewer
 --------------------------
@@ -397,6 +440,105 @@ when displaying them. It supports gAMA and sRGB chunks, but not cHRM
 (chromaticities) or iCCP (color profile) chunks. It knows that sRGB is not
 exactly the same as gamma=1/2.2, and the difference can be noticeable,
 especially in dark regions of an image.
+
+
+==================== AI image and video metadata ====================
+
+Images and videos made with AI generators usually carry their generation
+settings (prompt, seed, model, ...) inside the file. TweakPNG can read,
+compare and remove them. Supported sources:
+
+- PNG: the "parameters" text chunk (Automatic1111, Forge and similar) and
+  the "prompt" text chunk (ComfyUI).
+- JPEG and WebP: the EXIF UserComment (Automatic1111, Civitai, ComfyUI
+  exports).
+- MP4 and MOV: the "prompt" metadata written by ComfyUI's Save Video node,
+  and the "comment" metadata written by VideoHelperSuite (Video Combine).
+
+JPEG, WebP, MP4 and MOV files can be opened like PNG files (File > Open,
+drag and drop, or the command line), but only their metadata is read:
+there is no chunk list and no editing for them.
+
+
+AI Generation Parameters viewer
+-------------------------------
+
+Opens automatically when a file has AI parameters (see Preferences), or
+with Edit > View AI Parameters. It shows three parts, each with a Copy
+button:
+
+- Prompt
+- Negative prompt
+- Settings, one per line
+
+ComfyUI stores its whole node graph instead of a settings line. TweakPNG
+follows the graph to find the sampler settings (steps, sampler, scheduler,
+CFG, seed, denoise), the prompt text (also when it comes from a separate
+text or primitive node), the model and the LoRAs with their strengths.
+For video workflows it adds:
+
+- Mode: Reference to video, Image to video, First-last frame to video or
+  Text to video
+- References / First frame / Last frame: the input images that were used
+- FPS, and Frames where the graph has a fixed count
+- Video size, Frames and Duration as stored in the MP4/MOV file itself
+
+Buttons at the bottom:
+
+- < Prev / Next >: show the previous or next image or video in the same
+  folder (in Explorer's name order). The title bar shows the position, for
+  example "shot_15_00001_.mp4 (41/44)". When the viewer belongs to the
+  open document, the main window follows along.
+- Save JSON...: saves the ComfyUI graph as a .json file, which can be
+  loaded back into ComfyUI.
+- Copy All: copies the complete metadata text.
+
+
+Tools > Read AI parameters from File
+------------------------------------
+
+Pick any supported image or video and show its parameters in the viewer
+without opening it as the current document.
+
+
+Tools > Compare AI Parameters
+-----------------------------
+
+Shows what changed between two files. Select two files in the file
+dialog, or select one file to compare it with the open document. The
+report lists:
+
+- Settings that changed (old value -> new value), settings that only one
+  of the files has, and the names of the settings that are the same.
+- The prompt and negative prompt as a word-level diff: words only in the
+  first file are shown as [-like this-], words only in the second file as
+  {+like this+}.
+
+Use the Copy button to copy the report.
+
+
+Edit > Strip AI Metadata
+------------------------
+
+Removes the generation metadata so a file can be shared without revealing
+its prompt, seed or workflow.
+
+- PNG: removes the AI metadata chunks (parameters, prompt, workflow,
+  NovelAI keys, eXIf, ...) from the open document after asking. Save the
+  file to keep the change.
+- JPEG, WebP, MP4 and MOV: saves a cleaned copy, by default as
+  <name>_clean.<ext> next to the original. Choose the original file name
+  to replace the file instead. JPEG loses its EXIF, XMP, IPTC and comment
+  segments, WebP its EXIF and XMP chunks. In MP4/MOV the metadata boxes
+  are blanked out in place, so the video and audio data stay exactly the
+  same.
+
+
+Generator badge
+---------------
+
+The status bar shows which tool made the file when it can tell: Stable
+Diffusion (Automatic1111 style), ComfyUI or NovelAI.
 
 
 ==================== MNG support ====================
