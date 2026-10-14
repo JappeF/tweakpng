@@ -127,6 +127,13 @@ BEGIN
     BEGIN
         MENUITEM "&Preferences...",             ID_PREFS
         MENUITEM "Configure &Tools...",         ID_EDITTOOLS
+        MENUITEM SEPARATOR
+        POPUP "T&heme"
+        BEGIN
+            MENUITEM "&System default",         ID_THEME_SYSTEM
+            MENUITEM "&Light",                  ID_THEME_LIGHT
+            MENUITEM "&Dark",                   ID_THEME_DARK
+        END
     END
     POPUP "&Tools"
     BEGIN
@@ -265,8 +272,23 @@ BEGIN
     EDITTEXT        IDC_AIP_SETTINGS,7,193,392,124,ES_MULTILINE | ES_READONLY |
                     ES_AUTOVSCROLL | WS_VSCROLL
     PUSHBUTTON      "Copy",IDC_AIP_COPYSET,404,193,49,14
+    PUSHBUTTON      "< &Prev",IDC_AIP_PREV,7,339,45,14
+    PUSHBUTTON      "&Next >",IDC_AIP_NEXT,56,339,45,14
+    PUSHBUTTON      "&Save JSON...",IDC_AIP_SAVEJSON,276,339,60,14
     PUSHBUTTON      "Copy All",IDC_AIP_COPYALL,341,339,55,14
     DEFPUSHBUTTON   "Close",IDOK,404,339,49,14
+END
+
+DLG_AICOMPARE DIALOGEX 0, 0, 420, 300
+STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU |
+    WS_MAXIMIZEBOX | WS_THICKFRAME
+CAPTION "Compare AI Parameters"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    EDITTEXT        IDC_CMP_TEXT,7,7,406,266,ES_MULTILINE | ES_READONLY |
+                    ES_AUTOVSCROLL | WS_VSCROLL
+    PUSHBUTTON      "&Copy",IDC_CMP_COPY,306,279,50,14
+    DEFPUSHBUTTON   "Close",IDOK,363,279,50,14
 END
 
 DLG_TEXT DIALOGEX 0, 0, 300, 152
@@ -293,7 +315,7 @@ BEGIN
     EDITTEXT        IDC_TEXTTRNSLTKEYWORD,78,56,119,14,ES_AUTOHSCROLL
 END
 
-DLG_PREFS DIALOGEX 0, 0, 260, 78
+DLG_PREFS DIALOGEX 0, 0, 260, 94
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Preferences"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -305,8 +327,10 @@ BEGIN
     CONTROL         "Add TweakPNG to Explorer context menu",IDC_ADDTOMENU,
                     "Button",BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,7,42,
                     148,10
-    CONTROL         "Open text editor for a ""parameters"" tEXt chunk on load",IDC_OPENPARAMS,
+    CONTROL         "Open the AI parameters viewer when a file has them",IDC_OPENPARAMS,
                     "Button",BS_AUTOCHECKBOX | WS_TABSTOP,7,58,196,10
+    CONTROL         "Add ""View AI parameters"" to the Explorer menu (images, videos)",IDC_ADDAIMENU,
+                    "Button",BS_AUTOCHECKBOX | WS_TABSTOP,7,74,246,10
     DEFPUSHBUTTON   "OK",IDOK,203,7,50,14,WS_GROUP
     PUSHBUTTON      "Cancel",IDCANCEL,203,24,50,14
 END

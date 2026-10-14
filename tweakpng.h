@@ -222,6 +222,12 @@ struct globals_struct {
 	HFONT hUiFont;
 	HBRUSH hUiBgBrush;
 	HBRUSH hDarkEditBrush;
+#define TWPNG_THEME_SYSTEM 0
+#define TWPNG_THEME_LIGHT  1
+#define TWPNG_THEME_DARK   2
+	int theme_pref;
+	int dark;           // resolved from theme_pref (and the Windows setting for System)
+	int aiparams_only;  // started with /aiparams: main window hidden, viewer only
 	HANDLE hListRowImageList;
 
 	const TCHAR *twpng_homepage;
@@ -266,6 +272,8 @@ void update_viewer();
 void twpng_InitDarkDialog(HWND hwnd);
 BOOL twpng_HandleDlgDarkMsg(UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR *result);
 void twpng_ApplyModernWindowStyle(HWND hwnd);
+void twpng_ResolveTheme();
+void twpng_SetAppMode();
 BOOL twpng_HandleDarkMenuMsg(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT *result);
 BOOL twpng_ChooseColorDark(LPCHOOSECOLOR cc);
 
@@ -470,6 +478,7 @@ public:
 	TCHAR m_filename[MAX_PATH];
 	int m_named;
 	int m_dirty; // has file been modified?
+	int m_scratch; // read-only helper copy, not the open document
 
 private:
 	void initialize();

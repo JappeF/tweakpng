@@ -51,6 +51,9 @@
 #include <commctrl.h>
 #include <uxtheme.h>
 #include <vssym32.h>
+#include <shlwapi.h>
+#include <shlobj.h>
+#pragma comment(lib, "shlwapi.lib")
 
 #include "resource.h"
 #include "tweakpng.h"
@@ -108,7 +111,10 @@ struct globals_struct globals;
 static HWND g_hwndAIParams = NULL;
 static void twpng_ViewAIParams(HWND owner);
 static void twpng_CloseAIParamsView();
-static int  twpng_OpenAIParamsViewerFromText(const TCHAR *text, int len);
+static int  twpng_ShowAIParams(const TCHAR *text, const TCHAR *extra, const TCHAR *path, BOOL isDoc);
+static int  twpng_ReadMp4VideoInfo(const TCHAR *fn, TCHAR *out, int cap);
+static int  OkToClosePNG();
+static int  cf_skip_ws(const TCHAR *s, int i, int len);
 static int  twpng_ReadJpegAIParams(const TCHAR *fn, TCHAR **outText);
 static int  twpng_ReadWebpAIParams(const TCHAR *fn, TCHAR **outText);
 static int  twpng_SniffForeignKind(const unsigned char *hdr, DWORD got);
@@ -1165,6 +1171,7 @@ void Png::initialize()
 	StringCchCopy(m_filename,MAX_PATH,_T("untitled"));
 	m_named=0;
 	m_dirty=0;
+	m_scratch=0;
 	m_imgtype=IMG_PNG;
 	m_pngfilesize = 0;
 	m_width=1;
@@ -1239,8 +1246,10 @@ Png::~Png()
 	int i;
 
 	// This document is going away; close the modeless editor and parameters viewer.
-	twpng_CloseModelessEditors();
-	twpng_CloseAIParamsView();
+	if(!m_scratch) {
+		twpng_CloseModelessEditors();
+		twpng_CloseAIParamsView();
+	}
 
 	if(chunk) {
 		// free individual chunks
@@ -1358,6 +1367,7 @@ static int SaveSettings()
 	r=RegSetValueEx(key,_T("windowbg"),0,REG_DWORD,(LPBYTE)&globals.window_bgcolor,sizeof(DWORD));
 	r=RegSetValueEx(key,_T("zoom"),0,REG_DWORD,(LPBYTE)&globals.vsize,sizeof(DWORD));
 	r=RegSetValueEx(key,_T("open_params"),0,REG_DWORD,(LPBYTE)&globals.open_params_on_load,sizeof(DWORD));
+	r=RegSetValueEx(key,_T("theme"),0,REG_DWORD,(LPBYTE)&globals.theme_pref,sizeof(DWORD));
 
 	if(IsWindow(globals.hwndMainList)) {
 		for(i=0;i<5;i++) {
@@ -1395,6 +1405,7 @@ static void ReadSettings()
 	for(i=0;i<16;i++) globals.custcolors[i] = RGB(0,0,0);
 	globals.autoopen_viewer=0;
 	globals.window_bgcolor=TWPNG_WBG_SAMEASIMAGE;
+	globals.theme_pref=TWPNG_THEME_DARK;
 
 	for(i=0;i<TWPNG_NUMTOOLS;i++) {
 		StringCchCopy(globals.tools[i].name,MAX_TOOL_NAME,_T(""));
@@ -1477,6 +1488,10 @@ static void ReadSettings()
 	r=RegQueryValueEx(key,_T("zoom"),NULL,NULL,(LPBYTE)(&globals.vsize),&datasize);
 	datasize=sizeof(DWORD);
 	r=RegQueryValueEx(key,_T("open_params"),NULL,NULL,(LPBYTE)(&globals.open_params_on_load),&datasize);
+	datasize=sizeof(DWORD);
+	r=RegQueryValueEx(key,_T("theme"),NULL,NULL,(LPBYTE)(&globals.theme_pref),&datasize);
+	if(globals.theme_pref<TWPNG_THEME_SYSTEM || globals.theme_pref>TWPNG_THEME_DARK)
+		globals.theme_pref=TWPNG_THEME_DARK;
 
 	datasize=sizeof(DWORD);
 	tmpd = 0;
@@ -1496,6 +1511,14 @@ static void get_filename_from_cmdline(const TCHAR *lpCmdLine)
 	TCHAR buf[MAX_PATH];
 	int len;
 	DWORD ret;
+
+	// "/aiparams <file>" (the Explorer menu entry): show only the AI parameters viewer.
+	if(!_tcsnicmp(lpCmdLine, _T("/aiparams"), 9) &&
+	   (lpCmdLine[9]==_T(' ') || lpCmdLine[9]==0)) {
+		globals.aiparams_only = 1;
+		lpCmdLine += 9;
+		while(*lpCmdLine==_T(' ')) lpCmdLine++;
+	}
 
 	if(lpCmdLine[0]=='"') { // if quoted, strip quotes
 		StringCbCopy(buf,sizeof(buf),&lpCmdLine[1]);
@@ -1524,21 +1547,6 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 	MSG msg;
 	HACCEL hAccTable;
 	int p;
-
-	// Load uxtheme and force dark mode globally BEFORE any windows or controls are created
-	HMODULE hUxTheme = LoadLibrary(_T("uxtheme.dll"));
-	if(hUxTheme) {
-		typedef void (WINAPI *SetPreferredAppModeProc)(int);
-		typedef void (WINAPI *FlushMenuThemesProc)();
-		SetPreferredAppModeProc SetPreferredAppMode = (SetPreferredAppModeProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(135));
-		FlushMenuThemesProc FlushMenuThemes = (FlushMenuThemesProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(136));
-		if(SetPreferredAppMode) {
-			SetPreferredAppMode(2); // ForceDark = 2
-		}
-		if(FlushMenuThemes) {
-			FlushMenuThemes();
-		}
-	}
 
 	ZeroMemory(&globals,sizeof(struct globals_struct));
 
@@ -1610,10 +1618,13 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 	}
 
 	ReadSettings();
+	// The app-wide dark/light mode must be set before any window is created.
+	twpng_ResolveTheme();
+	twpng_SetAppMode();
 
 	globals.hwndMain = CreateWindow(
 		_T("TWEAKPNGMAIN"),_T("TweakPNG"),
-		WS_VISIBLE|WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
+		(globals.aiparams_only ? 0 : WS_VISIBLE)|WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
 		CW_USEDEFAULT,CW_USEDEFAULT,
 		globals.window_prefs.main.w,globals.window_prefs.main.h,
 		NULL,NULL,globals.hInst,NULL);
@@ -1813,12 +1824,14 @@ static int OpenPngByName(const TCHAR *fn)
 		update_viewer_filename();
 		update_status_bar_and_viewer();
 
-		TCHAR *aiText = NULL;
+		TCHAR *aiText = NULL, extra[200] = _T("");
 		twpng_ReadForeignAIParams(foreignKind, fn, &aiText);
 		g_foreignGen = twpng_DetectGeneratorFromText(aiText);
 		if(aiText) {
-			if(globals.open_params_on_load)
-				twpng_OpenAIParamsViewerFromText(aiText, lstrlen(aiText));
+			if(globals.open_params_on_load) {
+				if(foreignKind==3 || foreignKind==4) twpng_ReadMp4VideoInfo(fn, extra, 200);
+				twpng_ShowAIParams(aiText, extra, fn, TRUE);
+			}
 			free(aiText);
 		}
 		update_status_bar_and_viewer();   // refresh now that g_foreignGen is set
@@ -2275,11 +2288,14 @@ static int twpng_IsAIMetadataChunk(Chunk *c)
 
 // Remove all AI-generation metadata chunks (so an image can be shared without leaking
 // prompts, seed, workflow, etc.).
+static void twpng_StripForeignMetadata();
+
 static void StripAIMetadata()
 {
 	int i, count=0;
 	TCHAR buf[200];
 
+	if(!png && g_foreignFn[0]) { twpng_StripForeignMetadata(); return; }
 	if(!png) return;
 	for(i=0;i<png->m_num_chunks;i++)
 		if(twpng_IsAIMetadataChunk(png->chunk[i])) count++;
@@ -2383,10 +2399,12 @@ static TCHAR *twpng_SettingsToLines(const TCHAR *s)
 }
 
 struct aiparams_ctx {
-	TCHAR *full;    // full original parameters text
+	TCHAR *full;    // full original parameters text (NULL if the file has none)
 	TCHAR *pos;     // positive prompt
 	TCHAR *neg;     // negative prompt (NULL if none)
 	TCHAR *setRaw;  // settings line, original single line (NULL if none)
+	TCHAR path[MAX_PATH];  // file the parameters came from
+	BOOL isDoc;     // path is the open document, so browsing opens the next file as one
 };
 
 static void twpng_ParseA1111(const TCHAR *full, struct aiparams_ctx *c)
@@ -2409,6 +2427,127 @@ static void twpng_ParseA1111(const TCHAR *full, struct aiparams_ctx *c)
 }
 
 static struct aiparams_ctx *g_aiParamsCtx = NULL;
+// While set, replacing the document keeps the viewer open (folder browsing updates it).
+static BOOL g_keepAIView = FALSE;
+
+static void twpng_FreeAIParamsCtx(struct aiparams_ctx *c)
+{
+	if(!c) return;
+	free(c->full); free(c->pos); free(c->neg); free(c->setRaw);
+	free(c);
+}
+
+static void twpng_ParseAIText(const TCHAR *full, struct aiparams_ctx *c)
+{
+	if(twpng_LooksLikeComfyJson(full)) twpng_ParseComfyJson(full, c);
+	else twpng_ParseA1111(full, c);
+}
+
+// ---- Folder browsing -----------------------------------------------------------------
+
+static BOOL twpng_IsBrowsableFile(const TCHAR *name)
+{
+	static const TCHAR *exts[] = { _T("png"), _T("jpg"), _T("jpeg"), _T("webp"),
+		_T("mp4"), _T("mov"), _T("m4v"), NULL };
+	const TCHAR *ext = _tcsrchr(name, _T('.'));
+	if(!ext) return FALSE;
+	for(int i=0; exts[i]; i++) if(!lstrcmpi(ext+1, exts[i])) return TRUE;
+	return FALSE;
+}
+
+static int twpng_CmpNames(const void *a, const void *b)
+{
+#ifdef UNICODE
+	return StrCmpLogicalW(*(const TCHAR* const*)a, *(const TCHAR* const*)b);
+#else
+	return lstrcmpi(*(const TCHAR* const*)a, *(const TCHAR* const*)b);
+#endif
+}
+
+static void twpng_FreeList(TCHAR **list, int n)
+{
+	for(int i=0; i<n; i++) free(list[i]);
+	free(list);
+}
+
+// Supported files in the folder of `fn`, in Explorer order. *outIdx is fn's index or -1.
+static int twpng_ListSiblings(const TCHAR *fn, TCHAR ***outList, int *outIdx)
+{
+	*outList = NULL; *outIdx = -1;
+	TCHAR dir[MAX_PATH], pat[MAX_PATH];
+	StringCchCopy(dir, MAX_PATH, fn);
+	TCHAR *sl = _tcsrchr(dir, _T('\\'));
+	if(!sl) return 0;
+	sl[1] = 0;
+	StringCchPrintf(pat, MAX_PATH, _T("%s*"), dir);
+	WIN32_FIND_DATA fd;
+	HANDLE h = FindFirstFile(pat, &fd);
+	if(h==INVALID_HANDLE_VALUE) return 0;
+	TCHAR **list = NULL;
+	int n = 0, cap = 0;
+	do {
+		if((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !twpng_IsBrowsableFile(fd.cFileName))
+			continue;
+		if(n==cap) {
+			cap = cap ? cap*2 : 64;
+			TCHAR **nl = (TCHAR**)realloc(list, (size_t)cap*sizeof(TCHAR*));
+			if(!nl) break;
+			list = nl;
+		}
+		TCHAR full[MAX_PATH];
+		StringCchPrintf(full, MAX_PATH, _T("%s%s"), dir, fd.cFileName);
+		if((list[n] = _tcsdup(full)) != NULL) n++;
+	} while(FindNextFile(h, &fd));
+	FindClose(h);
+	if(n) qsort(list, n, sizeof(TCHAR*), twpng_CmpNames);
+	for(int i=0; i<n; i++) if(!lstrcmpi(list[i], fn)) *outIdx = i;
+	*outList = list;
+	return n;
+}
+
+// Title shows the file and its position in the folder; Prev/Next enable at the ends.
+static void twpng_UpdateAINav(HWND hwnd, struct aiparams_ctx *c)
+{
+	TCHAR title[MAX_PATH+80];
+	TCHAR **list = NULL;
+	int idx = -1, n = 0;
+	if(c->path[0]) n = twpng_ListSiblings(c->path, &list, &idx);
+	const TCHAR *base = _tcsrchr(c->path, _T('\\'));
+	base = base ? base+1 : c->path;
+	if(base[0] && idx>=0)
+		StringCchPrintf(title, MAX_PATH+80, _T("AI Generation Parameters - %s (%d/%d)"), base, idx+1, n);
+	else if(base[0])
+		StringCchPrintf(title, MAX_PATH+80, _T("AI Generation Parameters - %s"), base);
+	else
+		StringCchCopy(title, MAX_PATH+80, _T("AI Generation Parameters"));
+	SetWindowText(hwnd, title);
+	EnableWindow(GetDlgItem(hwnd,IDC_AIP_PREV), idx>0);
+	EnableWindow(GetDlgItem(hwnd,IDC_AIP_NEXT), idx>=0 && idx<n-1);
+	twpng_FreeList(list, n);
+}
+
+static void twpng_FillAIParams(HWND hwnd, struct aiparams_ctx *c)
+{
+	TCHAR *t;
+	SetDlgItemText(hwnd,IDC_AIP_PROMPT,_T(""));
+	SetDlgItemText(hwnd,IDC_AIP_NEG,_T(""));
+	SetDlgItemText(hwnd,IDC_AIP_SETTINGS,_T(""));
+	if(!c->full) SetDlgItemText(hwnd,IDC_AIP_PROMPT,_T("(No AI parameters found in this file.)"));
+	t=twpng_LfToCrlf(c->pos);            if(t){ SetDlgItemText(hwnd,IDC_AIP_PROMPT,t);   free(t); }
+	t=twpng_LfToCrlf(c->neg);            if(t){ SetDlgItemText(hwnd,IDC_AIP_NEG,t);      free(t); }
+	t=twpng_SettingsToLines(c->setRaw);  if(t){ SetDlgItemText(hwnd,IDC_AIP_SETTINGS,t); free(t); }
+	EnableWindow(GetDlgItem(hwnd,IDC_AIP_COPYPROMPT), c->pos!=NULL);
+	EnableWindow(GetDlgItem(hwnd,IDC_AIP_COPYNEG), c->neg!=NULL);
+	EnableWindow(GetDlgItem(hwnd,IDC_AIP_COPYSET), c->setRaw!=NULL);
+	EnableWindow(GetDlgItem(hwnd,IDC_AIP_COPYALL), c->full!=NULL);
+	BOOL json = FALSE;
+	if(c->full) {
+		int len = lstrlen(c->full), i = cf_skip_ws(c->full, 0, len);
+		json = (i<len && c->full[i]==_T('{'));
+	}
+	EnableWindow(GetDlgItem(hwnd,IDC_AIP_SAVEJSON), json);
+	twpng_UpdateAINav(hwnd, c);
+}
 
 // Lay out the AI params controls to fill the (resizable) client area.
 static void twpng_LayoutAIParams(HWND hwnd)
@@ -2445,10 +2584,16 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SETTINGS),NULL,editX,y,editW,setH,SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYSET),NULL,copyX,y,copyW,copyH,SWP_NOZORDER);
 
-	int closeX=W-m-copyW, copyAllX=closeX-gap-58;
+	int closeX=W-m-copyW, copyAllX=closeX-gap-58, saveX=copyAllX-gap-84, navW=64;
 	SetWindowPos(GetDlgItem(hwnd,IDOK),NULL,closeX,bottomY,copyW,btnH,SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYALL),NULL,copyAllX,bottomY,58,btnH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SAVEJSON),NULL,saveX,bottomY,84,btnH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_PREV),NULL,m,bottomY,navW,btnH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_NEXT),NULL,m+navW+gap,bottomY,navW,btnH,SWP_NOZORDER);
 }
+
+static void twpng_SaveAIJson(HWND hwnd, struct aiparams_ctx *c);
+static void twpng_AIParamsNavigate(int dir);
 
 static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -2459,14 +2604,7 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		c = (struct aiparams_ctx*)lParam;
 		SetWindowLongPtr(hwnd,DWLP_USER,lParam);
 		SendMessage(hwnd,WM_SETICON,ICON_BIG,(LPARAM)LoadIcon(globals.hInst,_T("ICONMAIN")));
-		if(c){
-			TCHAR *t;
-			t=twpng_LfToCrlf(c->pos);            if(t){ SetDlgItemText(hwnd,IDC_AIP_PROMPT,t);   free(t); }
-			t=twpng_LfToCrlf(c->neg);            if(t){ SetDlgItemText(hwnd,IDC_AIP_NEG,t);      free(t); }
-			t=twpng_SettingsToLines(c->setRaw);  if(t){ SetDlgItemText(hwnd,IDC_AIP_SETTINGS,t); free(t); }
-			if(!c->neg)    EnableWindow(GetDlgItem(hwnd,IDC_AIP_COPYNEG),FALSE);
-			if(!c->setRaw) EnableWindow(GetDlgItem(hwnd,IDC_AIP_COPYSET),FALSE);
-		}
+		if(c) twpng_FillAIParams(hwnd,c);
 		twpng_LayoutAIParams(hwnd);
 		twpng_InitDarkDialog(hwnd);
 		return 1;
@@ -2498,6 +2636,9 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		case IDC_AIP_COPYNEG:    if(c){TCHAR*t=twpng_LfToCrlf(c->neg);twpng_SetClipboardText(hwnd,t);free(t);} return 1;
 		case IDC_AIP_COPYSET:    if(c) twpng_SetClipboardText(hwnd,c->setRaw); return 1;
 		case IDC_AIP_COPYALL:    if(c){TCHAR*t=twpng_LfToCrlf(c->full);twpng_SetClipboardText(hwnd,t);free(t);} return 1;
+		case IDC_AIP_SAVEJSON:   twpng_SaveAIJson(hwnd,c); return 1;
+		case IDC_AIP_PREV:       twpng_AIParamsNavigate(-1); return 1;
+		case IDC_AIP_NEXT:       twpng_AIParamsNavigate(1); return 1;
 		case IDOK: case IDCANCEL: DestroyWindow(hwnd); return 1;
 		}
 		break;
@@ -2505,11 +2646,11 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 	case WM_NCDESTROY:
 		if(g_hwndAIParams==hwnd){
 			g_hwndAIParams=NULL;
-			if(g_aiParamsCtx){
-				free(g_aiParamsCtx->full); free(g_aiParamsCtx->pos);
-				free(g_aiParamsCtx->neg);  free(g_aiParamsCtx->setRaw);
-				free(g_aiParamsCtx); g_aiParamsCtx=NULL;
-			}
+			twpng_FreeAIParamsCtx(g_aiParamsCtx);
+			g_aiParamsCtx=NULL;
+			// Started from the Explorer menu: the viewer is the whole app.
+			if(globals.aiparams_only && globals.hwndMain && !IsWindowVisible(globals.hwndMain))
+				PostMessage(globals.hwndMain,WM_CLOSE,0,0);
 		}
 		SetWindowLongPtr(hwnd,DWLP_USER,0);
 		return 0;
@@ -2524,35 +2665,61 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 // Force-close the parameters viewer (e.g. when the document changes).
 static void twpng_CloseAIParamsView()
 {
-	if(g_hwndAIParams) DestroyWindow(g_hwndAIParams);
+	if(g_hwndAIParams && !g_keepAIView) DestroyWindow(g_hwndAIParams);
 }
 
-// Show the modeless parsed viewer for an already-extracted parameters string.
-// `text` is copied; pass len in TCHARs (excluding terminator). Returns 1 on success.
-static int twpng_OpenAIParamsViewerFromText(const TCHAR *text, int len)
+// Show the parsed viewer, or update it in place if it is already open. `text` may be NULL
+// for a file without AI parameters; `extra` is appended to the settings (container info
+// such as the video size). Returns 1 on success.
+// Parsed parameters for `text` (may be NULL), with `extra` appended to the settings.
+static struct aiparams_ctx *twpng_BuildAICtx(const TCHAR *text, const TCHAR *extra)
 {
-	if(g_hwndAIParams) { SetForegroundWindow(g_hwndAIParams); return 1; }
-	if(!text || len<=0) return 0;
+	struct aiparams_ctx *c = (struct aiparams_ctx*)calloc(1,sizeof(struct aiparams_ctx));
+	if(!c) return NULL;
+	if(text && text[0]) {
+		c->full = _tcsdup(text);
+		if(!c->full) { free(c); return NULL; }
+		twpng_ParseAIText(c->full, c);
+	}
+	if(extra && extra[0]) {
+		int n = (c->setRaw ? lstrlen(c->setRaw) : 0) + lstrlen(extra) + 3;
+		TCHAR *ns = (TCHAR*)malloc((size_t)n*sizeof(TCHAR));
+		if(ns) {
+			ns[0] = 0;
+			if(c->setRaw) { StringCchCopy(ns, n, c->setRaw); StringCchCat(ns, n, _T(", ")); }
+			StringCchCat(ns, n, extra);
+			free(c->setRaw);
+			c->setRaw = ns;
+		}
+	}
+	return c;
+}
 
-	g_aiParamsCtx = (struct aiparams_ctx*)calloc(1,sizeof(struct aiparams_ctx));
-	if(!g_aiParamsCtx) return 0;
-	g_aiParamsCtx->full=(TCHAR*)malloc(((size_t)len+1)*sizeof(TCHAR));
-	if(!g_aiParamsCtx->full) { free(g_aiParamsCtx); g_aiParamsCtx=NULL; return 0; }
-	memcpy(g_aiParamsCtx->full, text, (size_t)len*sizeof(TCHAR));
-	g_aiParamsCtx->full[len]=0;
+static int twpng_ShowAIParams(const TCHAR *text, const TCHAR *extra, const TCHAR *path, BOOL isDoc)
+{
+	struct aiparams_ctx *c = twpng_BuildAICtx(text, extra);
+	if(!c) return 0;
+	if(path) StringCchCopy(c->path, MAX_PATH, path);
+	c->isDoc = isDoc;
 
-	if(twpng_LooksLikeComfyJson(g_aiParamsCtx->full))
-		twpng_ParseComfyJson(g_aiParamsCtx->full, g_aiParamsCtx);
-	else
-		twpng_ParseA1111(g_aiParamsCtx->full, g_aiParamsCtx);
+	if(g_hwndAIParams) {
+		struct aiparams_ctx *old = g_aiParamsCtx;
+		g_aiParamsCtx = c;
+		SetWindowLongPtr(g_hwndAIParams, DWLP_USER, (LONG_PTR)c);
+		twpng_FillAIParams(g_hwndAIParams, c);
+		twpng_FreeAIParamsCtx(old);
+		if(IsIconic(g_hwndAIParams)) ShowWindow(g_hwndAIParams, SW_RESTORE);
+		SetForegroundWindow(g_hwndAIParams);
+		return 1;
+	}
 
+	g_aiParamsCtx = c;
 	// No owner window, so it minimizes independently and gets its own taskbar button.
 	g_hwndAIParams = CreateDialogParam(globals.hInst,_T("DLG_AIPARAMS"),
-		NULL, DlgProcAIParams, (LPARAM)g_aiParamsCtx);
-	if(!g_hwndAIParams){
-		free(g_aiParamsCtx->full); free(g_aiParamsCtx->pos);
-		free(g_aiParamsCtx->neg);  free(g_aiParamsCtx->setRaw);
-		free(g_aiParamsCtx); g_aiParamsCtx=NULL;
+		NULL, DlgProcAIParams, (LPARAM)c);
+	if(!g_hwndAIParams) {
+		twpng_FreeAIParamsCtx(c);
+		g_aiParamsCtx = NULL;
 		return 0;
 	}
 	if(globals.window_prefs.aiparams.w>0 && globals.window_prefs.aiparams.h>0)
@@ -2562,55 +2729,165 @@ static int twpng_OpenAIParamsViewerFromText(const TCHAR *text, int len)
 	return 1;
 }
 
-// Find the "parameters" tEXt chunk in the current document and show the parsed viewer.
-// Also handles foreign (JPEG/WebP) files: re-reads their EXIF metadata.
+// Copy of the "parameters" (A1111) or "prompt" (ComfyUI) text chunk, or NULL.
+static TCHAR *twpng_PngAIText(Png *p)
+{
+	static const TCHAR *keys[] = { _T("parameters"), _T("prompt"), NULL };
+	for(int ki=0; keys[ki]; ki++) {
+		for(int i=0; i<p->m_num_chunks; i++) {
+			Chunk *c = p->chunk[i];
+			if(!c || (c->m_chunktype_id!=CHUNK_tEXt && c->m_chunktype_id!=CHUNK_zTXt &&
+			          c->m_chunktype_id!=CHUNK_iTXt)) continue;
+			struct keyword_info_struct kw;
+			if(!c->get_keyword_info(&kw) || lstrcmp(kw.keyword,keys[ki])) continue;
+			if(!c->get_text_info() || !c->m_text_info.text) return NULL;
+			int n = c->m_text_info.text_size_in_tchars;
+			if(n<0) n = 0;
+			TCHAR *out = (TCHAR*)malloc(((size_t)n+1)*sizeof(TCHAR));
+			if(!out) return NULL;
+			memcpy(out, c->m_text_info.text, (size_t)n*sizeof(TCHAR));
+			out[n] = 0;
+			return out;
+		}
+	}
+	return NULL;
+}
+
+static const TCHAR *twpng_DocPath()
+{
+	if(png) return png->m_named ? png->m_filename : _T("");
+	return g_foreignFn;
+}
+
+// AI text of the open document. Caller frees *outText; `extra` gets container info.
+static int twpng_GetDocAIText(TCHAR **outText, TCHAR *extra, int extraCap)
+{
+	*outText = NULL;
+	extra[0] = 0;
+	if(png) {
+		*outText = twpng_PngAIText(png);
+	}
+	else if(g_foreignFn[0]) {
+		twpng_ReadForeignAIParams(g_foreignKind, g_foreignFn, outText);
+		if(g_foreignKind==3 || g_foreignKind==4) twpng_ReadMp4VideoInfo(g_foreignFn, extra, extraCap);
+	}
+	return *outText!=NULL;
+}
+
+// AI text of any supported file on disk, without opening it as the document.
+static int twpng_ReadAnyAIParams(const TCHAR *fn, TCHAR **outText, TCHAR *extra, int extraCap)
+{
+	*outText = NULL;
+	extra[0] = 0;
+	HANDLE fh = CreateFile(fn, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL, NULL);
+	if(fh==INVALID_HANDLE_VALUE) return 0;
+	unsigned char hdr[16]; DWORD got = 0;
+	ReadFile(fh, hdr, sizeof(hdr), &got, NULL);
+	CloseHandle(fh);
+
+	int kind = twpng_SniffForeignKind(hdr, got);
+	if(kind) {
+		twpng_ReadForeignAIParams(kind, fn, outText);
+		if(kind==3 || kind==4) twpng_ReadMp4VideoInfo(fn, extra, extraCap);
+	}
+	else if(got>=8 && !memcmp(hdr,"\x89PNG\r\n\x1a\n",8)) {
+		Png *tmp = new Png(fn, fn);
+		tmp->m_scratch = 1;
+		if(tmp->m_valid) *outText = twpng_PngAIText(tmp);
+		delete tmp;
+	}
+	return *outText!=NULL;
+}
+
+// Show the parsed viewer for the current document.
 static void twpng_ViewAIParams(HWND owner)
 {
-	Chunk *found=NULL;
-	int i;
+	TCHAR *text = NULL, extra[200];
 	(void)owner;
-
-	if(g_hwndAIParams) { SetForegroundWindow(g_hwndAIParams); return; }
-
-	// Foreign (JPEG/WebP) file loaded — re-extract from EXIF.
-	if(!png && g_foreignFn[0]) {
-		TCHAR *text = NULL;
-		twpng_ReadForeignAIParams(g_foreignKind, g_foreignFn, &text);
-		if(text) {
-			twpng_OpenAIParamsViewerFromText(text, lstrlen(text));
-			free(text);
-		} else {
-			mesg(MSG_I, _T("No AI parameters were found in this file."));
-		}
+	if(!twpng_GetDocAIText(&text, extra, 200)) {
+		if(png || g_foreignFn[0]) mesg(MSG_I, _T("No AI parameters were found in this file."));
 		return;
 	}
+	twpng_ShowAIParams(text, extra, twpng_DocPath(), TRUE);
+	free(text);
+}
 
-	if(!png) return;
+// Prev/Next in the viewer: step through the supported files in the same folder.
+static void twpng_AIParamsNavigate(int dir)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c || !c->path[0]) return;
+	TCHAR **list;
+	int idx, n = twpng_ListSiblings(c->path, &list, &idx);
+	if(idx<0 || idx+dir<0 || idx+dir>=n) { twpng_FreeList(list, n); return; }
+	TCHAR next[MAX_PATH];
+	StringCchCopy(next, MAX_PATH, list[idx+dir]);
+	twpng_FreeList(list, n);
 
-	static const TCHAR *keys[] = { _T("parameters"), _T("prompt"), NULL };
-	for(int ki=0; keys[ki] && !found; ki++) {
-		for(i=0;i<png->m_num_chunks;i++){
-			Chunk *c=png->chunk[i];
-			if(c && (c->m_chunktype_id==CHUNK_tEXt ||
-			         c->m_chunktype_id==CHUNK_zTXt ||
-			         c->m_chunktype_id==CHUNK_iTXt)){
-				struct keyword_info_struct kw;
-				if(c->get_keyword_info(&kw) && !lstrcmp(kw.keyword,keys[ki])){ found=c; break; }
-			}
-		}
+	BOOL isDoc = c->isDoc;   // c may be replaced while the next file opens
+	TCHAR *text = NULL, extra[200] = _T("");
+	if(isDoc) {
+		if(!OkToClosePNG()) return;
+		g_keepAIView = TRUE;
+		OpenPngByName(next);
+		g_keepAIView = FALSE;
+		twpng_GetDocAIText(&text, extra, 200);
 	}
-	if(!found){
-		mesg(MSG_I,_T("No AI parameters (tEXt \"parameters\" or \"prompt\") were found."));
-		return;
+	else {
+		twpng_ReadAnyAIParams(next, &text, extra, 200);
 	}
-	if(!found->get_text_info() || !found->m_text_info.text){
-		mesg(MSG_S,_T("Could not read the parameters chunk."));
-		return;
+	twpng_ShowAIParams(text, extra, next, isDoc);
+	free(text);
+}
+
+// Save the ComfyUI graph JSON (UTF-8) so it can be loaded back into ComfyUI.
+static void twpng_SaveAIJson(HWND hwnd, struct aiparams_ctx *c)
+{
+	if(!c || !c->full) return;
+	TCHAR fn[MAX_PATH], dir[MAX_PATH] = _T("");
+	const TCHAR *base = _tcsrchr(c->path, _T('\\'));
+	// Full path as the default, so the dialog opens next to the source file.
+	StringCchCopy(fn, MAX_PATH, c->path[0] ? c->path : _T("workflow"));
+	TCHAR *dot = _tcsrchr(fn, _T('.'));
+	if(dot && (!base || dot > fn + (base - c->path))) *dot = 0;
+	StringCchCat(fn, MAX_PATH, _T(".json"));
+	if(base) {
+		StringCchCopy(dir, MAX_PATH, c->path);
+		dir[base - c->path] = 0;
 	}
 
-	int n = found->m_text_info.text_size_in_tchars;
-	if(n<0) n=0;
-	twpng_OpenAIParamsViewerFromText(found->m_text_info.text, n);
+	OPENFILENAME ofn;
+	ZeroMemory(&ofn, sizeof(ofn));
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = hwnd;
+	ofn.lpstrFilter = _T("JSON files (*.json)\0*.json\0All files (*.*)\0*.*\0\0");
+	ofn.lpstrFile = fn;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrInitialDir = dir[0] ? dir : NULL;
+	ofn.lpstrDefExt = _T("json");
+	ofn.lpstrTitle = _T("Save ComfyUI JSON");
+	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+	if(!GetSaveFileName(&ofn)) return;
+
+#ifdef UNICODE
+	int n = WideCharToMultiByte(CP_UTF8, 0, c->full, -1, NULL, 0, NULL, NULL);
+	char *data = (n>0) ? (char*)malloc(n) : NULL;
+	if(!data) return;
+	WideCharToMultiByte(CP_UTF8, 0, c->full, -1, data, n, NULL, NULL);
+	DWORD size = (DWORD)n-1;
+#else
+	const char *data = c->full;
+	DWORD size = (DWORD)lstrlen(c->full);
+#endif
+	HANDLE fh = CreateFile(fn, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	DWORD written = 0;
+	BOOL ok = fh!=INVALID_HANDLE_VALUE && WriteFile(fh, data, size, &written, NULL) && written==size;
+	if(fh!=INVALID_HANDLE_VALUE) CloseHandle(fh);
+#ifdef UNICODE
+	free(data);
+#endif
+	if(!ok) mesg(MSG_E, _T("Could not write %s"), fn);
 }
 
 // ---- Minimal ComfyUI prompt-JSON extractor -------------------------------------------
@@ -2987,6 +3264,40 @@ static void cf_collect_images(const TCHAR *s, int len, int is, int ie,
 	}
 }
 
+static void cf_add_lora(TCHAR *list, int cap, const TCHAR *name, const TCHAR *strength) {
+	if(list[0]) StringCchCat(list, cap, _T(", "));
+	StringCchCat(list, cap, name);
+	if(strength && strength[0]) { StringCchCat(list, cap, _T(":")); StringCchCat(list, cap, strength); }
+}
+
+// LoRAs of one loader node: LoraLoader-style (lora_name + strength_model) or rgthree's
+// Power Lora Loader ("lora_1": {"on": true, "lora": "...", "strength": 0.8}, ...).
+static void cf_collect_loras(const TCHAR *s, int is, int ie, TCHAR *list, int cap) {
+	TCHAR *name = cf_get_string(s, is, ie, _T("lora_name"));
+	if(name) {
+		TCHAR st[32] = _T("");
+		if(!cf_get_number_str(s, is, ie, _T("strength_model"), st, 32))
+			cf_get_number_str(s, is, ie, _T("strength"), st, 32);
+		if(lstrcmp(name, _T("None"))) cf_add_lora(list, cap, name, st);
+		free(name);
+		return;
+	}
+	int pos = is, vs, ve;
+	TCHAR *key;
+	while((key = cf_next_member(s, &pos, ie, &vs, &ve)) != NULL) {
+		free(key);
+		if(s[vs]!=_T('{')) continue;
+		TCHAR *lora = cf_get_string(s, vs+1, ve-1, _T("lora"));
+		if(!lora) continue;
+		int v;
+		BOOL on = !cf_find_key(s, vs+1, ve-1, _T("on"), &v) || !_tcsncmp(&s[v], _T("true"), 4);
+		TCHAR st[32] = _T("");
+		cf_get_number_str(s, vs+1, ve-1, _T("strength"), st, 32);
+		if(on && lstrcmp(lora, _T("None"))) cf_add_lora(list, cap, lora, st);
+		free(lora);
+	}
+}
+
 // Parse a ComfyUI prompt JSON and fill aiparams_ctx (pos, neg, setRaw). Returns TRUE
 // on success. The caller still owns ctx->full.
 static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
@@ -3102,35 +3413,59 @@ static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
 			model = cf_get_string(full, is, ie, loaders[t].key);
 	}
 
-	// Build settings line.
-	TCHAR setbuf[1500] = _T("");
-	if(st.steps[0])    { StringCchCat(setbuf,1500,_T("Steps: "));         StringCchCat(setbuf,1500,st.steps); }
-	if(st.sampler)     { StringCchCat(setbuf,1500,_T(", Sampler: "));     StringCchCat(setbuf,1500,st.sampler); }
-	if(st.scheduler)   { StringCchCat(setbuf,1500,_T(", Schedule type: ")); StringCchCat(setbuf,1500,st.scheduler); }
-	if(st.cfg[0])      { StringCchCat(setbuf,1500,_T(", CFG scale: "));   StringCchCat(setbuf,1500,st.cfg); }
-	if(st.seed[0])     { StringCchCat(setbuf,1500,_T(", Seed: "));        StringCchCat(setbuf,1500,st.seed); }
-	if(width[0] && height[0]) {
-		StringCchCat(setbuf,1500,_T(", Size: "));
-		StringCchCat(setbuf,1500,width); StringCchCat(setbuf,1500,_T("x")); StringCchCat(setbuf,1500,height);
+	// LoRAs from every loader node (the API prompt only holds nodes that actually ran).
+	TCHAR loras[600] = _T("");
+	{
+		int pos = cf_skip_ws(full, 0, len), vs, ve;
+		if(pos<len && full[pos]==_T('{')) pos++;
+		TCHAR *key;
+		while((key = cf_next_member(full, &pos, len, &vs, &ve)) != NULL) {
+			free(key);
+			if(full[vs]!=_T('{')) continue;
+			TCHAR *ct = cf_get_string(full, vs+1, ve-1, _T("class_type"));
+			BOOL isLora = ct && _tcsstr(ct, _T("Lora")) != NULL;
+			free(ct);
+			int is, ie;
+			if(isLora && cf_inputs_range(full, len, vs+1, ve-1, &is, &ie))
+				cf_collect_loras(full, is, ie, loras, 600);
+		}
 	}
-	if(frames[0])      { StringCchCat(setbuf,1500,_T(", Frames: "));      StringCchCat(setbuf,1500,frames); }
-	if(fps[0])         { StringCchCat(setbuf,1500,_T(", FPS: "));         StringCchCat(setbuf,1500,fps); }
-	if(mode)           { StringCchCat(setbuf,1500,_T(", Mode: "));        StringCchCat(setbuf,1500,mode); }
+
+	// Build settings line.
+	TCHAR setbuf[2000] = _T("");
+	if(st.steps[0])    { StringCchCat(setbuf,2000,_T("Steps: "));         StringCchCat(setbuf,2000,st.steps); }
+	if(st.sampler)     { StringCchCat(setbuf,2000,_T(", Sampler: "));     StringCchCat(setbuf,2000,st.sampler); }
+	if(st.scheduler)   { StringCchCat(setbuf,2000,_T(", Schedule type: ")); StringCchCat(setbuf,2000,st.scheduler); }
+	if(st.cfg[0])      { StringCchCat(setbuf,2000,_T(", CFG scale: "));   StringCchCat(setbuf,2000,st.cfg); }
+	if(st.seed[0])     { StringCchCat(setbuf,2000,_T(", Seed: "));        StringCchCat(setbuf,2000,st.seed); }
+	if(width[0] && height[0]) {
+		StringCchCat(setbuf,2000,_T(", Size: "));
+		StringCchCat(setbuf,2000,width); StringCchCat(setbuf,2000,_T("x")); StringCchCat(setbuf,2000,height);
+	}
+	if(frames[0])      { StringCchCat(setbuf,2000,_T(", Frames: "));      StringCchCat(setbuf,2000,frames); }
+	if(fps[0])         { StringCchCat(setbuf,2000,_T(", FPS: "));         StringCchCat(setbuf,2000,fps); }
+	if(mode)           { StringCchCat(setbuf,2000,_T(", Mode: "));        StringCchCat(setbuf,2000,mode); }
 	if(vStart>=0) {
 		TCHAR refs[600]=_T(""), first[600]=_T(""), last[600]=_T("");
 		cf_collect_images(full, len, vStart, vEnd, refs, first, last, 600);
 		// A list is quoted so the settings splitter keeps it on one line.
 		if(refs[0]) {
 			BOOL list = _tcschr(refs, _T(',')) != NULL;
-			StringCchCat(setbuf,1500, list ? _T(", References: \"") : _T(", References: "));
-			StringCchCat(setbuf,1500,refs);
-			if(list) StringCchCat(setbuf,1500,_T("\""));
+			StringCchCat(setbuf,2000, list ? _T(", References: \"") : _T(", References: "));
+			StringCchCat(setbuf,2000,refs);
+			if(list) StringCchCat(setbuf,2000,_T("\""));
 		}
-		if(first[0]) { StringCchCat(setbuf,1500,_T(", First frame: "));  StringCchCat(setbuf,1500,first); }
-		if(last[0])  { StringCchCat(setbuf,1500,_T(", Last frame: "));   StringCchCat(setbuf,1500,last); }
+		if(first[0]) { StringCchCat(setbuf,2000,_T(", First frame: "));  StringCchCat(setbuf,2000,first); }
+		if(last[0])  { StringCchCat(setbuf,2000,_T(", Last frame: "));   StringCchCat(setbuf,2000,last); }
 	}
-	if(model)          { StringCchCat(setbuf,1500,_T(", Model: "));       StringCchCat(setbuf,1500,model); }
-	if(st.denoise[0])  { StringCchCat(setbuf,1500,_T(", Denoising strength: ")); StringCchCat(setbuf,1500,st.denoise); }
+	if(model)          { StringCchCat(setbuf,2000,_T(", Model: "));       StringCchCat(setbuf,2000,model); }
+	if(loras[0]) {
+		BOOL list = _tcschr(loras, _T(',')) != NULL;
+		StringCchCat(setbuf,2000, list ? _T(", LoRAs: \"") : _T(", LoRA: "));
+		StringCchCat(setbuf,2000,loras);
+		if(list) StringCchCat(setbuf,2000,_T("\""));
+	}
+	if(st.denoise[0])  { StringCchCat(setbuf,2000,_T(", Denoising strength: ")); StringCchCat(setbuf,2000,st.denoise); }
 	// "Steps:" must come first in the settings line for the A1111 parser to find it.
 	if(setbuf[0]==_T(',')) memmove(setbuf,setbuf+2,(lstrlen(setbuf+2)+1)*sizeof(TCHAR));
 
@@ -3514,7 +3849,7 @@ static void mp4_parse_meta(const unsigned char *p, DWORD len, TCHAR **slots)
 }
 
 // Read the moov box (it may sit before or after mdat) without loading the media data.
-static unsigned char *mp4_read_moov(const TCHAR *fn, DWORD *outLen)
+static unsigned char *mp4_read_moov(const TCHAR *fn, DWORD *outLen, unsigned __int64 *outOff)
 {
 	HANDLE fh = CreateFile(fn, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
 		FILE_ATTRIBUTE_NORMAL, NULL);
@@ -3545,7 +3880,10 @@ static unsigned char *mp4_read_moov(const TCHAR *fn, DWORD *outLen)
 			   !ReadFile(fh, buf, n, &got, NULL) || got!=n) {
 				free(buf); buf = NULL;
 			}
-			else *outLen = n;
+			else {
+				*outLen = n;
+				if(outOff) *outOff = off+hdr;
+			}
 			break;
 		}
 		off += sz;
@@ -3558,7 +3896,7 @@ static int twpng_ReadMp4AIParams(const TCHAR *fn, TCHAR **outText)
 {
 	*outText = NULL;
 	DWORD mlen = 0;
-	unsigned char *moov = mp4_read_moov(fn, &mlen);
+	unsigned char *moov = mp4_read_moov(fn, &mlen, NULL);
 	if(!moov) return 0;
 	const unsigned char *mend = moov+mlen;
 
@@ -3612,6 +3950,64 @@ static int twpng_ReadMp4AIParams(const TCHAR *fn, TCHAR **outText)
 	return 1;
 }
 
+// Size, frame count and duration of the first video track, as settings entries
+// ("Video size: 832x480, Frames: 121, Duration: 5.04 s"). Returns 1 if found.
+static int twpng_ReadMp4VideoInfo(const TCHAR *fn, TCHAR *out, int cap)
+{
+	out[0] = 0;
+	DWORD mlen = 0;
+	unsigned char *moov = mp4_read_moov(fn, &mlen, NULL);
+	if(!moov) return 0;
+	const unsigned char *p = moov, *end = moov+mlen;
+	while(end-p >= 8 && !out[0]) {
+		DWORD sz = mp4_be32(p);
+		if(sz<8 || sz>(DWORD)(end-p)) break;
+		const unsigned char *t = p+8, *tend = p+sz;
+		DWORD len, hl;
+		const unsigned char *mdia = memcmp(p+4,"trak",4) ? NULL : mp4_find_box(t, tend, "mdia", &len);
+		const unsigned char *hdlr = mdia ? mp4_find_box(mdia, mdia+len, "hdlr", &hl) : NULL;
+		if(hdlr && hl>=12 && !memcmp(hdlr+8, "vide", 4)) {
+			DWORD w = 0, h = 0, frames = 0, tl, ml, nl, bl, zl;
+			const unsigned char *tkhd = mp4_find_box(t, tend, "tkhd", &tl);
+			if(tkhd && tl>=8) { w = mp4_be32(tkhd+tl-8)>>16; h = mp4_be32(tkhd+tl-4)>>16; }
+			double secs = 0;
+			const unsigned char *mdhd = mp4_find_box(mdia, mdia+len, "mdhd", &ml);
+			if(mdhd && ml>=20) {
+				DWORD scale;
+				unsigned __int64 dur;
+				if(mdhd[0]==1 && ml>=32) {
+					scale = mp4_be32(mdhd+20);
+					dur = ((unsigned __int64)mp4_be32(mdhd+24)<<32) | mp4_be32(mdhd+28);
+				} else {
+					scale = mp4_be32(mdhd+12);
+					dur = mp4_be32(mdhd+16);
+				}
+				if(scale) secs = (double)dur/scale;
+			}
+			const unsigned char *minf = mp4_find_box(mdia, mdia+len, "minf", &nl);
+			const unsigned char *stbl = minf ? mp4_find_box(minf, minf+nl, "stbl", &bl) : NULL;
+			const unsigned char *stsz = stbl ? mp4_find_box(stbl, stbl+bl, "stsz", &zl) : NULL;
+			if(!stsz && stbl) stsz = mp4_find_box(stbl, stbl+bl, "stz2", &zl);
+			if(stsz && zl>=12) frames = mp4_be32(stsz+8);
+			TCHAR item[64];
+			if(w && h) { StringCchPrintf(item, 64, _T("Video size: %ux%u"), w, h); StringCchCat(out, cap, item); }
+			if(frames) {
+				StringCchPrintf(item, 64, _T("%sFrames: %u"), out[0] ? _T(", ") : _T(""), frames);
+				StringCchCat(out, cap, item);
+			}
+			if(secs>0) {
+				StringCchPrintf(item, 64, _T("%sDuration: %.2f s"), out[0] ? _T(", ") : _T(""), secs);
+				StringCchCat(out, cap, item);
+			}
+			if(!out[0]) StringCchCopy(out, cap, _T(" "));   // video track found, nothing usable
+		}
+		p += sz;
+	}
+	free(moov);
+	if(out[0]==_T(' ')) out[0] = 0;
+	return out[0]!=0;
+}
+
 // Sniff a file header: 1=JPEG, 2=WebP, 3=MP4, 4=MOV, 0=other.
 static int twpng_SniffForeignKind(const unsigned char *hdr, DWORD got)
 {
@@ -3632,7 +4028,513 @@ static int twpng_ReadForeignAIParams(int kind, const TCHAR *fn, TCHAR **outText)
 	return 0;
 }
 
-// File-open command: read AI params from a JPEG, WebP or MP4/MOV and show the parsed viewer.
+// ---- Strip metadata from JPEG / WebP / MP4 --------------------------------------------
+
+// JPEG without APP1 (EXIF/XMP), APP13 (IPTC) and COM segments. NULL if the file doesn't
+// parse up to its image data, so we never write a broken copy.
+static unsigned char *twpng_StripJpeg(const unsigned char *buf, DWORD len, DWORD *outLen, int *removed)
+{
+	*removed = 0;
+	if(len<4 || buf[0]!=0xFF || buf[1]!=0xD8) return NULL;
+	unsigned char *out = (unsigned char*)malloc(len);
+	if(!out) return NULL;
+	DWORD o = 0, p = 2;
+	out[o++] = 0xFF; out[o++] = 0xD8;
+	while(p+2 <= len) {
+		if(buf[p]!=0xFF) { p++; continue; }   // junk after a too-short APP1 (Civitai)
+		while(p<len && buf[p]==0xFF) p++;
+		if(p>=len) break;
+		BYTE marker = buf[p++];
+		if(marker<0xC0) continue;               // 0xFF inside junk, not a marker
+		if(marker==0xD8 || (marker>=0xD0 && marker<=0xD7)) { out[o++]=0xFF; out[o++]=marker; continue; }
+		if(marker==0xDA || marker==0xD9) {      // image data: copy the rest verbatim
+			out[o++] = 0xFF;
+			memcpy(out+o, buf+p-1, len-(p-1));
+			o += len-(p-1);
+			*outLen = o;
+			return out;
+		}
+		if(p+2 > len) break;
+		DWORD seglen = ((DWORD)buf[p]<<8) | buf[p+1];
+		if(seglen<2 || p+seglen>len) break;
+		if(marker==0xE1 || marker==0xED || marker==0xFE) {
+			(*removed)++;
+		} else {
+			out[o++] = 0xFF; out[o++] = marker;
+			memcpy(out+o, buf+p, seglen);
+			o += seglen;
+		}
+		p += seglen;
+	}
+	free(out);
+	return NULL;
+}
+
+static DWORD le32(const unsigned char *p)
+{
+	return (DWORD)p[0] | ((DWORD)p[1]<<8) | ((DWORD)p[2]<<16) | ((DWORD)p[3]<<24);
+}
+
+// WebP without EXIF and XMP chunks; the VP8X flags and RIFF size are updated to match.
+static unsigned char *twpng_StripWebp(const unsigned char *buf, DWORD len, DWORD *outLen, int *removed)
+{
+	*removed = 0;
+	if(len<12 || memcmp(buf,"RIFF",4) || memcmp(buf+8,"WEBP",4)) return NULL;
+	unsigned char *out = (unsigned char*)malloc(len);
+	if(!out) return NULL;
+	memcpy(out, buf, 12);
+	DWORD o = 12, p = 12, vp8x = 0;
+	while(p+8 <= len) {
+		DWORD cs = le32(buf+p+4);
+		if(cs > len-p-8) break;
+		DWORD total = 8 + cs + (cs & 1);
+		if(total > len-p) total = len-p;
+		if(!memcmp(buf+p,"EXIF",4) || !memcmp(buf+p,"XMP ",4)) {
+			(*removed)++;
+		} else {
+			if(!memcmp(buf+p,"VP8X",4)) vp8x = o;
+			memcpy(out+o, buf+p, total);
+			o += total;
+		}
+		p += total;
+	}
+	if(vp8x && o >= vp8x+9) out[vp8x+8] &= (unsigned char)~(0x08|0x04);   // EXIF, XMP flags
+	DWORD riff = o-8;
+	out[4] = (unsigned char)riff; out[5] = (unsigned char)(riff>>8);
+	out[6] = (unsigned char)(riff>>16); out[7] = (unsigned char)(riff>>24);
+	*outLen = o;
+	return out;
+}
+
+// Turn moov/udta and moov/meta into "free" boxes in place. Sizes and offsets don't change,
+// so the media data is untouched. With dryRun only counts them.
+static int twpng_StripMp4File(const TCHAR *fn, BOOL dryRun, int *removed)
+{
+	*removed = 0;
+	DWORD mlen = 0;
+	unsigned __int64 moff = 0;
+	unsigned char *moov = mp4_read_moov(fn, &mlen, &moff);
+	if(!moov) return 0;
+	HANDLE fh = INVALID_HANDLE_VALUE;
+	if(!dryRun) {
+		fh = CreateFile(fn, GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		if(fh==INVALID_HANDLE_VALUE) { free(moov); return 0; }
+	}
+	int ok = 1;
+	const unsigned char *p = moov, *end = moov+mlen;
+	while(end-p >= 8) {
+		unsigned __int64 sz = mp4_be32(p);
+		if(sz==1 && end-p>=16) sz = ((unsigned __int64)mp4_be32(p+8)<<32) | mp4_be32(p+12);
+		else if(sz==0) sz = (unsigned __int64)(end-p);
+		if(sz<8 || sz>(unsigned __int64)(end-p)) break;
+		if(!memcmp(p+4,"udta",4) || !memcmp(p+4,"meta",4)) {
+			(*removed)++;
+			if(!dryRun) {
+				LARGE_INTEGER li;
+				li.QuadPart = (LONGLONG)(moff + (unsigned __int64)(p-moov) + 4);
+				DWORD w = 0;
+				if(!SetFilePointerEx(fh, li, NULL, FILE_BEGIN) || !WriteFile(fh, "free", 4, &w, NULL) || w!=4)
+					ok = 0;
+				// Zero the old contents too, so the prompt isn't left readable in the file.
+				DWORD hdr = (mp4_be32(p)==1) ? 16 : 8;
+				DWORD n = (DWORD)sz - hdr;
+				unsigned char *zero = (unsigned char*)calloc(n ? n : 1, 1);
+				li.QuadPart = (LONGLONG)(moff + (unsigned __int64)(p-moov) + hdr);
+				if(!zero || !SetFilePointerEx(fh, li, NULL, FILE_BEGIN) || !WriteFile(fh, zero, n, &w, NULL) || w!=n)
+					ok = 0;
+				free(zero);
+			}
+		}
+		p += (size_t)sz;
+	}
+	if(fh!=INVALID_HANDLE_VALUE) CloseHandle(fh);
+	free(moov);
+	return ok;
+}
+
+static BOOL twpng_WriteWholeFile(const TCHAR *fn, const unsigned char *data, DWORD len)
+{
+	HANDLE fh = CreateFile(fn, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if(fh==INVALID_HANDLE_VALUE) return FALSE;
+	DWORD w = 0;
+	BOOL ok = WriteFile(fh, data, len, &w, NULL) && w==len;
+	CloseHandle(fh);
+	return ok;
+}
+
+// Strip AI Metadata for a loaded JPEG/WebP/MP4/MOV: writes a cleaned copy (or replaces
+// the file if the user picks the same name).
+static void twpng_StripForeignMetadata()
+{
+	const TCHAR *src = g_foreignFn;
+	int kind = g_foreignKind, removed = 0;
+	unsigned char *buf = NULL, *out = NULL;
+	DWORD size = 0, outLen = 0;
+
+	if(kind==3 || kind==4) {
+		twpng_StripMp4File(src, TRUE, &removed);
+	} else {
+		if(!twpng_SlurpFile(src, 512UL*1024*1024, &buf, &size)) { mesg(MSG_E,_T("Can") SYM_RSQUO _T("t read %s"), src); return; }
+		out = (kind==1) ? twpng_StripJpeg(buf, size, &outLen, &removed)
+		                : twpng_StripWebp(buf, size, &outLen, &removed);
+		free(buf);
+		if(!out) { mesg(MSG_E,_T("The file structure could not be parsed, nothing was changed.")); return; }
+	}
+	if(removed<1) {
+		free(out);
+		mesg(MSG_I,_T("No metadata was found in this file."));
+		return;
+	}
+
+	TCHAR fn[MAX_PATH], dir[MAX_PATH];
+	const TCHAR *base = _tcsrchr(src, _T('\\'));
+	StringCchCopy(dir, MAX_PATH, src);
+	if(base) dir[base-src+1] = 0; else dir[0] = 0;
+	StringCchCopy(fn, MAX_PATH, src);   // full path, so the dialog opens in the source folder
+	TCHAR ext[16] = _T("");
+	TCHAR *dot = _tcsrchr(fn, _T('.'));
+	if(dot) { StringCchCopy(ext, 16, dot); *dot = 0; }
+	StringCchCat(fn, MAX_PATH, _T("_clean"));
+	StringCchCat(fn, MAX_PATH, ext);
+
+	OPENFILENAME ofn;
+	ZeroMemory(&ofn, sizeof(ofn));
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = globals.hwndMain;
+	ofn.lpstrFilter = _T("Same type as the original\0*.*\0\0");
+	ofn.lpstrFile = fn;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrInitialDir = dir[0] ? dir : NULL;
+	ofn.lpstrTitle = _T("Save a copy without AI metadata");
+	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+	if(!GetSaveFileName(&ofn)) { free(out); return; }
+
+	BOOL same = !lstrcmpi(fn, src);
+	BOOL ok;
+	if(kind==3 || kind==4) {
+		ok = same || CopyFile(src, fn, FALSE);
+		if(ok) ok = twpng_StripMp4File(fn, FALSE, &removed);
+	} else {
+		ok = twpng_WriteWholeFile(fn, out, outLen);
+		free(out);
+	}
+	if(!ok) { mesg(MSG_E,_T("Could not write %s"), fn); return; }
+	if(same) OpenPngByName(fn);   // refresh the badge and viewer for the cleaned file
+	mesg(MSG_I,_T("Removed %d metadata block%s.\r\n\r\nSaved: %s"), removed, removed==1?_T(""):_T("s"), fn);
+}
+
+// ---- Compare AI parameters of two files ----------------------------------------------
+
+struct twpng_tbuf { TCHAR *s; size_t len, cap; };
+
+static void tb_add(struct twpng_tbuf *b, const TCHAR *t, int n)
+{
+	if(!t) return;
+	if(n<0) n = lstrlen(t);
+	if(b->len + n + 1 > b->cap) {
+		size_t ncap = (b->cap ? b->cap*2 : 4096);
+		while(ncap < b->len + n + 1) ncap *= 2;
+		TCHAR *ns = (TCHAR*)realloc(b->s, ncap*sizeof(TCHAR));
+		if(!ns) return;
+		b->s = ns; b->cap = ncap;
+	}
+	memcpy(b->s + b->len, t, (size_t)n*sizeof(TCHAR));
+	b->len += n;
+	b->s[b->len] = 0;
+}
+
+struct twpng_kv { TCHAR key[80]; TCHAR *val; };
+
+// Settings line into key/value pairs (the same split the viewer uses for display).
+static int twpng_SplitSettings(const TCHAR *set, struct twpng_kv *kv, int max)
+{
+	TCHAR *lines = twpng_SettingsToLines(set);
+	if(!lines) return 0;
+	int n = 0;
+	TCHAR *line = lines;
+	while(line && *line && n<max) {
+		TCHAR *nl = _tcsstr(line, _T("\r\n"));
+		if(nl) *nl = 0;
+		TCHAR *colon = _tcsstr(line, _T(": "));
+		if(colon) {
+			*colon = 0;
+			StringCchCopy(kv[n].key, 80, line);
+			kv[n].val = _tcsdup(colon+2);
+		} else {
+			StringCchCopy(kv[n].key, 80, line);
+			kv[n].val = _tcsdup(_T(""));
+		}
+		n++;
+		line = nl ? nl+2 : NULL;
+	}
+	free(lines);
+	return n;
+}
+
+// Words of a text; a whitespace run holding a line break becomes a "\n" token.
+static int twpng_Tokenize(const TCHAR *s, const TCHAR ***outTok, int **outLen)
+{
+	int cap = 256, n = 0;
+	const TCHAR **tok = (const TCHAR**)malloc(cap*sizeof(TCHAR*));
+	int *tl = (int*)malloc(cap*sizeof(int));
+	if(!tok || !tl) { free(tok); free(tl); *outTok = NULL; *outLen = NULL; return 0; }
+	const TCHAR *p = s ? s : _T("");
+	while(*p) {
+		const TCHAR *ws = p;
+		BOOL brk = FALSE;
+		while(*p==_T(' ') || *p==_T('\t') || *p==_T('\r') || *p==_T('\n')) { if(*p==_T('\n')) brk = TRUE; p++; }
+		if(n+1 >= cap) {
+			cap *= 2;
+			const TCHAR **nt = (const TCHAR**)realloc((void*)tok, cap*sizeof(TCHAR*));
+			int *nl = (int*)realloc(tl, cap*sizeof(int));
+			if(!nt || !nl) { if(nt) tok = nt; if(nl) tl = nl; break; }
+			tok = nt; tl = nl;
+		}
+		if(brk && n>0) { tok[n] = _T("\n"); tl[n] = 1; n++; }
+		(void)ws;
+		if(!*p) break;
+		const TCHAR *w = p;
+		while(*p && *p!=_T(' ') && *p!=_T('\t') && *p!=_T('\r') && *p!=_T('\n')) p++;
+		tok[n] = w; tl[n] = (int)(p-w); n++;
+	}
+	*outTok = tok; *outLen = tl;
+	return n;
+}
+
+static void tb_add_tokens(struct twpng_tbuf *b, const TCHAR **tok, const int *tl, int from, int to,
+	const TCHAR *open, const TCHAR *close)
+{
+	if(from>=to) return;
+	tb_add(b, open, -1);
+	for(int i=from; i<to; i++) {
+		if(tl[i]==1 && tok[i][0]==_T('\n')) { tb_add(b, _T("\r\n"), 2); continue; }
+		if(i>from && !(tl[i-1]==1 && tok[i-1][0]==_T('\n'))) tb_add(b, _T(" "), 1);
+		tb_add(b, tok[i], tl[i]);
+	}
+	tb_add(b, close, -1);
+}
+
+// Word diff: unchanged words as-is, removed words as [-...-], added words as {+...+}.
+static void twpng_DiffWords(struct twpng_tbuf *b, const TCHAR *x, const TCHAR *y)
+{
+	const TCHAR **ta, **tb2;
+	int *la, *lb;
+	int na = twpng_Tokenize(x, &ta, &la), nb = twpng_Tokenize(y, &tb2, &lb);
+	unsigned short *dp = NULL;
+	if(na<=3000 && nb<=3000)
+		dp = (unsigned short*)calloc((size_t)(na+1)*(nb+1), sizeof(unsigned short));
+	if(!dp) {
+		tb_add(b, _T("A:\r\n"), -1); tb_add_tokens(b, ta, la, 0, na, _T(""), _T(""));
+		tb_add(b, _T("\r\n\r\nB:\r\n"), -1); tb_add_tokens(b, tb2, lb, 0, nb, _T(""), _T(""));
+	} else {
+		#define DP(i,j) dp[(size_t)(i)*(nb+1)+(j)]
+		for(int i=na-1; i>=0; i--)
+			for(int j=nb-1; j>=0; j--)
+				DP(i,j) = (la[i]==lb[j] && !_tcsncmp(ta[i], tb2[j], la[i]))
+					? DP(i+1,j+1)+1 : (DP(i+1,j)>=DP(i,j+1) ? DP(i+1,j) : DP(i,j+1));
+		#define EQ(i,j) (la[i]==lb[j] && !_tcsncmp(ta[i], tb2[j], la[i]))
+		int i = 0, j = 0;
+		while(i<na || j<nb) {
+			if(i<na && j<nb && EQ(i,j)) {
+				if(la[i]==1 && ta[i][0]==_T('\n')) tb_add(b, _T("\r\n"), 2);
+				else { if(b->len && b->s[b->len-1]!=_T('\n')) tb_add(b, _T(" "), 1); tb_add(b, ta[i], la[i]); }
+				i++; j++;
+				continue;
+			}
+			// A run of edits up to the next common word.
+			int di = i, dj = j;
+			while((di<na || dj<nb) && !(di<na && dj<nb && EQ(di,dj))) {
+				if(dj>=nb || (di<na && DP(di+1,dj)>=DP(di,dj+1))) di++; else dj++;
+			}
+			if(b->len && b->s[b->len-1]!=_T('\n')) tb_add(b, _T(" "), 1);
+			tb_add_tokens(b, ta, la, i, di, _T("[-"), _T("-]"));
+			if(di>i && dj>j) tb_add(b, _T(" "), 1);
+			tb_add_tokens(b, tb2, lb, j, dj, _T("{+"), _T("+}"));
+			i = di; j = dj;
+		}
+		#undef EQ
+		#undef DP
+		free(dp);
+	}
+	free((void*)ta); free(la); free((void*)tb2); free(lb);
+}
+
+static void twpng_CompareSection(struct twpng_tbuf *b, const TCHAR *title, const TCHAR *x, const TCHAR *y)
+{
+	tb_add(b, title, -1);
+	if(!x && !y) { tb_add(b, _T(": (none in either file)\r\n\r\n"), -1); return; }
+	if(x && y && !lstrcmp(x, y)) { tb_add(b, _T(": identical\r\n"), -1); }
+	else {
+		tb_add(b, _T(": differs  ([-only in A-]  {+only in B+})\r\n"), -1);
+		twpng_DiffWords(b, x ? x : _T(""), y ? y : _T(""));
+		tb_add(b, _T("\r\n"), -1);
+	}
+	tb_add(b, _T("\r\n"), -1);
+}
+
+static TCHAR *twpng_BuildCompareReport(const TCHAR *fa, const struct aiparams_ctx *a,
+	const TCHAR *fb, const struct aiparams_ctx *c)
+{
+	struct twpng_tbuf b = { NULL, 0, 0 };
+	tb_add(&b, _T("A: "), -1); tb_add(&b, fa, -1); tb_add(&b, a->full ? _T("") : _T("  (no AI parameters)"), -1);
+	tb_add(&b, _T("\r\nB: "), -1); tb_add(&b, fb, -1); tb_add(&b, c->full ? _T("") : _T("  (no AI parameters)"), -1);
+	tb_add(&b, _T("\r\n\r\nSETTINGS\r\n"), -1);
+
+	struct twpng_kv *ka = (struct twpng_kv*)calloc(200, sizeof(struct twpng_kv));
+	struct twpng_kv *kb = (struct twpng_kv*)calloc(200, sizeof(struct twpng_kv));
+	int na = ka ? twpng_SplitSettings(a->setRaw, ka, 200) : 0;
+	int nb = kb ? twpng_SplitSettings(c->setRaw, kb, 200) : 0;
+	struct twpng_tbuf same = { NULL, 0, 0 }, onlyA = { NULL, 0, 0 }, onlyB = { NULL, 0, 0 };
+	BOOL anyChange = FALSE;
+	for(int i=0; i<na; i++) {
+		int j;
+		for(j=0; j<nb && lstrcmp(ka[i].key, kb[j].key); j++) {}
+		if(j==nb) {
+			tb_add(&onlyA, _T("    "), -1); tb_add(&onlyA, ka[i].key, -1); tb_add(&onlyA, _T(": "), -1);
+			tb_add(&onlyA, ka[i].val, -1); tb_add(&onlyA, _T("\r\n"), -1);
+		} else if(!lstrcmp(ka[i].val, kb[j].val)) {
+			if(same.len) tb_add(&same, _T(", "), -1);
+			tb_add(&same, ka[i].key, -1);
+		} else {
+			if(!anyChange) tb_add(&b, _T("  Changed:\r\n"), -1);
+			anyChange = TRUE;
+			tb_add(&b, _T("    "), -1); tb_add(&b, ka[i].key, -1); tb_add(&b, _T(": "), -1);
+			tb_add(&b, ka[i].val, -1); tb_add(&b, _T("  ->  "), -1); tb_add(&b, kb[j].val, -1);
+			tb_add(&b, _T("\r\n"), -1);
+		}
+	}
+	for(int j=0; j<nb; j++) {
+		int i;
+		for(i=0; i<na && lstrcmp(ka[i].key, kb[j].key); i++) {}
+		if(i==na) {
+			tb_add(&onlyB, _T("    "), -1); tb_add(&onlyB, kb[j].key, -1); tb_add(&onlyB, _T(": "), -1);
+			tb_add(&onlyB, kb[j].val, -1); tb_add(&onlyB, _T("\r\n"), -1);
+		}
+	}
+	if(onlyA.len) { tb_add(&b, _T("  Only in A:\r\n"), -1); tb_add(&b, onlyA.s, -1); }
+	if(onlyB.len) { tb_add(&b, _T("  Only in B:\r\n"), -1); tb_add(&b, onlyB.s, -1); }
+	if(same.len)  { tb_add(&b, _T("  Same: "), -1); tb_add(&b, same.s, -1); tb_add(&b, _T("\r\n"), -1); }
+	if(!na && !nb) tb_add(&b, _T("  (none)\r\n"), -1);
+	tb_add(&b, _T("\r\n"), -1);
+	for(int i=0; i<na; i++) free(ka[i].val);
+	for(int j=0; j<nb; j++) free(kb[j].val);
+	free(ka); free(kb); free(same.s); free(onlyA.s); free(onlyB.s);
+
+	twpng_CompareSection(&b, _T("PROMPT"), a->pos, c->pos);
+	twpng_CompareSection(&b, _T("NEGATIVE PROMPT"), a->neg, c->neg);
+	return b.s;
+}
+
+static void twpng_LayoutCompare(HWND hwnd)
+{
+	RECT rc;
+	GetClientRect(hwnd, &rc);
+	int m = 10, btnW = 72, btnH = 24, gap = 8;
+	int by = rc.bottom - m - btnH;
+	SetWindowPos(GetDlgItem(hwnd,IDC_CMP_TEXT), NULL, m, m, rc.right-2*m, by-gap-m, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDOK), NULL, rc.right-m-btnW, by, btnW, btnH, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_CMP_COPY), NULL, rc.right-m-2*btnW-gap, by, btnW, btnH, SWP_NOZORDER);
+}
+
+static INT_PTR CALLBACK DlgProcCompare(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch(msg) {
+	case WM_INITDIALOG:
+		SetDlgItemText(hwnd, IDC_CMP_TEXT, (const TCHAR*)lParam);
+		twpng_LayoutCompare(hwnd);
+		twpng_InitDarkDialog(hwnd);
+		return TRUE;
+	case WM_SIZE:
+		twpng_LayoutCompare(hwnd);
+		return TRUE;
+	case WM_GETMINMAXINFO:
+		((LPMINMAXINFO)lParam)->ptMinTrackSize.x = 360;
+		((LPMINMAXINFO)lParam)->ptMinTrackSize.y = 240;
+		return TRUE;
+	case WM_COMMAND:
+		switch(LOWORD(wParam)) {
+		case IDC_CMP_COPY:
+			{
+				int n = GetWindowTextLength(GetDlgItem(hwnd,IDC_CMP_TEXT));
+				TCHAR *t = (TCHAR*)malloc(((size_t)n+1)*sizeof(TCHAR));
+				if(t) { GetDlgItemText(hwnd, IDC_CMP_TEXT, t, n+1); twpng_SetClipboardText(hwnd, t); free(t); }
+			}
+			return TRUE;
+		case IDOK: case IDCANCEL:
+			EndDialog(hwnd, 0);
+			return TRUE;
+		}
+		break;
+	}
+	INT_PTR dr = 0;
+	if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &dr)) return dr;
+	return FALSE;
+}
+
+static BOOL twpng_PickAIFile(HWND owner, const TCHAR *title, TCHAR *fn, BOOL multi, DWORD *outOffset)
+{
+	OPENFILENAME ofn;
+	ZeroMemory(&ofn, sizeof(ofn));
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = owner;
+	ofn.lpstrFilter = _T("Images and videos\0*.png;*.jpg;*.jpeg;*.webp;*.mp4;*.mov;*.m4v\0All files (*.*)\0*.*\0\0");
+	ofn.lpstrFile = fn;
+	ofn.nMaxFile = 4*MAX_PATH;
+	ofn.lpstrTitle = title;
+	ofn.lpstrInitialDir = globals.last_open_dir[0] ? globals.last_open_dir : NULL;
+	ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR | OFN_EXPLORER |
+		(multi ? OFN_ALLOWMULTISELECT : 0);
+	if(!GetOpenFileName(&ofn)) return FALSE;
+	if(outOffset) *outOffset = ofn.nFileOffset;
+	return TRUE;
+}
+
+// Tools > Compare AI Parameters: pick two files (or one, to compare with the open document).
+static void twpng_CompareAIParams(HWND owner)
+{
+	TCHAR sel[4*MAX_PATH] = _T(""), fa[MAX_PATH] = _T(""), fb[MAX_PATH] = _T("");
+	DWORD off = 0;
+	const TCHAR *doc = twpng_DocPath();
+	if(!twpng_PickAIFile(owner, doc[0] ? _T("Compare with the open file (or select two files)")
+	                                     : _T("Select two files to compare"), sel, TRUE, &off)) return;
+	if(off>0 && sel[off-1]==0) {
+		// Multi-select: "dir\0name1\0name2\0\0".
+		const TCHAR *n1 = sel+off, *n2 = n1 + lstrlen(n1) + 1;
+		StringCchPrintf(fa, MAX_PATH, _T("%s\\%s"), sel, n1);
+		if(*n2) StringCchPrintf(fb, MAX_PATH, _T("%s\\%s"), sel, n2);
+	} else {
+		StringCchCopy(fa, MAX_PATH, sel);
+	}
+	if(!fb[0]) {
+		if(doc[0] && lstrcmpi(doc, fa)) {
+			StringCchCopy(fb, MAX_PATH, fa);
+			StringCchCopy(fa, MAX_PATH, doc);
+		} else {
+			TCHAR sel2[4*MAX_PATH] = _T("");
+			if(!twpng_PickAIFile(owner, _T("Select the second file"), sel2, FALSE, NULL)) return;
+			StringCchCopy(fb, MAX_PATH, sel2);
+		}
+	}
+
+	struct aiparams_ctx *ca = NULL, *cb = NULL;
+	TCHAR *ta = NULL, *tb = NULL, ea[200], eb[200];
+	twpng_ReadAnyAIParams(fa, &ta, ea, 200);
+	twpng_ReadAnyAIParams(fb, &tb, eb, 200);
+	ca = twpng_BuildAICtx(ta, ea);
+	cb = twpng_BuildAICtx(tb, eb);
+	free(ta); free(tb);
+	if(ca && cb) {
+		TCHAR *report = twpng_BuildCompareReport(fa, ca, fb, cb);
+		if(report) {
+			DialogBoxParam(globals.hInst, _T("DLG_AICOMPARE"), owner, DlgProcCompare, (LPARAM)report);
+			free(report);
+		}
+	}
+	twpng_FreeAIParamsCtx(ca);
+	twpng_FreeAIParamsCtx(cb);
+}
+
+// File-open command: show the parsed viewer for a file without loading it as the document.
 static void twpng_ReadAIFromFile(HWND owner)
 {
 	OPENFILENAME ofn;
@@ -3641,39 +4543,20 @@ static void twpng_ReadAIFromFile(HWND owner)
 	ZeroMemory(&ofn, sizeof(ofn));
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner   = owner;
-	ofn.lpstrFilter = _T("JPEG, WebP and MP4/MOV files\0*.jpg;*.jpeg;*.webp;*.mp4;*.mov;*.m4v\0All files (*.*)\0*.*\0\0");
+	ofn.lpstrFilter = _T("Images and videos\0*.png;*.jpg;*.jpeg;*.webp;*.mp4;*.mov;*.m4v\0All files (*.*)\0*.*\0\0");
 	ofn.nFilterIndex= 1;
 	ofn.lpstrFile   = fn;
 	ofn.nMaxFile    = MAX_PATH;
-	ofn.lpstrTitle  = _T("Read AI parameters from JPEG, WebP or MP4/MOV");
+	ofn.lpstrTitle  = _T("Read AI parameters from file");
 	ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
 	if(!GetOpenFileName(&ofn)) return;
 
-	// Sniff format by magic bytes.
-	HANDLE fh = CreateFile(fn, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-		FILE_ATTRIBUTE_NORMAL, NULL);
-	if(fh==INVALID_HANDLE_VALUE) { mesg(MSG_S,_T("Cannot open file.")); return; }
-	unsigned char hdr[16]; DWORD got=0;
-	ReadFile(fh, hdr, sizeof(hdr), &got, NULL);
-	CloseHandle(fh);
-
-	TCHAR *text = NULL;
-	int kind = twpng_SniffForeignKind(hdr, got);
-	if(kind) twpng_ReadForeignAIParams(kind, fn, &text);
-	else if(got>=8 && !memcmp(hdr,"\x89PNG\r\n\x1a\n",8)) {
-		mesg(MSG_I,_T("For PNG files, use File \xb7 Open and the viewer will pop up automatically."));
-		return;
-	}
-	else {
-		mesg(MSG_W,_T("Unrecognized file format. Expected JPEG, WebP, MP4/MOV, or PNG."));
-		return;
-	}
-
-	if(!text) {
+	TCHAR *text = NULL, extra[200];
+	if(!twpng_ReadAnyAIParams(fn, &text, extra, 200)) {
 		mesg(MSG_I,_T("No AI parameters were found in this file."));
 		return;
 	}
-	twpng_OpenAIParamsViewerFromText(text, lstrlen(text));
+	twpng_ShowAIParams(text, extra, fn, FALSE);
 	free(text);
 }
 
@@ -4330,6 +5213,112 @@ static void DblClickOnList()
 	}
 }
 
+// ---- Theme (Options > Theme: System / Light / Dark) ------------------------------------
+
+static BOOL twpng_SystemUsesDark()
+{
+	DWORD val = 1, sz = sizeof(val), type = 0;
+	HKEY hKey;
+	if(RegOpenKeyEx(HKEY_CURRENT_USER,
+		_T("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+		0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+		if(RegQueryValueEx(hKey, _T("AppsUseLightTheme"), NULL, &type, (LPBYTE)&val, &sz)!=ERROR_SUCCESS
+		   || type!=REG_DWORD) val = 1;
+		RegCloseKey(hKey);
+	}
+	return val==0;
+}
+
+void twpng_ResolveTheme()
+{
+	globals.dark = globals.theme_pref==TWPNG_THEME_DARK ||
+		(globals.theme_pref==TWPNG_THEME_SYSTEM && twpng_SystemUsesDark());
+}
+
+// App-wide mode for menus, scrollbars and common controls (undocumented uxtheme ordinals).
+void twpng_SetAppMode()
+{
+	HMODULE hUx = LoadLibrary(_T("uxtheme.dll"));
+	if(!hUx) return;
+	typedef int (WINAPI *SetPreferredAppModeProc)(int);
+	typedef void (WINAPI *VoidProc)();
+	SetPreferredAppModeProc setMode = (SetPreferredAppModeProc)GetProcAddress(hUx, MAKEINTRESOURCEA(135));
+	VoidProc refreshPolicy = (VoidProc)GetProcAddress(hUx, MAKEINTRESOURCEA(104));
+	VoidProc flushMenus = (VoidProc)GetProcAddress(hUx, MAKEINTRESOURCEA(136));
+	if(setMode) setMode(globals.dark ? 2 : 3);   // ForceDark / ForceLight
+	if(refreshPolicy) refreshPolicy();
+	if(flushMenus) flushMenus();
+	FreeLibrary(hUx);
+}
+
+static void twpng_AllowDark(HWND hwnd, BOOL dark)
+{
+	if(!hwnd) return;
+	HMODULE hUx = LoadLibrary(_T("uxtheme.dll"));
+	if(!hUx) return;
+	typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
+	AllowDarkModeForWindowProc f = (AllowDarkModeForWindowProc)GetProcAddress(hUx, MAKEINTRESOURCEA(133));
+	if(f) f(hwnd, dark);
+	FreeLibrary(hUx);
+}
+
+// The dark brushes double as the "dark mode is on" switch for the WM_CTLCOLOR handlers.
+static void twpng_UpdateThemeBrushes()
+{
+	if(globals.hUiBgBrush) { DeleteObject(globals.hUiBgBrush); globals.hUiBgBrush = NULL; }
+	if(globals.hDarkEditBrush) { DeleteObject(globals.hDarkEditBrush); globals.hDarkEditBrush = NULL; }
+	if(globals.dark) {
+		globals.hUiBgBrush = CreateSolidBrush(RGB(32,32,32));
+		globals.hDarkEditBrush = CreateSolidBrush(RGB(45,45,45));
+	}
+}
+
+static void twpng_ThemeMainControls()
+{
+	BOOL d = globals.dark;
+	HWND lv = globals.hwndMainList, hdr = lv ? ListView_GetHeader(lv) : NULL;
+	twpng_AllowDark(globals.hwndStBar, d);
+	twpng_AllowDark(lv, d);
+	twpng_AllowDark(hdr, d);
+	if(lv) {
+		SetWindowTheme(lv, d ? _T("DarkMode_Explorer") : _T("Explorer"), NULL);
+		COLORREF bg = d ? RGB(32,32,32) : GetSysColor(COLOR_WINDOW);
+		ListView_SetBkColor(lv, bg);
+		ListView_SetTextBkColor(lv, bg);
+		ListView_SetTextColor(lv, d ? RGB(255,255,255) : GetSysColor(COLOR_WINDOWTEXT));
+	}
+	if(hdr) SetWindowTheme(hdr, d ? _T("DarkMode_ItemsView") : _T("ItemsView"), NULL);
+}
+
+static BOOL CALLBACK twpng_RethemeWindow(HWND h, LPARAM lParam)
+{
+	(void)lParam;
+	if(h==globals.hwndMain || !IsWindowVisible(h)) return TRUE;
+	TCHAR cls[32];
+	GetClassName(h, cls, 32);
+	if(!lstrcmp(cls, _T("#32770"))) {
+		twpng_InitDarkDialog(h);
+	} else if(!lstrcmp(cls, _T("TPNGVIEWER"))) {
+		twpng_ApplyModernWindowStyle(h);
+		SetWindowPos(h, NULL, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
+		RedrawWindow(h, NULL, NULL, RDW_INVALIDATE|RDW_ERASE|RDW_FRAME|RDW_ALLCHILDREN);
+	}
+	return TRUE;
+}
+
+// Re-apply the theme to the running app (main window plus open modeless windows).
+static void twpng_ApplyTheme()
+{
+	twpng_ResolveTheme();
+	twpng_SetAppMode();
+	twpng_UpdateThemeBrushes();
+	twpng_ApplyModernWindowStyle(globals.hwndMain);
+	twpng_ThemeMainControls();
+	EnumThreadWindows(GetCurrentThreadId(), twpng_RethemeWindow, 0);
+	SetWindowPos(globals.hwndMain, NULL, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
+	RedrawWindow(globals.hwndMain, NULL, NULL, RDW_INVALIDATE|RDW_ERASE|RDW_FRAME|RDW_ALLCHILDREN|RDW_UPDATENOW);
+}
+
 void twpng_ApplyModernWindowStyle(HWND hwnd)
 {
 	typedef HRESULT (WINAPI *DwmSetWindowAttributeProc)(HWND,DWORD,LPCVOID,DWORD);
@@ -4347,13 +5336,13 @@ void twpng_ApplyModernWindowStyle(HWND hwnd)
 		AllowDarkModeForWindowProc AllowDarkModeForWindow = (AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
 		FlushMenuThemesProc FlushMenuThemes = (FlushMenuThemesProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(136));
 		if(AllowDarkModeForWindow) {
-			AllowDarkModeForWindow(hwnd, TRUE);
+			AllowDarkModeForWindow(hwnd, globals.dark);
 		}
 		if(FlushMenuThemes) {
 			FlushMenuThemes();
 		}
 		// Set dark window theme class to force standard Win32 menu bar to go dark
-		SetWindowTheme(hwnd, _T("DarkMode_Explorer"), NULL);
+		SetWindowTheme(hwnd, globals.dark ? _T("DarkMode_Explorer") : NULL, NULL);
 		FreeLibrary(hUxTheme);
 	}
 
@@ -4361,7 +5350,7 @@ void twpng_ApplyModernWindowStyle(HWND hwnd)
 	if(!hDwm) return;
 	pDwmSetWindowAttribute=(DwmSetWindowAttributeProc)GetProcAddress(hDwm,"DwmSetWindowAttribute");
 	if(pDwmSetWindowAttribute) {
-		use_dark_title=TRUE;
+		use_dark_title=globals.dark;
 		pDwmSetWindowAttribute(hwnd,20,&use_dark_title,sizeof(use_dark_title));
 		corner_pref=2;
 		pDwmSetWindowAttribute(hwnd,33,&corner_pref,sizeof(corner_pref));
@@ -4379,6 +5368,7 @@ void twpng_ApplyModernWindowStyle(HWND hwnd)
 // main window and the image viewer. Returns TRUE if the message was handled.
 BOOL twpng_HandleDarkMenuMsg(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT *result)
 {
+	if(!globals.dark) return FALSE;
 	switch(msg) {
 	case WM_UAHDRAWMENU:
 		{
@@ -4484,23 +5474,10 @@ static void twpng_CreateUiFont(UINT dpi = 0)
 	}
 }
 
-// Subtle 1px border color for edit controls. Reads the active app theme so it looks
-// right whether the UI is dark (current default) or a light system theme.
+// Subtle 1px border color for edit controls and the chunk table.
 static COLORREF twpng_GetEditBorderColor()
 {
-	BOOL useLight = FALSE;
-	HKEY hKey;
-	if(RegOpenKeyEx(HKEY_CURRENT_USER,
-		_T("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-		0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-		DWORD val=0, sz=sizeof(val), type=0;
-		if(RegQueryValueEx(hKey, _T("AppsUseLightTheme"), NULL, &type,
-			(LPBYTE)&val, &sz)==ERROR_SUCCESS && type==REG_DWORD) {
-			useLight = (val != 0);
-		}
-		RegCloseKey(hKey);
-	}
-	return useLight ? RGB(171,171,171) : RGB(90,90,90);
+	return globals.dark ? RGB(90,90,90) : RGB(171,171,171);
 }
 
 // Paints a flat border over a control's non-client edge: outer 1px in the border
@@ -4615,6 +5592,20 @@ static BOOL CALLBACK DarkModeEnumChildProc(HWND hChild, LPARAM lParam)
 {
 	TCHAR classname[64];
 	GetClassName(hChild, classname, 64);
+
+	if(!globals.dark) {
+		// Light theme: plain themed controls (also undoes dark styling on a live switch).
+		if(!_tcsicmp(classname,_T("Edit")) || !_tcsicmp(classname,_T("Button")) ||
+		   !_tcsicmp(classname,_T("ListBox")) || !_tcsicmp(classname,_T("ComboBox"))) {
+			SetWindowTheme(hChild, NULL, NULL);
+			RemoveWindowSubclass(hChild, EditBorderSubclassProc, 1);
+			RemoveWindowSubclass(hChild, RadioSubclassProc, 1);
+			SetWindowPos(hChild, NULL, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
+		}
+		twpng_AllowDark(hChild, FALSE);
+		if(globals.hUiFont) SendMessage(hChild, WM_SETFONT, (WPARAM)globals.hUiFont, TRUE);
+		return TRUE;
+	}
 
 	if(!_tcsicmp(classname, _T("Edit"))) {
 		SetWindowTheme(hChild, _T("DarkMode_Explorer"), NULL);
@@ -4747,6 +5738,7 @@ static LRESULT CALLBACK SysDlgDarkCbtProc(int code, WPARAM wParam, LPARAM lParam
 
 BOOL twpng_ChooseColorDark(LPCHOOSECOLOR cc)
 {
+	if(!globals.dark) return ChooseColor(cc);
 	g_sysDlgCbtHook = SetWindowsHookEx(WH_CBT, SysDlgDarkCbtProc, NULL, GetCurrentThreadId());
 	BOOL r = ChooseColor(cc);
 	if(g_sysDlgCbtHook) {
@@ -4759,6 +5751,7 @@ BOOL twpng_ChooseColorDark(LPCHOOSECOLOR cc)
 BOOL twpng_HandleDlgDarkMsg(UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR *result)
 {
 	(void)lParam;
+	if(!globals.dark) return FALSE;
 	switch(msg) {
 	case WM_CTLCOLORDLG:
 	case WM_CTLCOLORSTATIC:
@@ -4817,7 +5810,7 @@ static LRESULT CALLBACK MainListSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
 	(void)uIdSubclass; (void)dwRefData;
-	if(msg == WM_NOTIFY) {
+	if(msg == WM_NOTIFY && globals.dark) {
 		LPNMHDR pnmh = (LPNMHDR)lParam;
 		HWND hwndHdr = ListView_GetHeader(hwnd);
 		if(pnmh->code == NM_CUSTOMDRAW && pnmh->hwndFrom == hwndHdr) {
@@ -4897,16 +5890,8 @@ static int CreateMainWindows(HWND hwnd)
 		mesg(MSG_S,_T("Cannot create status bar"));
 		return 0;
 	}
-	HMODULE hUxTheme = LoadLibrary(_T("uxtheme.dll"));
-	if(hUxTheme) {
-		typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
-		AllowDarkModeForWindowProc AllowDarkModeForWindow = (AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
-		if(AllowDarkModeForWindow) AllowDarkModeForWindow(globals.hwndStBar, TRUE);
-		FreeLibrary(hUxTheme);
-	}
 	SendMessage(globals.hwndStBar, WM_SETFONT, (WPARAM)globals.hUiFont, TRUE);
-	globals.hUiBgBrush=CreateSolidBrush(RGB(32,32,32));
-	globals.hDarkEditBrush=CreateSolidBrush(RGB(45,45,45));
+	twpng_UpdateThemeBrushes();
 
 	GetClientRect(hwnd,&r);
 
@@ -4925,30 +5910,7 @@ static int CreateMainWindows(HWND hwnd)
 	ListView_SetExtendedListViewStyle(globals.hwndMainList,style|LVS_EX_FULLROWSELECT|0x00010000|LVS_EX_HEADERDRAGDROP);
 	SendMessage(globals.hwndMainList,WM_SETFONT,(WPARAM)globals.hUiFont,TRUE);
 	SetWindowSubclass(globals.hwndMainList, MainListSubclassProc, 1, 0);
-	SetWindowTheme(globals.hwndMainList,_T("DarkMode_Explorer"),NULL);
-	ListView_SetBkColor(globals.hwndMainList, RGB(32,32,32));
-	ListView_SetTextBkColor(globals.hwndMainList, RGB(32,32,32));
-	ListView_SetTextColor(globals.hwndMainList, RGB(255,255,255));
-	
-	hUxTheme = LoadLibrary(_T("uxtheme.dll"));
-	if(hUxTheme) {
-		typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
-		AllowDarkModeForWindowProc AllowDarkModeForWindow = (AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
-		if(AllowDarkModeForWindow) AllowDarkModeForWindow(globals.hwndMainList, TRUE);
-		FreeLibrary(hUxTheme);
-	}
-
-	HWND hwndHeader = ListView_GetHeader(globals.hwndMainList);
-	if (hwndHeader) {
-		SetWindowTheme(hwndHeader, _T("DarkMode_ItemsView"), NULL);
-		hUxTheme = LoadLibrary(_T("uxtheme.dll"));
-		if(hUxTheme) {
-			typedef BOOL (WINAPI *AllowDarkModeForWindowProc)(HWND, BOOL);
-			AllowDarkModeForWindowProc AllowDarkModeForWindow = (AllowDarkModeForWindowProc)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(133));
-			if(AllowDarkModeForWindow) AllowDarkModeForWindow(hwndHeader, TRUE);
-			FreeLibrary(hUxTheme);
-		}
-	}
+	twpng_ThemeMainControls();
 
 	globals.hListRowImageList=ImageList_Create(1,28,ILC_COLOR32,1,1);
 	if(globals.hListRowImageList) {
@@ -5343,6 +6305,7 @@ void update_viewer()
 
 struct prefs_dlg_ctx {
 	int remember_menusetting;
+	int remember_aimenu;
 };
 
 static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -5366,10 +6329,8 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		break;
 
 	case WM_ERASEBKGND:
-		if(globals.hUiBgBrush) {
-			GetClientRect(hwnd,&r);
-			FillRect((HDC)wParam,&r,globals.hUiBgBrush);
-		}
+		GetClientRect(hwnd,&r);
+		FillRect((HDC)wParam,&r,globals.hUiBgBrush ? globals.hUiBgBrush : GetSysColorBrush(COLOR_WINDOW));
 		return 1;
 
 	case WM_CREATE:
@@ -5381,6 +6342,15 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 		if(lstrlen(globals.file_from_cmdline)) {
 			OpenPngByName(globals.file_from_cmdline);
+		}
+		if(globals.aiparams_only) {
+			// The viewer is the whole app; closing it closes the hidden main window.
+			TCHAR *text = NULL, extra[200] = _T("");
+			if(png || g_foreignFn[0]) twpng_GetDocAIText(&text, extra, 200);
+			if(!(png || g_foreignFn[0]) || !twpng_ShowAIParams(text, extra, globals.file_from_cmdline, TRUE))
+				PostMessage(hwnd, WM_CLOSE, 0, 0);
+			free(text);
+			return 0;
 		}
 		if(globals.autoopen_viewer) {
 			PostMessage(hwnd,WM_COMMAND,ID_IMGVIEWER,(LPARAM)0);
@@ -5436,12 +6406,27 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		return 0;
 
 	case WM_CTLCOLORSTATIC:
-		if((HWND)lParam==globals.hwndStBar && globals.hUiBgBrush) {
-			SetBkColor((HDC)wParam,RGB(32,32,32));
-			SetTextColor((HDC)wParam,RGB(255,255,255));
-			return (LRESULT)globals.hUiBgBrush;
+		if((HWND)lParam==globals.hwndStBar) {
+			if(globals.hUiBgBrush) {
+				SetBkColor((HDC)wParam,RGB(32,32,32));
+				SetTextColor((HDC)wParam,RGB(255,255,255));
+				return (LRESULT)globals.hUiBgBrush;
+			}
+			SetBkColor((HDC)wParam,GetSysColor(COLOR_WINDOW));
+			SetTextColor((HDC)wParam,GetSysColor(COLOR_WINDOWTEXT));
+			return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
 		}
 		return 0;
+
+	case WM_SETTINGCHANGE:
+		// Follow the Windows light/dark switch when the theme is "System default".
+		if(globals.theme_pref==TWPNG_THEME_SYSTEM && lParam &&
+		   !lstrcmpi((LPCTSTR)lParam, _T("ImmersiveColorSet"))) {
+			int was = globals.dark;
+			twpng_ResolveTheme();
+			if(was!=globals.dark) twpng_ApplyTheme();
+		}
+		break;
 
 	case WM_DPICHANGED:
 		{
@@ -5515,7 +6500,8 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			AppendMenu(mtools,MF_SEPARATOR,0,NULL);
 #endif
 			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_VIEWAIPARAMS,_T("&View AI Parameters..."));
-			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_READAIFROMFILE,_T("Read AI parameters from &JPEG/WebP/MP4..."));
+			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_READAIFROMFILE,_T("Read AI parameters from &File..."));
+			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_COMPAREAI,_T("&Compare AI Parameters..."));
 			AppendMenu(mtools,MF_SEPARATOR,0,NULL);
 			for(i=0;i<TWPNG_NUMTOOLS;i++) {
 				if(lstrlen(globals.tools[i].name)) {
@@ -5540,8 +6526,13 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			}
 
 			// "View AI Parameters" also works for a loaded JPEG/WebP (no PNG document).
-			if(!png && g_foreignFn[0])
+			if(!png && g_foreignFn[0]) {
 				EnableMenuItem(m,ID_VIEWAIPARAMS,MF_BYCOMMAND|MF_ENABLED);
+				EnableMenuItem(m,ID_STRIPAIMETA,MF_BYCOMMAND|MF_ENABLED);
+			}
+
+			CheckMenuRadioItem(m, ID_THEME_SYSTEM, ID_THEME_DARK,
+				ID_THEME_SYSTEM + globals.theme_pref, MF_BYCOMMAND);
 
 			// Close Document is enabled for either a PNG or a foreign (JPEG/WebP) file.
 			EnableMenuItem(m,ID_CLOSEDOCUMENT,MF_BYCOMMAND |
@@ -5658,6 +6649,19 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			globals.dlgs_open--;
 			return 0;
 
+		case ID_STRIPAIMETA:
+			StripAIMetadata();
+			return 0;
+		case ID_THEME_SYSTEM:
+		case ID_THEME_LIGHT:
+		case ID_THEME_DARK:
+			globals.theme_pref = id - ID_THEME_SYSTEM;
+			SaveSettings();
+			twpng_ApplyTheme();
+			return 0;
+		case ID_COMPAREAI:
+			twpng_CompareAIParams(hwnd);
+			return 0;
 		case ID_READAIFROMFILE:
 			twpng_ReadAIFromFile(hwnd);
 			return 0;
@@ -5711,7 +6715,6 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		case ID_SAVE:         SavePng(hwnd);     return 0;
 		case ID_SAVEAS:       SavePngAs(hwnd);   return 0;
 		case ID_CHECKPNG:     png->check_validity(0);  return 0;
-		case ID_STRIPAIMETA:  StripAIMetadata(); return 0;
 
 		case ID_EDITCHUNK:    DblClickOnList();  return 0;
 		case ID_DELCHUNK:     DeleteChunks();    return 0;
@@ -5843,12 +6846,14 @@ static INT_PTR CALLBACK DlgProcAbout(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 	switch (msg) {
 	case WM_INITDIALOG:
 		twpng_InitDarkDialog(hwnd);
-		twpng_ApplyAcrylic(hwnd);
+		// Light text on a black (see-through) client only reads well on dark acrylic.
+		if(globals.dark) twpng_ApplyAcrylic(hwnd);
 		twpng_HandleAboutInitDialog(hwnd);
 		return 1;
 	case WM_CTLCOLORDLG:
 	case WM_CTLCOLORSTATIC:
 	case WM_CTLCOLORBTN:
+		if(!globals.dark) break;
 		// Black is "transparent" on the extended frame, letting the acrylic show through.
 		SetBkMode((HDC)wParam, TRANSPARENT);
 		SetBkColor((HDC)wParam, RGB(0,0,0));
@@ -6048,6 +7053,45 @@ static void remove_from_explorer_menu()
 	return;
 }
 
+static const TCHAR *ai_menu_exts[] = { _T(".png"), _T(".jpg"), _T(".jpeg"), _T(".webp"),
+	_T(".mp4"), _T(".mov"), _T(".m4v"), NULL };
+#define TWPNG_AIMENU_KEY _T("Software\\Classes\\SystemFileAssociations\\%s\\shell\\TweakPNG.AIParams")
+
+static int is_ai_menu_set()
+{
+	TCHAR buf[300];
+	HKEY key;
+	StringCchPrintf(buf, 300, TWPNG_AIMENU_KEY, _T(".png"));
+	if(RegOpenKeyEx(HKEY_CURRENT_USER, buf, 0, KEY_READ, &key)!=ERROR_SUCCESS) return 0;
+	RegCloseKey(key);
+	return 1;
+}
+
+static void set_ai_menu(int add)
+{
+	TCHAR exe[MAX_PATH], buf[300], val[MAX_PATH+40];
+	GetModuleFileName(NULL, exe, MAX_PATH);
+	for(int i=0; ai_menu_exts[i]; i++) {
+		StringCchPrintf(buf, 300, TWPNG_AIMENU_KEY, ai_menu_exts[i]);
+		if(!add) { RegDeleteTree(HKEY_CURRENT_USER, buf); RegDeleteKey(HKEY_CURRENT_USER, buf); continue; }
+		HKEY key;
+		if(RegCreateKeyEx(HKEY_CURRENT_USER, buf, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &key, NULL)==ERROR_SUCCESS) {
+			StringCchCopy(val, MAX_PATH+40, _T("View AI parameters"));
+			RegSetValueEx(key, NULL, 0, REG_SZ, (BYTE*)val, (DWORD)sizeof(TCHAR)*(1+lstrlen(val)));
+			StringCchPrintf(val, MAX_PATH+40, _T("\"%s\",0"), exe);
+			RegSetValueEx(key, _T("Icon"), 0, REG_SZ, (BYTE*)val, (DWORD)sizeof(TCHAR)*(1+lstrlen(val)));
+			RegCloseKey(key);
+		}
+		StringCchCat(buf, 300, _T("\\command"));
+		if(RegCreateKeyEx(HKEY_CURRENT_USER, buf, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &key, NULL)==ERROR_SUCCESS) {
+			StringCchPrintf(val, MAX_PATH+40, _T("\"%s\" /aiparams \"%%1\""), exe);
+			RegSetValueEx(key, NULL, 0, REG_SZ, (BYTE*)val, (DWORD)sizeof(TCHAR)*(1+lstrlen(val)));
+			RegCloseKey(key);
+		}
+	}
+	SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+}
+
 static const TCHAR *cmprlevel_names[] = { _T("Default compression"),
 	_T("0 = No compression"),
 	_T("1 = Fastest"),_T("2"),_T("3"),_T("4"),_T("5"),_T("6"),_T("7"),_T("8"),
@@ -6088,6 +7132,8 @@ static INT_PTR CALLBACK DlgProcPrefs(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
 		CheckDlgButton(hwnd,IDC_OPENPARAMS,
 			globals.open_params_on_load?BST_CHECKED:BST_UNCHECKED);
+		prctx->remember_aimenu = is_ai_menu_set();
+		CheckDlgButton(hwnd,IDC_ADDAIMENU,prctx->remember_aimenu?BST_CHECKED:BST_UNCHECKED);
 
 		twpng_InitDarkDialog(hwnd);
 		return 1;
@@ -6116,6 +7162,10 @@ static INT_PTR CALLBACK DlgProcPrefs(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 			}
 
 			globals.open_params_on_load= (IsDlgButtonChecked(hwnd,IDC_OPENPARAMS)==BST_CHECKED);
+			{
+				int x = (IsDlgButtonChecked(hwnd,IDC_ADDAIMENU)==BST_CHECKED);
+				if(x!=prctx->remember_aimenu) set_ai_menu(x);
+			}
 
 			i=(int)SendDlgItemMessage(hwnd,IDC_CMPRLEVEL,CB_GETCURSEL,0,0);
 			if(i==CB_ERR) i=0;

@@ -63,8 +63,19 @@ Windows dark mode for classic Win32 relies on **undocumented APIs and message la
 When touching this, the canonical reference is `adzm/win32-custom-menubar-aero-theme` and
 `ysc3839/win32-darkmode`.
 
-- App-level dark mode: `SetPreferredAppMode(2)` and `AllowDarkModeForWindow` via
-  `uxtheme.dll` ordinals (133/135/136). Title bar/corners/backdrop via
+- **Theme selector** (Options > Theme: System default / Light / Dark, registry value
+  `theme`, default Dark). `globals.theme_pref` is resolved into `globals.dark` by
+  `twpng_ResolveTheme` (System reads `AppsUseLightTheme`). Everything dark is gated on
+  `globals.dark`; in light mode `hUiBgBrush`/`hDarkEditBrush` are NULL, which also turns
+  off the `WM_CTLCOLOR*` dark paths. `twpng_ApplyTheme` switches live: app mode, brushes,
+  main window controls (`twpng_ThemeMainControls`) and every visible dialog / image
+  viewer (re-running `twpng_InitDarkDialog`, whose child proc also undoes the dark
+  subclasses and themes). `WM_SETTINGCHANGE` "ImmersiveColorSet" re-applies it when the
+  theme is System and Windows flips.
+- App-level mode: `SetPreferredAppMode` (2 = ForceDark, 3 = ForceLight) set in
+  `twpng_SetAppMode` after `ReadSettings` and before any window exists, plus
+  `AllowDarkModeForWindow`, `RefreshImmersiveColorPolicyState` and `FlushMenuThemes` via
+  `uxtheme.dll` ordinals (133/135/104/136). Title bar/corners/backdrop via
   `DwmSetWindowAttribute` (attrs 20/33/38) in `twpng_ApplyModernWindowStyle`.
 - **Menu bar** is owner-drawn through the undocumented `WM_UAHDRAWMENU` (0x91) /
   `WM_UAHDRAWMENUITEM` (0x92). The `UAHDRAWMENUITEM` struct has `DRAWITEMSTRUCT` as its
@@ -87,7 +98,8 @@ When touching this, the canonical reference is `adzm/win32-custom-menubar-aero-t
 - **About dialog acrylic**: `twpng_ApplyAcrylic` sets backdrop type 3 (acrylic) and
   extends the DWM frame over the whole client area; `DlgProcAbout` returns a black brush
   with transparent bk mode for `WM_CTLCOLOR*`, since black is what lets the blur show
-  through. Windows shows acrylic as a flat fill while the window is inactive.
+  through. Windows shows acrylic as a flat fill while the window is inactive. Dark theme
+  only: light text on a see-through black client doesn't work on light acrylic.
 - **System common dialogs** (the `ChooseColor` picker) are dark-themed via a scoped
   `WH_CBT` hook in `twpng_ChooseColorDark`, which themes the chrome on activation while
   leaving owner-drawn swatches/spectrum colorful.
@@ -101,7 +113,7 @@ Two windows run modeless and **unowned** (so they minimize independently of the 
 window and get their own taskbar buttons), one instance each:
 
 - the tEXt/zTXt/iTXt editor (`DlgProcEdit_tEXt`, opened from `Chunk::edit()`), and
-- the AI parameters viewer (`DlgProcAIParams` / `twpng_ViewAIParams`).
+- the AI parameters viewer (`DlgProcAIParams` / `twpng_ShowAIParams`).
 
 The main message loop routes their messages via `IsDialogMessage`
 (`twpng_IsModelessEditorMessage` for the editor; a direct `g_hwndAIParams` check for the
@@ -109,7 +121,8 @@ viewer). Both are force-closed when the document is torn down — `Png::~Png` ca
 `twpng_CloseModelessEditors()` and `twpng_CloseAIParamsView()` — and free their
 heap context in `WM_NCDESTROY`. The tEXt editor edits live chunk data, so deleting its
 chunk also closes it (`twpng_CloseEditorForChunk`); the AI viewer holds a copy, so it is
-safe regardless.
+safe regardless. A `Png` with `m_scratch` set (a helper copy used to read a PNG that
+isn't the open document) skips that close in its destructor.
 
 ## A1111 / AI image features
 
@@ -122,8 +135,18 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
   chunk pops up the parsed viewer. The option persists in the registry (`open_params`).
   The foreign (JPEG/WebP/MP4/MOV) path triggers the same auto-open from its branch in
   `OpenPngByName`.
-- **Parsed viewer** (`DLG_AIPARAMS`): splits the A1111 string into Prompt / Negative
-  prompt / Settings with copy buttons. Parser `twpng_ParseA1111` splits on the
+- **Parsed viewer** (`DLG_AIPARAMS`, `twpng_ShowAIParams`): splits the A1111 string into
+  Prompt / Negative prompt / Settings with copy buttons. `twpng_BuildAICtx` parses the
+  text and appends `extra` (container info such as the MP4 video size) to the settings.
+  Showing again while the viewer is open updates it in place (new ctx swapped in). The
+  ctx remembers the source `path` and whether it is the open document (`isDoc`).
+  - **Prev / Next** (`twpng_AIParamsNavigate`): steps through the supported files in the
+    same folder (`twpng_ListSiblings`, natural sort via `StrCmpLogicalW`); the title shows
+    the position. For the open document it opens the next file as the document, with
+    `g_keepAIView` set so the document change doesn't close the viewer; otherwise it just
+    reads the next file (`twpng_ReadAnyAIParams`).
+  - **Save JSON** writes `ctx->full` as UTF-8 when it is JSON (the ComfyUI graph), so it
+    can be loaded back into ComfyUI. Parser `twpng_ParseA1111` splits on the
   `Negative prompt:` and `Steps:` line markers; `twpng_SettingsToLines` reformats the
   settings one-per-line while respecting double-quoted values (e.g. `Lora hashes: "..."`).
 - **ComfyUI parser** (`twpng_ParseComfyJson`): ComfyUI stores its graph as JSON in
@@ -142,17 +165,33 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
   `Last frame:`), resolved back to the `LoadImage` file name by `cf_resolve_image`.
   Text inputs go through `cf_get_text`, which follows a wired input (e.g. `prompt` fed
   by a `PrimitiveStringMultiline`) to the string node's `value`/`text`/`string`.
+  LoRAs come from every node whose class contains `Lora` (`cf_collect_loras`:
+  `lora_name` + `strength_model`, or rgthree Power Lora Loader `lora_N` objects with
+  `on`/`lora`/`strength`), shown as `LoRA:` or a quoted `LoRAs:` list.
 - **View AI Parameters** (`twpng_ViewAIParams`, Edit + Tools menus): re-opens the parsed
   viewer for the current document. Handles both PNG (looks up the `parameters`/`prompt`
-  chunk) and foreign files (re-reads metadata via `twpng_ReadForeignAIParams`). Menu enabling lives in `WM_INITMENU` and explicitly
-  re-enables the item when only a foreign file is loaded (the standard `cmdlist1` loop
-  greys everything that requires `png != NULL`).
-- **Read AI parameters from JPEG/WebP/MP4** (Tools menu, `ID_READAIFROMFILE`): one-shot file
-  picker that pops the parsed viewer without loading the file as a document.
-- **Strip AI Metadata** (`StripAIMetadata`, Edit menu): removes AI metadata chunks
-  (`twpng_IsAIMetadataChunk`: parameters/workflow/prompt/NovelAI keys/`eXIf`...) after a
-  confirm, for sharing without leaking prompts. PNG-only — JPEG/WebP EXIF stripping is
-  not implemented.
+  chunk) and foreign files (`twpng_GetDocAIText`). Menu enabling lives in `WM_INITMENU`
+  and explicitly re-enables the item (and Strip AI Metadata) when only a foreign file is
+  loaded (the standard `cmdlist1` loop greys everything that requires `png != NULL`).
+  Commands that must work without a PNG are dispatched outside the `if(png) switch(id)`
+  block in `WM_COMMAND`.
+- **Read AI parameters from File** (Tools menu, `ID_READAIFROMFILE`): one-shot file
+  picker that pops the parsed viewer without loading the file as a document. Any
+  supported type, PNG included (`twpng_ReadAnyAIParams` reads PNGs via a scratch `Png`).
+- **Compare AI Parameters** (Tools menu, `ID_COMPAREAI`, `DLG_AICOMPARE`): pick two
+  files (or one, compared with the open document). `twpng_BuildCompareReport` lists
+  changed / one-sided / identical settings keys and a word diff of the prompts
+  (`twpng_DiffWords`: LCS over whitespace tokens, `[-removed-]` / `{+added+}`, capped at
+  3000 words per side).
+- **Strip AI Metadata** (`StripAIMetadata`, Edit menu): for PNG removes AI metadata
+  chunks (`twpng_IsAIMetadataChunk`: parameters/workflow/prompt/NovelAI keys/`eXIf`...)
+  after a confirm. For a loaded JPEG/WebP/MP4/MOV (`twpng_StripForeignMetadata`) it
+  saves a copy (default `<name>_clean.<ext>`; picking the same name replaces the file):
+  JPEG drops APP1 (EXIF/XMP), APP13 and COM segments and skips junk left by short APP1
+  lengths; WebP drops `EXIF`/`XMP ` chunks and fixes the VP8X flags and RIFF size; MP4
+  renames `moov/udta` and `moov/meta` to `free` and zeroes their contents in place, so
+  no offsets move and the media data is untouched. The save dialogs get a full default
+  path (the dialog ignores `lpstrInitialDir` in favour of its remembered folder).
 - **Generator badge**: `twpng_DetectGenerator(Png*)` walks tEXt keywords for the PNG
   path; `twpng_DetectGeneratorFromText(const TCHAR*)` sniffs the raw EXIF text
   (`"class_type"` → ComfyUI, `"uc"`+`"prompt"` → NovelAI, `Steps:` → A1111) for the
@@ -175,7 +214,8 @@ metadata-only path so AI prompts can be inspected.
   branch that sets the globals, updates the title/status, runs the reader
   (`twpng_ReadForeignAIParams` dispatches by kind), and triggers auto-open if enabled.
 - **Close path**: `ClosePngDocument` clears all three globals and also calls
-  `twpng_CloseAIParamsView()` (the PNG path gets that for free from `Png::~Png`).
+  `twpng_CloseAIParamsView()` (the PNG path gets that for free from `Png::~Png`); that
+  function is a no-op while `g_keepAIView` is set (folder browsing).
   `OpenPngByName` does the same close-stale-viewer dance when replacing one foreign
   file with another.
 - **EXIF readers**: `twpng_ReadJpegAIParams` walks JPEG markers via `twpng_FindJpegExif`
@@ -198,6 +238,21 @@ metadata-only path so AI prompts can be inspected.
   native SaveVideo, mdta key), `parameters`, `comment` (VideoHelperSuite), `description`.
   VHS wraps the graph as `{"prompt": "<json string>", "workflow": ...}`; the reader
   unwraps the `prompt` value (string or object) when it looks like a ComfyUI graph.
+  `twpng_ReadMp4VideoInfo` adds the real `Video size`, `Frames` (sample count) and
+  `Duration` of the first video track (`tkhd`, `mdhd`, `stsz`) to the viewer settings,
+  since graphs often compute these (ResolutionSelector, math nodes) instead of storing
+  them.
+
+## Explorer menu and `/aiparams`
+
+`tweakpng.exe /aiparams "<file>"` starts with the main window hidden and shows only the
+AI parameters viewer (as the open document, so Prev/Next work); closing the viewer
+closes the app (`WM_NCDESTROY` posts `WM_CLOSE` when `globals.aiparams_only`). The
+Preferences checkbox "Add View AI parameters to the Explorer menu" registers that
+command per user under
+`HKCU\Software\Classes\SystemFileAssociations\<ext>\shell\TweakPNG.AIParams` for
+.png/.jpg/.jpeg/.webp/.mp4/.mov/.m4v (`set_ai_menu`), independent of the file type's
+ProgID (unlike the older "Add TweakPNG to Explorer context menu" option).
 
 ## Conventions
 

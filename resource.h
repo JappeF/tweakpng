@@ -95,6 +95,12 @@
 #define IDC_AIP_LBLPROMPT               1110
 #define IDC_AIP_LBLNEG                  1111
 #define IDC_AIP_LBLSET                  1112
+#define IDC_AIP_PREV                    1113
+#define IDC_AIP_NEXT                    1114
+#define IDC_AIP_SAVEJSON                1115
+#define IDC_ADDAIMENU                   1116
+#define IDC_CMP_TEXT                    1117
+#define IDC_CMP_COPY                    1118
 #define ID_EXIT                         40001
 #define ID_OPEN                         40002
 #define ID_SAVEAS                       40003
@@ -163,6 +169,10 @@
 #define ID_STRIPAIMETA                  40101
 #define ID_VIEWAIPARAMS                 40102
 #define ID_READAIFROMFILE               40103
+#define ID_THEME_SYSTEM                 40104
+#define ID_THEME_LIGHT                  40105
+#define ID_THEME_DARK                   40106
+#define ID_COMPAREAI                    40107
 
 // Next default values for new objects
 //

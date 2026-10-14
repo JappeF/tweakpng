@@ -24,10 +24,18 @@ Civitai):
 - **ComfyUI video workflows** - for MP4/MOV the settings also show the generation mode
   (reference/image/first-last frame/text to video) and the reference or first/last frame
   images that were used.
-- **Read AI parameters from JPEG/WebP/MP4** (Tools menu) - one-shot file picker that opens
-  the parsed viewer without loading the file as a document.
-- **Strip AI Metadata** (Edit → Strip AI Metadata) — removes prompt/seed/workflow/EXIF
-  metadata so an image can be shared privately. PNG only.
+- **Browse a folder** - Prev/Next in the viewer step through the images and videos in the
+  same folder, and **Save JSON** saves the ComfyUI graph so it can be loaded back into
+  ComfyUI. Settings include LoRAs, and for videos the real size, frame count and duration.
+- **Read AI parameters from File** (Tools menu) - one-shot file picker that opens the
+  parsed viewer without loading the file as a document.
+- **Compare AI Parameters** (Tools menu) - shows what changed between two files: settings
+  side by side and a word-level diff of the prompts.
+- **Strip AI Metadata** (Edit menu) - removes prompt/seed/workflow/EXIF metadata so a file
+  can be shared privately. PNG in place; JPEG, WebP and MP4/MOV as a cleaned copy.
+- **Explorer menu** (Options > Preferences) - adds "View AI parameters" to the right-click
+  menu of images and videos, which opens just the viewer.
+- **Theme** (Options > Theme) - System default, Light or Dark, remembered between runs.
 - **Generator badge** — the status bar identifies A1111, ComfyUI, or NovelAI images
   (for PNG and for JPEG/WebP/MP4/MOV files).
 
