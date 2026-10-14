@@ -17,15 +17,19 @@ Civitai):
 
 - **Auto-open parameters** — opening an image that has AI generation parameters pops
   up a viewer automatically (toggle in Options → Preferences). Works for PNG
-  (`parameters`/`prompt` tEXt chunks) and for JPEG/WebP (EXIF UserComment).
+  (`parameters`/`prompt` tEXt chunks), JPEG/WebP (EXIF UserComment) and MP4/MOV videos
+  (ComfyUI SaveVideo and VideoHelperSuite metadata).
 - **AI Generation Parameters viewer** (Edit → View AI Parameters) — splits the metadata
   into Prompt, Negative prompt, and Settings, each with a Copy button (plus Copy All).
-- **Read AI parameters from JPEG/WebP** (Tools menu) — one-shot file picker that opens
+- **ComfyUI video workflows** - for MP4/MOV the settings also show the generation mode
+  (reference/image/first-last frame/text to video) and the reference or first/last frame
+  images that were used.
+- **Read AI parameters from JPEG/WebP/MP4** (Tools menu) - one-shot file picker that opens
   the parsed viewer without loading the file as a document.
 - **Strip AI Metadata** (Edit → Strip AI Metadata) — removes prompt/seed/workflow/EXIF
   metadata so an image can be shared privately. PNG only.
 - **Generator badge** — the status bar identifies A1111, ComfyUI, or NovelAI images
-  (both for PNG and for foreign JPEG/WebP files).
+  (for PNG and for JPEG/WebP/MP4/MOV files).
 
 Download
 --------
