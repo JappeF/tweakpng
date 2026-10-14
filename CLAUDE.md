@@ -131,6 +131,11 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
   prompt is reached through the guider (`positive`, `conditioning` or `cond1`). Prompt
   resolution follows refs until a node has a string `text`/`prompt` input, so video
   nodes (Wan/MiniMax `*ToVideo`) work too. Video graphs also add `Frames:`/`FPS:`.
+  The first `*ToVideo` node on the positive path gives `Mode:` (`cf_video_mode`, from
+  the class name: ReferenceToVideo / ImageToVideo / FirstLastFrame / TextToVideo) and
+  its input images (`cf_collect_images`: `ref_image*` keys as a quoted `References:`
+  list, `first_frame`/`start_image` and `last_frame`/`end_image` as `First frame:` /
+  `Last frame:`), resolved back to the `LoadImage` file name by `cf_resolve_image`.
 - **View AI Parameters** (`twpng_ViewAIParams`, Edit + Tools menus): re-opens the parsed
   viewer for the current document. Handles both PNG (looks up the `parameters`/`prompt`
   chunk) and foreign files (re-reads metadata via `twpng_ReadForeignAIParams`). Menu enabling lives in `WM_INITMENU` and explicitly

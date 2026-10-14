@@ -2880,6 +2880,93 @@ static void cf_read_settings(const TCHAR *s, int is, int ie, struct cf_settings 
 	if(!st->scheduler)  st->scheduler = cf_get_string(s,is,ie,_T("scheduler"));
 }
 
+// Next member of an object body [*pos, ie). Returns the allocated key and sets the value
+// range [*vs, *ve), or NULL when there are no more members.
+static TCHAR *cf_next_member(const TCHAR *s, int *pos, int ie, int *vs, int *ve) {
+	int p = cf_skip_ws(s, *pos, ie);
+	if(p<ie && s[p]==_T(',')) p = cf_skip_ws(s, p+1, ie);
+	if(p>=ie || s[p]!=_T('"')) return NULL;
+	int after;
+	TCHAR *key = cf_parse_string(s, p, ie, &after);
+	if(!key) return NULL;
+	p = cf_skip_ws(s, after, ie);
+	if(p>=ie || s[p]!=_T(':')) { free(key); return NULL; }
+	p = cf_skip_ws(s, p+1, ie);
+	int e = -1;
+	if(p<ie && (s[p]==_T('{') || s[p]==_T('['))) e = cf_match_brace(s, p, ie);
+	else if(p<ie && s[p]==_T('"')) { TCHAR *t = cf_parse_string(s, p, ie, &e); if(t) free(t); else e = -1; }
+	else { e = p; while(e<ie && s[e]!=_T(',')) e++; }
+	if(e<0) { free(key); return NULL; }
+	*vs = p; *ve = e; *pos = e;
+	return key;
+}
+
+// Generation mode from a *ToVideo node's class_type, or NULL if it isn't one.
+static const TCHAR *cf_video_mode(const TCHAR *s, int len, const TCHAR *id, int is, int ie) {
+	int ns, ne, v;
+	if(!cf_find_node_by_id(s, len, id, &ns, &ne)) return NULL;
+	TCHAR *ct = cf_get_string(s, ns, ne, _T("class_type"));
+	if(!ct) return NULL;
+	const TCHAR *mode = NULL;
+	if(_tcsstr(ct,_T("ReferenceToVideo")) || _tcsstr(ct,_T("Ref2V")))
+		mode = _T("Reference to video");
+	else if(_tcsstr(ct,_T("FirstLastFrame")))
+		mode = _T("First-last frame to video");
+	else if(_tcsstr(ct,_T("ImageToVideo")) || _tcsstr(ct,_T("I2V")))
+		mode = (cf_find_key(s,is,ie,_T("last_frame"),&v) || cf_find_key(s,is,ie,_T("end_image"),&v))
+			? _T("First-last frame to video") : _T("Image to video");
+	else if(_tcsstr(ct,_T("TextToVideo")) || _tcsstr(ct,_T("T2V")))
+		mode = _T("Text to video");
+	free(ct);
+	return mode;
+}
+
+// Follow an image ref (through resize/crop nodes) back to a LoadImage-style node and
+// return its file name. Takes ownership of `ref`.
+static TCHAR *cf_resolve_image(const TCHAR *s, int len, TCHAR *ref) {
+	for(int hop=0; ref && hop<4; hop++) {
+		int is, ie;
+		if(!cf_node_inputs_by_id(s, len, ref, &is, &ie)) break;
+		TCHAR *img = cf_get_string(s, is, ie, _T("image"));
+		if(img) { free(ref); return img; }
+		TCHAR *next = cf_get_ref(s, is, ie, _T("image"));
+		if(!next) next = cf_get_ref(s, is, ie, _T("images"));
+		if(!next) next = cf_get_ref(s, is, ie, _T("pixels"));
+		free(ref);
+		ref = next;
+	}
+	free(ref);
+	return NULL;
+}
+
+// Collect the input image file names of a video node, sorted by role.
+static void cf_collect_images(const TCHAR *s, int len, int is, int ie,
+	TCHAR *refs, TCHAR *first, TCHAR *last, int cap)
+{
+	int pos = is, vs, ve;
+	TCHAR *key;
+	while((key = cf_next_member(s, &pos, ie, &vs, &ve)) != NULL) {
+		TCHAR *list = NULL;
+		if(!_tcsncmp(key,_T("ref_image"),9) || _tcsstr(key,_T("reference")))
+			list = refs;
+		else if(!lstrcmp(key,_T("first_frame")) || !lstrcmp(key,_T("start_image")) ||
+		        !lstrcmp(key,_T("start_frame")) || !lstrcmp(key,_T("image")))
+			list = first;
+		else if(!lstrcmp(key,_T("last_frame")) || !lstrcmp(key,_T("end_image")) ||
+		        !lstrcmp(key,_T("end_frame")))
+			list = last;
+		free(key);
+		if(!list || s[vs]!=_T('[')) continue;
+		int after;
+		TCHAR *ref = cf_parse_string(s, cf_skip_ws(s, vs+1, ve), ve, &after);
+		TCHAR *name = cf_resolve_image(s, len, ref);
+		if(!name) continue;
+		if(list[0]) StringCchCat(list, cap, _T(", "));
+		StringCchCat(list, cap, name);
+		free(name);
+	}
+}
+
 // Parse a ComfyUI prompt JSON and fill aiparams_ctx (pos, neg, setRaw). Returns TRUE
 // on success. The caller still owns ctx->full.
 static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
@@ -2927,7 +3014,11 @@ static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
 
 	// Resolve positive/negative to the prompt text by walking the graph until we reach a
 	// node with a string text input (skipping ConditioningSet*, *ToVideo pass-throughs...).
+	// The first *ToVideo node on the positive path also gives the generation mode and
+	// its input images.
 	TCHAR *positive = NULL, *negative = NULL;
+	const TCHAR *mode = NULL;
+	int vStart = -1, vEnd = -1;
 	for(int side=0; side<2; side++) {
 		TCHAR *ref = (side==0) ? posRef : negRef;
 		TCHAR **outp = (side==0) ? &positive : &negative;
@@ -2938,6 +3029,9 @@ static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
 		for(int hop=0; ref && hop<8 && !*outp; hop++) {
 			int ns, ne;
 			if(!cf_node_inputs_by_id(full, len, ref, &ns, &ne)) break;
+			if(side==0 && !mode && (mode = cf_video_mode(full, len, ref, ns, ne)) != NULL) {
+				vStart = ns; vEnd = ne;
+			}
 			for(int k=0; textKeys[k] && !*outp; k++) *outp = cf_get_string(full, ns, ne, textKeys[k]);
 			if(*outp) break;
 			TCHAR *next = NULL;
@@ -3001,6 +3095,15 @@ static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
 	}
 	if(frames[0])      { StringCchCat(setbuf,1500,_T(", Frames: "));      StringCchCat(setbuf,1500,frames); }
 	if(fps[0])         { StringCchCat(setbuf,1500,_T(", FPS: "));         StringCchCat(setbuf,1500,fps); }
+	if(mode)           { StringCchCat(setbuf,1500,_T(", Mode: "));        StringCchCat(setbuf,1500,mode); }
+	if(vStart>=0) {
+		TCHAR refs[600]=_T(""), first[600]=_T(""), last[600]=_T("");
+		cf_collect_images(full, len, vStart, vEnd, refs, first, last, 600);
+		// Quoted so the settings splitter keeps the comma-separated list on one line.
+		if(refs[0])  { StringCchCat(setbuf,1500,_T(", References: \"")); StringCchCat(setbuf,1500,refs); StringCchCat(setbuf,1500,_T("\"")); }
+		if(first[0]) { StringCchCat(setbuf,1500,_T(", First frame: "));  StringCchCat(setbuf,1500,first); }
+		if(last[0])  { StringCchCat(setbuf,1500,_T(", Last frame: "));   StringCchCat(setbuf,1500,last); }
+	}
 	if(model)          { StringCchCat(setbuf,1500,_T(", Model: "));       StringCchCat(setbuf,1500,model); }
 	if(st.denoise[0])  { StringCchCat(setbuf,1500,_T(", Denoising strength: ")); StringCchCat(setbuf,1500,st.denoise); }
 	// "Steps:" must come first in the settings line for the A1111 parser to find it.
