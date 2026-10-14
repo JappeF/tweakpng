@@ -110,28 +110,33 @@ safe regardless.
 ## A1111 / AI image features
 
 For PNGs, all keyed off text chunks (mainly tEXt keyword `parameters`); for JPEG/WebP,
-keyed off the EXIF UserComment tag (see "Foreign image formats" below).
+keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (see
+"Foreign image formats" below).
 
 - **Auto-open** (`twpng_AutoOpenParamsText`, end of `OpenPngByName`): if the Preferences
   option `open_params_on_load` is set (default on), opening an image with a `parameters`
   chunk pops up the parsed viewer. The option persists in the registry (`open_params`).
-  The foreign (JPEG/WebP) path triggers the same auto-open from its branch in
+  The foreign (JPEG/WebP/MP4/MOV) path triggers the same auto-open from its branch in
   `OpenPngByName`.
 - **Parsed viewer** (`DLG_AIPARAMS`): splits the A1111 string into Prompt / Negative
   prompt / Settings with copy buttons. Parser `twpng_ParseA1111` splits on the
   `Negative prompt:` and `Steps:` line markers; `twpng_SettingsToLines` reformats the
   settings one-per-line while respecting double-quoted values (e.g. `Lora hashes: "..."`).
 - **ComfyUI parser** (`twpng_ParseComfyJson`): ComfyUI stores its graph as JSON in
-  a `prompt` tEXt chunk or EXIF UserComment; this walks the node graph with brace-aware
-  substring scans (not a full JSON parser) and synthesizes an A1111-style string the
-  parsed viewer can consume.
+  a `prompt` tEXt chunk, EXIF UserComment or MP4 `prompt` key; this walks the node graph
+  with brace-aware substring scans (not a full JSON parser) and synthesizes an
+  A1111-style string the parsed viewer can consume. Helpers: `cf_find_class_inputs`
+  (first node of a class), `cf_node_inputs_by_id`. For `SamplerCustom(Advanced)` the
+  settings live in the nodes behind its `noise`/`sampler`/`sigmas`/`guider` refs, and the
+  prompt is reached through the guider (`positive`, `conditioning` or `cond1`). Prompt
+  resolution follows refs until a node has a string `text`/`prompt` input, so video
+  nodes (Wan/MiniMax `*ToVideo`) work too. Video graphs also add `Frames:`/`FPS:`.
 - **View AI Parameters** (`twpng_ViewAIParams`, Edit + Tools menus): re-opens the parsed
   viewer for the current document. Handles both PNG (looks up the `parameters`/`prompt`
-  chunk) and foreign files (re-reads EXIF via `twpng_ReadJpegAIParams` /
-  `twpng_ReadWebpAIParams`). Menu enabling lives in `WM_INITMENU` and explicitly
+  chunk) and foreign files (re-reads metadata via `twpng_ReadForeignAIParams`). Menu enabling lives in `WM_INITMENU` and explicitly
   re-enables the item when only a foreign file is loaded (the standard `cmdlist1` loop
   greys everything that requires `png != NULL`).
-- **Read AI parameters from JPEG/WebP** (Tools menu, `ID_READAIFROMFILE`): one-shot file
+- **Read AI parameters from JPEG/WebP/MP4** (Tools menu, `ID_READAIFROMFILE`): one-shot file
   picker that pops the parsed viewer without loading the file as a document.
 - **Strip AI Metadata** (`StripAIMetadata`, Edit menu): removes AI metadata chunks
   (`twpng_IsAIMetadataChunk`: parameters/workflow/prompt/NovelAI keys/`eXIf`...) after a
@@ -143,19 +148,21 @@ keyed off the EXIF UserComment tag (see "Foreign image formats" below).
   foreign path. The result is cached in `g_foreignGen` at load time and appended to the
   status-bar size line.
 
-## Foreign image formats (JPEG / WebP)
+## Foreign image formats (JPEG / WebP / MP4 / MOV)
 
 The app is still PNG-first — no decoder, no chunk table, no editing for JPEG/WebP. But
 opening one of these files from the menu/drag-drop/command line goes through a
 metadata-only path so AI prompts can be inspected.
 
 - **State**: three globals in `tweakpng.cpp` — `g_foreignFn` (path), `g_foreignKind`
-  (1=JPEG, 2=WebP), `g_foreignGen` (cached badge string). When set, `png == NULL` but
+  (1=JPEG, 2=WebP, 3=MP4, 4=MOV), `g_foreignGen` (cached badge string). When set, `png == NULL` but
   the title bar, status bar, View AI Parameters, and Close Document all treat the
   foreign file as "the current document."
-- **Open path**: `OpenPngByName` sniffs the first bytes (`FF D8` for JPEG,
-  `RIFF....WEBP` for WebP), routes foreign files through a branch that sets the globals,
-  updates the title/status, runs the EXIF reader, and triggers auto-open if enabled.
+- **Open path**: `OpenPngByName` sniffs the first bytes via `twpng_SniffForeignKind`
+  (`FF D8` for JPEG, `RIFF....WEBP` for WebP, `ftyp` at offset 4 for MP4, brand `qt  `
+  or a bare `moov`/`wide`/`mdat`/`free` box for MOV), routes foreign files through a
+  branch that sets the globals, updates the title/status, runs the reader
+  (`twpng_ReadForeignAIParams` dispatches by kind), and triggers auto-open if enabled.
 - **Close path**: `ClosePngDocument` clears all three globals and also calls
   `twpng_CloseAIParamsView()` (the PNG path gets that for free from `Png::~Png`).
   `OpenPngByName` does the same close-stale-viewer dance when replacing one foreign
@@ -172,6 +179,14 @@ metadata-only path so AI prompts can be inspected.
   the enclosing TIFF byte order, so `twpng_DecodeUserComment` auto-detects BE vs LE
   from the count of zero bytes at even vs odd positions instead of trusting the TIFF
   header.
+- **MP4/MOV reader** (`twpng_ReadMp4AIParams`): seeks over top-level boxes (64-bit
+  sizes, so multi-GB videos are fine) and reads only `moov` (it can sit before or after
+  `mdat`). Metadata is collected from `moov/udta/meta` and `moov/meta` (`keys` + `ilst`;
+  item types are 1-based key indexes when a `keys` table exists, else fourccs) and from
+  the classic QuickTime `udta` comment box (0xA9 `cmt`). Preference order: `prompt` (ComfyUI
+  native SaveVideo, mdta key), `parameters`, `comment` (VideoHelperSuite), `description`.
+  VHS wraps the graph as `{"prompt": "<json string>", "workflow": ...}`; the reader
+  unwraps the `prompt` value (string or object) when it looks like a ComfyUI graph.
 
 ## Conventions
 

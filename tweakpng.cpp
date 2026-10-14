@@ -111,14 +111,16 @@ static void twpng_CloseAIParamsView();
 static int  twpng_OpenAIParamsViewerFromText(const TCHAR *text, int len);
 static int  twpng_ReadJpegAIParams(const TCHAR *fn, TCHAR **outText);
 static int  twpng_ReadWebpAIParams(const TCHAR *fn, TCHAR **outText);
+static int  twpng_SniffForeignKind(const unsigned char *hdr, DWORD got);
+static int  twpng_ReadForeignAIParams(int kind, const TCHAR *fn, TCHAR **outText);
 static BOOL twpng_LooksLikeComfyJson(const TCHAR *s);
 struct aiparams_ctx;
 static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx);
 
-// When a JPEG/WebP is opened, png stays NULL but we remember the filename so the title
+// When a JPEG/WebP/MP4/MOV is opened, png stays NULL but we remember the filename so the title
 // and status bar can show its info. Empty when no foreign file is loaded.
 static TCHAR g_foreignFn[MAX_PATH] = _T("");
-static int   g_foreignKind = 0;   // 1=JPEG, 2=WebP
+static int   g_foreignKind = 0;   // 1=JPEG, 2=WebP, 3=MP4, 4=MOV
 // Generator badge for the currently-loaded foreign file, or NULL. Cached on open so the
 // status bar doesn't re-read EXIF on every redraw.
 static const TCHAR *g_foreignGen = NULL;
@@ -503,17 +505,20 @@ static void update_status_bar_and_viewer()
 		if(g_foreignFn[0]) {
 			HANDLE fh = CreateFile(g_foreignFn, GENERIC_READ, FILE_SHARE_READ, NULL,
 				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-			DWORD fs = 0;
-			if(fh != INVALID_HANDLE_VALUE) { fs = GetFileSize(fh, NULL); CloseHandle(fh); }
+			ULONGLONG fs = 0;
+			LARGE_INTEGER li;
+			if(fh != INVALID_HANDLE_VALUE) { if(GetFileSizeEx(fh, &li)) fs = (ULONGLONG)li.QuadPart; CloseHandle(fh); }
 			const TCHAR *label = (g_foreignKind==1) ? _T("JPEG") :
-			                     (g_foreignKind==2) ? _T("WebP") : _T("File");
+			                     (g_foreignKind==2) ? _T("WebP") :
+			                     (g_foreignKind==3) ? _T("MP4") :
+			                     (g_foreignKind==4) ? _T("MOV") : _T("File");
 			TCHAR fbuf[40];
 			if(fs >= 1073741824UL)   StringCchPrintf(fbuf,40,_T(" (%.2f GB)"),(double)fs/1073741824.0);
 			else if(fs >= 1048576UL) StringCchPrintf(fbuf,40,_T(" (%.2f MB)"),(double)fs/1048576.0);
 			else if(fs >= 1024UL)    StringCchPrintf(fbuf,40,_T(" (%.2f KB)"),(double)fs/1024.0);
 			else                     fbuf[0]=0;
 			TCHAR sbuf[200];
-			StringCchPrintf(sbuf,200,_T("%s file size: %u bytes%s"),label,(unsigned int)fs,fbuf);
+			StringCchPrintf(sbuf,200,_T("%s file size: %I64u bytes%s"),label,fs,fbuf);
 			if(g_foreignGen) {
 				TCHAR genbuf[80];
 				StringCchPrintf(genbuf,80,_T("     %s  %s"),SYM_MIDDOT,g_foreignGen);
@@ -1781,9 +1786,7 @@ static int OpenPngByName(const TCHAR *fn)
 	DWORD got = 0;
 	ReadFile(fh, hdr, sizeof(hdr), &got, NULL);
 	CloseHandle(fh);
-	int foreignKind = 0;
-	if(got>=2 && hdr[0]==0xFF && hdr[1]==0xD8) foreignKind = 1;
-	else if(got>=12 && !memcmp(hdr,"RIFF",4) && !memcmp(hdr+8,"WEBP",4)) foreignKind = 2;
+	int foreignKind = twpng_SniffForeignKind(hdr, got);
 
 	if(png) { delete png; png=NULL; }
 	else if(g_foreignFn[0]) {
@@ -1811,8 +1814,7 @@ static int OpenPngByName(const TCHAR *fn)
 		update_status_bar_and_viewer();
 
 		TCHAR *aiText = NULL;
-		if(foreignKind==1) twpng_ReadJpegAIParams(fn, &aiText);
-		else               twpng_ReadWebpAIParams(fn, &aiText);
+		twpng_ReadForeignAIParams(foreignKind, fn, &aiText);
 		g_foreignGen = twpng_DetectGeneratorFromText(aiText);
 		if(aiText) {
 			if(globals.open_params_on_load)
@@ -1861,7 +1863,7 @@ static int OpenPngFromMenu(HWND hwnd)
 	ofn.lStructSize=sizeof(OPENFILENAME);
 	ofn.hwndOwner=hwnd;
 	ofn.hInstance=NULL;
-	ofn.lpstrFilter=_T("Images\0*.png;*.mng;*.jng;*.jpg;*.jpeg;*.webp\0PNG, MNG, JNG\0*.png;*.mng;*.jng\0JPEG\0*.jpg;*.jpeg\0WebP\0*.webp\0All files\0*.*\0\0");
+	ofn.lpstrFilter=_T("Images and videos\0*.png;*.mng;*.jng;*.jpg;*.jpeg;*.webp;*.mp4;*.mov;*.m4v\0PNG, MNG, JNG\0*.png;*.mng;*.jng\0JPEG\0*.jpg;*.jpeg\0WebP\0*.webp\0MP4, MOV\0*.mp4;*.mov;*.m4v\0All files\0*.*\0\0");
 	ofn.nFilterIndex=1;
 	ofn.lpstrTitle=_T("Open image file");
 	if(lstrlen(globals.last_open_dir))
@@ -2573,8 +2575,7 @@ static void twpng_ViewAIParams(HWND owner)
 	// Foreign (JPEG/WebP) file loaded — re-extract from EXIF.
 	if(!png && g_foreignFn[0]) {
 		TCHAR *text = NULL;
-		if(g_foreignKind == 1)      twpng_ReadJpegAIParams(g_foreignFn, &text);
-		else if(g_foreignKind == 2) twpng_ReadWebpAIParams(g_foreignFn, &text);
+		twpng_ReadForeignAIParams(g_foreignKind, g_foreignFn, &text);
 		if(text) {
 			twpng_OpenAIParamsViewerFromText(text, lstrlen(text));
 			free(text);
@@ -2826,135 +2827,150 @@ static BOOL twpng_LooksLikeComfyJson(const TCHAR *s) {
 	return _tcsstr(s, _T("\"class_type\"")) != NULL;
 }
 
+// Inside of a node body [ns, ne) to inside of its "inputs" object.
+static BOOL cf_inputs_range(const TCHAR *s, int len, int ns, int ne, int *is, int *ie) {
+	int v;
+	if(!cf_find_key(s,ns,ne,_T("inputs"),&v) || v>=ne || s[v]!=_T('{')) return FALSE;
+	int after = cf_match_brace(s, v, len);
+	if(after<0) return FALSE;
+	*is = v+1; *ie = after-1;
+	return TRUE;
+}
+
+static BOOL cf_node_inputs_by_id(const TCHAR *s, int len, const TCHAR *id, int *is, int *ie) {
+	int ns, ne;
+	return id && cf_find_node_by_id(s,len,id,&ns,&ne) && cf_inputs_range(s,len,ns,ne,is,ie);
+}
+
+// Inputs of the first node whose class_type is `cls`.
+static BOOL cf_find_class_inputs(const TCHAR *s, int len, const TCHAR *cls, int *is, int *ie) {
+	TCHAR needle[96];
+	StringCchPrintf(needle,96,_T("\"class_type\": \"%s\""),cls);
+	const TCHAR *hit = _tcsstr(s, needle);
+	if(!hit) { StringCchPrintf(needle,96,_T("\"class_type\":\"%s\""),cls); hit=_tcsstr(s,needle); }
+	if(!hit) return FALSE;
+	// Walk back to the node's '{'. Strings aren't tracked here, but ComfyUI node bodies
+	// don't have unbalanced braces inside strings ahead of class_type in practice.
+	int back = (int)(hit-s), depth = 0, ns = -1;
+	while(back>0) {
+		back--;
+		TCHAR c = s[back];
+		if(c==_T('}')||c==_T(']')) depth++;
+		else if(c==_T('{')||c==_T('[')) { if(depth==0) { ns=back+1; break; } depth--; }
+	}
+	if(ns<0) return FALSE;
+	int after = cf_match_brace(s, ns-1, len);
+	if(after<0) return FALSE;
+	return cf_inputs_range(s, len, ns, after-1, is, ie);
+}
+
+struct cf_settings {
+	TCHAR seed[64], steps[32], cfg[32], denoise[32];
+	TCHAR *sampler, *scheduler;
+};
+
+// Fill whichever settings are still missing from one node's inputs.
+static void cf_read_settings(const TCHAR *s, int is, int ie, struct cf_settings *st) {
+	if(!st->seed[0])    cf_get_number_str(s,is,ie,_T("seed"),st->seed,64);
+	if(!st->seed[0])    cf_get_number_str(s,is,ie,_T("noise_seed"),st->seed,64);
+	if(!st->steps[0])   cf_get_number_str(s,is,ie,_T("steps"),st->steps,32);
+	if(!st->cfg[0])     cf_get_number_str(s,is,ie,_T("cfg"),st->cfg,32);
+	if(!st->denoise[0]) cf_get_number_str(s,is,ie,_T("denoise"),st->denoise,32);
+	if(!st->sampler)    st->sampler   = cf_get_string(s,is,ie,_T("sampler_name"));
+	if(!st->scheduler)  st->scheduler = cf_get_string(s,is,ie,_T("scheduler"));
+}
+
 // Parse a ComfyUI prompt JSON and fill aiparams_ctx (pos, neg, setRaw). Returns TRUE
 // on success. The caller still owns ctx->full.
 static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
 	int len = lstrlen(full);
 
-	// Locate the inputs subobject of the first KSampler-like sampler.
-	// Try a few known class_type names in order.
 	static const TCHAR *samplerTypes[] = {
 		_T("KSampler"), _T("KSamplerAdvanced"), _T("KSampler (Efficient)"),
-		_T("SamplerCustom"), _T("SamplerCustomAdvanced"), NULL };
+		_T("SamplerCustom"), _T("SamplerCustomAdvanced"), _T("WanVideoSampler"), NULL };
+	int iStart=-1, iEnd=-1;
+	for(int t=0; samplerTypes[t] && iStart<0; t++)
+		cf_find_class_inputs(full, len, samplerTypes[t], &iStart, &iEnd);
+	if(iStart<0) return FALSE;
 
-	int samplerStart=-1, samplerEnd=-1;
-	for(int t=0; samplerTypes[t] && samplerStart<0; t++) {
-		// scan for "\"class_type\": \"<name>\"" inside a top-level node body.
-		TCHAR needle[80];
-		StringCchPrintf(needle, 80, _T("\"class_type\": \"%s\""), samplerTypes[t]);
-		int alt2 = lstrlen(needle);
-		const TCHAR *hit = _tcsstr(full, needle);
-		if(!hit) {
-			StringCchPrintf(needle, 80, _T("\"class_type\":\"%s\""), samplerTypes[t]);
-			hit = _tcsstr(full, needle);
-		}
-		if(!hit) continue;
-		// Walk backward to the enclosing node '{' (depth 1).
-		int pos = (int)(hit - full);
-		int depth=0; BOOL inStr=FALSE;
-		// Easier: search forward from pos for the end of this node's containing object.
-		// And backward for its start. Use simple brace count.
-		int back = pos;
-		depth = 0; inStr=FALSE;
-		while(back > 0) {
-			back--;
-			TCHAR c = full[back];
-			// crude: don't handle strings on the way back, but JSON node bodies don't
-			// have unbalanced braces inside strings in practice for ComfyUI graphs.
-			if(c==_T('}')||c==_T(']')) depth++;
-			else if(c==_T('{')||c==_T('[')) {
-				if(depth==0) { samplerStart = back+1; break; }
-				depth--;
-			}
-		}
-		if(samplerStart>=0) {
-			int after = cf_match_brace(full, samplerStart-1, len);
-			if(after>0) samplerEnd = after-1;
-			else samplerStart = -1;
-		}
+	struct cf_settings st;
+	ZeroMemory(&st, sizeof(st));
+	cf_read_settings(full, iStart, iEnd, &st);
+	// SamplerCustom(Advanced) keeps its settings in separate noise/sampler/sigmas/guider
+	// nodes (RandomNoise, KSamplerSelect, BasicScheduler, CFGGuider...).
+	static const TCHAR *settingRefs[] = { _T("noise"), _T("sampler"), _T("sigmas"), _T("guider"), NULL };
+	for(int k=0; settingRefs[k]; k++) {
+		TCHAR *ref = cf_get_ref(full, iStart, iEnd, settingRefs[k]);
+		int ns, ne;
+		if(cf_node_inputs_by_id(full, len, ref, &ns, &ne)) cf_read_settings(full, ns, ne, &st);
+		free(ref);
 	}
-	if(samplerStart<0) return FALSE;
 
-	// Pull the sampler's "inputs" subobject.
-	int inputsVal;
-	if(!cf_find_key(full, samplerStart, samplerEnd, _T("inputs"), &inputsVal)) return FALSE;
-	if(inputsVal>=samplerEnd || full[inputsVal]!=_T('{')) return FALSE;
-	int inputsEnd = cf_match_brace(full, inputsVal, len);
-	if(inputsEnd<0) return FALSE;
-	int iStart = inputsVal+1, iEnd = inputsEnd-1;
+	TCHAR *posRef = cf_get_ref(full, iStart, iEnd, _T("positive"));
+	TCHAR *negRef = cf_get_ref(full, iStart, iEnd, _T("negative"));
+	if(!posRef && !negRef) {
+		TCHAR *g = cf_get_ref(full, iStart, iEnd, _T("guider"));
+		int gs, ge;
+		if(cf_node_inputs_by_id(full, len, g, &gs, &ge)) {
+			posRef = cf_get_ref(full, gs, ge, _T("positive"));                 // CFGGuider
+			if(!posRef) posRef = cf_get_ref(full, gs, ge, _T("conditioning")); // BasicGuider
+			if(!posRef) posRef = cf_get_ref(full, gs, ge, _T("cond1"));        // DualCFGGuider
+			negRef = cf_get_ref(full, gs, ge, _T("negative"));
+		}
+		free(g);
+	}
+	if(!posRef && !negRef) {
+		// WanVideoSampler: one text_embeds node carries both prompts.
+		posRef = cf_get_ref(full, iStart, iEnd, _T("text_embeds"));
+		if(posRef) negRef = _tcsdup(posRef);
+	}
 
-	TCHAR seed[64]=_T(""), steps[32]=_T(""), cfg[32]=_T(""), denoise[32]=_T("");
-	cf_get_number_str(full, iStart, iEnd, _T("seed"), seed, 64);
-	if(!seed[0]) cf_get_number_str(full, iStart, iEnd, _T("noise_seed"), seed, 64);
-	cf_get_number_str(full, iStart, iEnd, _T("steps"), steps, 32);
-	cf_get_number_str(full, iStart, iEnd, _T("cfg"), cfg, 32);
-	cf_get_number_str(full, iStart, iEnd, _T("denoise"), denoise, 32);
-	TCHAR *sampler   = cf_get_string(full, iStart, iEnd, _T("sampler_name"));
-	TCHAR *scheduler = cf_get_string(full, iStart, iEnd, _T("scheduler"));
-	TCHAR *posRef    = cf_get_ref(full, iStart, iEnd, _T("positive"));
-	TCHAR *negRef    = cf_get_ref(full, iStart, iEnd, _T("negative"));
-
-	// Resolve positive/negative to CLIPTextEncode "text" by recursively walking the
-	// graph until we find a node with a "text" input (skipping ConditioningSet* etc.).
+	// Resolve positive/negative to the prompt text by walking the graph until we reach a
+	// node with a string text input (skipping ConditioningSet*, *ToVideo pass-throughs...).
 	TCHAR *positive = NULL, *negative = NULL;
-	const TCHAR *refKeys[] = { _T("conditioning"), _T("conditioning_1"), _T("clip"), NULL };
 	for(int side=0; side<2; side++) {
 		TCHAR *ref = (side==0) ? posRef : negRef;
 		TCHAR **outp = (side==0) ? &positive : &negative;
-		for(int hop=0; ref && hop<6 && !*outp; hop++) {
-			int ns,ne;
-			if(!cf_find_node_by_id(full, len, ref, &ns, &ne)) break;
-			int ivStart;
-			if(cf_find_key(full,ns,ne,_T("inputs"),&ivStart) && full[ivStart]==_T('{')) {
-				int ivEnd = cf_match_brace(full, ivStart, len);
-				if(ivEnd>0) {
-					TCHAR *txt = cf_get_string(full, ivStart+1, ivEnd-1, _T("text"));
-					if(txt) { *outp = txt; break; }
-					// no text here — follow first ref-style input that points to another node
-					TCHAR *next = NULL;
-					for(int k=0; refKeys[k] && !next; k++)
-						next = cf_get_ref(full, ivStart+1, ivEnd-1, refKeys[k]);
-					if(!next) break;
-					free(ref);
-					ref = next;
-					if(side==0) posRef = ref; else negRef = ref;
-				}
-			}
+		const TCHAR *textKeys[] = { _T("text"), _T("prompt"),
+			(side==0) ? _T("positive_prompt") : _T("negative_prompt"), _T("text_g"), NULL };
+		const TCHAR *follow[] = { (side==0) ? _T("positive") : _T("negative"),
+			_T("conditioning"), _T("conditioning_1"), _T("conditioning_to"), _T("clip"), NULL };
+		for(int hop=0; ref && hop<8 && !*outp; hop++) {
+			int ns, ne;
+			if(!cf_node_inputs_by_id(full, len, ref, &ns, &ne)) break;
+			for(int k=0; textKeys[k] && !*outp; k++) *outp = cf_get_string(full, ns, ne, textKeys[k]);
+			if(*outp) break;
+			TCHAR *next = NULL;
+			for(int k=0; follow[k] && !next; k++) next = cf_get_ref(full, ns, ne, follow[k]);
+			free(ref);
+			ref = next;
 		}
+		free(ref);
 	}
-	if(posRef) free(posRef);
-	if(negRef) free(negRef);
 
-	// Find first size-bearing node (EmptyLatentImage / EmptySD3LatentImage / EmptyHunyuan*).
-	TCHAR width[16]=_T(""), height[16]=_T("");
+	// Size / frame count from the first latent-producing node.
+	TCHAR width[16]=_T(""), height[16]=_T(""), frames[16]=_T(""), fps[32]=_T("");
 	static const TCHAR *latentTypes[] = {
 		_T("EmptyLatentImage"), _T("EmptySD3LatentImage"),
-		_T("EmptyHunyuanLatentVideo"), _T("EmptyMochiLatentVideo"), NULL };
+		_T("EmptyHunyuanLatentVideo"), _T("EmptyMochiLatentVideo"),
+		_T("EmptyLTXVLatentVideo"), _T("EmptyCosmosLatentVideo"),
+		_T("WanImageToVideo"), _T("WanVaceToVideo"), _T("HunyuanImageToVideo"), NULL };
 	for(int t=0; latentTypes[t] && !width[0]; t++) {
-		TCHAR needle[64];
-		StringCchPrintf(needle,64,_T("\"class_type\": \"%s\""),latentTypes[t]);
-		const TCHAR *hit = _tcsstr(full, needle);
-		if(!hit) { StringCchPrintf(needle,64,_T("\"class_type\":\"%s\""),latentTypes[t]); hit=_tcsstr(full,needle); }
-		if(!hit) continue;
-		// Walk back to find this node's body.
-		int pos = (int)(hit - full), back=pos, depth=0;
-		int ns=-1;
-		while(back>0){ back--; TCHAR c=full[back];
-			if(c==_T('}')||c==_T(']')) depth++;
-			else if(c==_T('{')||c==_T('[')){ if(depth==0){ ns=back+1; break; } depth--; }
-		}
-		if(ns<0) continue;
-		int after = cf_match_brace(full, ns-1, len);
-		if(after<0) continue;
-		int ne = after-1;
-		int ivStart;
-		if(cf_find_key(full,ns,ne,_T("inputs"),&ivStart) && full[ivStart]==_T('{')) {
-			int ivEnd = cf_match_brace(full, ivStart, len);
-			if(ivEnd>0) {
-				cf_get_number_str(full, ivStart+1, ivEnd-1, _T("width"), width, 16);
-				cf_get_number_str(full, ivStart+1, ivEnd-1, _T("height"), height, 16);
-			}
-		}
+		int is, ie;
+		if(!cf_find_class_inputs(full, len, latentTypes[t], &is, &ie)) continue;
+		cf_get_number_str(full, is, ie, _T("width"), width, 16);
+		cf_get_number_str(full, is, ie, _T("height"), height, 16);
+		if(!frames[0]) cf_get_number_str(full, is, ie, _T("length"), frames, 16);
+	}
+	static const struct { const TCHAR *cls; const TCHAR *key; } fpsNodes[] = {
+		{ _T("CreateVideo"),      _T("fps") },
+		{ _T("VHS_VideoCombine"), _T("frame_rate") },
+		{ _T("SaveAnimatedWEBP"), _T("fps") },
+		{ NULL, NULL } };
+	for(int t=0; fpsNodes[t].cls && !fps[0]; t++) {
+		int is, ie;
+		if(cf_find_class_inputs(full, len, fpsNodes[t].cls, &is, &ie))
+			cf_get_number_str(full, is, ie, fpsNodes[t].key, fps, 32);
 	}
 
 	// Find a model name from common loader class types.
@@ -2964,50 +2980,37 @@ static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
 		{ _T("UnetLoaderGGUF"),         _T("unet_name") },
 		{ _T("CheckpointLoaderSimple"), _T("ckpt_name") },
 		{ _T("CheckpointLoader"),       _T("ckpt_name") },
+		{ _T("WanVideoModelLoader"),    _T("model") },
 		{ NULL, NULL } };
 	for(int t=0; loaders[t].cls && !model; t++) {
-		TCHAR needle[64];
-		StringCchPrintf(needle,64,_T("\"class_type\": \"%s\""),loaders[t].cls);
-		const TCHAR *hit = _tcsstr(full, needle);
-		if(!hit) { StringCchPrintf(needle,64,_T("\"class_type\":\"%s\""),loaders[t].cls); hit=_tcsstr(full,needle); }
-		if(!hit) continue;
-		int pos = (int)(hit-full), back=pos, depth=0, ns=-1;
-		while(back>0){ back--; TCHAR c=full[back];
-			if(c==_T('}')||c==_T(']')) depth++;
-			else if(c==_T('{')||c==_T('[')){ if(depth==0){ ns=back+1; break; } depth--; }
-		}
-		if(ns<0) continue;
-		int after = cf_match_brace(full, ns-1, len);
-		if(after<0) continue;
-		int ivStart;
-		if(cf_find_key(full,ns,after-1,_T("inputs"),&ivStart) && full[ivStart]==_T('{')) {
-			int ivEnd = cf_match_brace(full, ivStart, len);
-			if(ivEnd>0) model = cf_get_string(full, ivStart+1, ivEnd-1, loaders[t].key);
-		}
+		int is, ie;
+		if(cf_find_class_inputs(full, len, loaders[t].cls, &is, &ie))
+			model = cf_get_string(full, is, ie, loaders[t].key);
 	}
 
 	// Build settings line.
 	TCHAR setbuf[1500] = _T("");
-	if(steps[0])    { StringCchCat(setbuf,1500,_T("Steps: "));         StringCchCat(setbuf,1500,steps); }
-	if(sampler)     { StringCchCat(setbuf,1500,_T(", Sampler: "));     StringCchCat(setbuf,1500,sampler); }
-	if(scheduler)   { StringCchCat(setbuf,1500,_T(", Schedule type: ")); StringCchCat(setbuf,1500,scheduler); }
-	if(cfg[0])      { StringCchCat(setbuf,1500,_T(", CFG scale: "));   StringCchCat(setbuf,1500,cfg); }
-	if(seed[0])     { StringCchCat(setbuf,1500,_T(", Seed: "));        StringCchCat(setbuf,1500,seed); }
+	if(st.steps[0])    { StringCchCat(setbuf,1500,_T("Steps: "));         StringCchCat(setbuf,1500,st.steps); }
+	if(st.sampler)     { StringCchCat(setbuf,1500,_T(", Sampler: "));     StringCchCat(setbuf,1500,st.sampler); }
+	if(st.scheduler)   { StringCchCat(setbuf,1500,_T(", Schedule type: ")); StringCchCat(setbuf,1500,st.scheduler); }
+	if(st.cfg[0])      { StringCchCat(setbuf,1500,_T(", CFG scale: "));   StringCchCat(setbuf,1500,st.cfg); }
+	if(st.seed[0])     { StringCchCat(setbuf,1500,_T(", Seed: "));        StringCchCat(setbuf,1500,st.seed); }
 	if(width[0] && height[0]) {
 		StringCchCat(setbuf,1500,_T(", Size: "));
 		StringCchCat(setbuf,1500,width); StringCchCat(setbuf,1500,_T("x")); StringCchCat(setbuf,1500,height);
 	}
-	if(model)       { StringCchCat(setbuf,1500,_T(", Model: "));       StringCchCat(setbuf,1500,model); }
-	if(denoise[0])  { StringCchCat(setbuf,1500,_T(", Denoising strength: ")); StringCchCat(setbuf,1500,denoise); }
+	if(frames[0])      { StringCchCat(setbuf,1500,_T(", Frames: "));      StringCchCat(setbuf,1500,frames); }
+	if(fps[0])         { StringCchCat(setbuf,1500,_T(", FPS: "));         StringCchCat(setbuf,1500,fps); }
+	if(model)          { StringCchCat(setbuf,1500,_T(", Model: "));       StringCchCat(setbuf,1500,model); }
+	if(st.denoise[0])  { StringCchCat(setbuf,1500,_T(", Denoising strength: ")); StringCchCat(setbuf,1500,st.denoise); }
 	// "Steps:" must come first in the settings line for the A1111 parser to find it.
 	if(setbuf[0]==_T(',')) memmove(setbuf,setbuf+2,(lstrlen(setbuf+2)+1)*sizeof(TCHAR));
 
-	if(sampler) free(sampler);
-	if(scheduler) free(scheduler);
-	if(model) free(model);
+	free(st.sampler);
+	free(st.scheduler);
+	free(model);
 
-	if(positive) ctx->pos = positive;
-	else ctx->pos = NULL;
+	ctx->pos = positive;
 	ctx->neg = negative;  // may be NULL
 	ctx->setRaw = NULL;
 	if(setbuf[0]) {
@@ -3258,7 +3261,250 @@ static int twpng_ReadWebpAIParams(const TCHAR *fn, TCHAR **outText)
 	return ok;
 }
 
-// File-open command: read AI params from a JPEG or WebP and show the parsed viewer.
+// ---- ComfyUI metadata from MP4 / MOV ---------------------------------------------------
+// ComfyUI's SaveVideo writes the prompt graph as a QuickTime "mdta" key `prompt` (moov/
+// udta/meta/keys+ilst). VideoHelperSuite writes `comment` (iTunes 0xA9 "cmt") holding
+// {"prompt": "<graph json>", "workflow": {...}}.
+
+static DWORD mp4_be32(const unsigned char *p)
+{
+	return ((DWORD)p[0]<<24) | ((DWORD)p[1]<<16) | ((DWORD)p[2]<<8) | (DWORD)p[3];
+}
+
+// Find child box `type` in [p, end). Returns its payload and sets *outLen.
+static const unsigned char *mp4_find_box(const unsigned char *p, const unsigned char *end,
+	const char *type, DWORD *outLen)
+{
+	while(end-p >= 8) {
+		unsigned __int64 sz = mp4_be32(p);
+		DWORD hdr = 8;
+		if(sz==1) {
+			if(end-p < 16) return NULL;
+			sz = ((unsigned __int64)mp4_be32(p+8)<<32) | mp4_be32(p+12);
+			hdr = 16;
+		}
+		else if(sz==0) sz = (unsigned __int64)(end-p);
+		if(sz < hdr || sz > (unsigned __int64)(end-p)) return NULL;
+		if(!memcmp(p+4, type, 4)) { *outLen = (DWORD)sz - hdr; return p+hdr; }
+		p += (size_t)sz;
+	}
+	return NULL;
+}
+
+static TCHAR *mp4_decode_text(const unsigned char *s, DWORD len, BOOL utf16be)
+{
+	while(len>0 && s[len-1]==0) len--;
+	if(len==0) return NULL;
+#ifdef UNICODE
+	if(utf16be) {
+		int n = (int)(len/2);
+		TCHAR *out = (TCHAR*)malloc(((size_t)n+1)*sizeof(TCHAR));
+		if(!out) return NULL;
+		for(int i=0; i<n; i++) out[i] = (TCHAR)(((unsigned)s[i*2]<<8) | s[i*2+1]);
+		out[n]=0;
+		return out;
+	}
+	int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)s, (int)len, NULL, 0);
+	if(wlen<=0) return NULL;
+	TCHAR *out = (TCHAR*)malloc(((size_t)wlen+1)*sizeof(TCHAR));
+	if(!out) return NULL;
+	MultiByteToWideChar(CP_UTF8, 0, (const char*)s, (int)len, out, wlen);
+	out[wlen]=0;
+	return out;
+#else
+	(void)utf16be;
+	TCHAR *out = (TCHAR*)malloc((size_t)len+1);
+	if(!out) return NULL;
+	memcpy(out, s, len);
+	out[len]=0;
+	return out;
+#endif
+}
+
+// Metadata slots, in order of preference.
+enum { MP4_PROMPT, MP4_PARAMETERS, MP4_COMMENT, MP4_DESCRIPTION, MP4_NSLOTS };
+
+static int mp4_slot_for_name(const unsigned char *name, DWORD len)
+{
+	static const struct { const char *name; int slot; } names[] = {
+		{ "prompt", MP4_PROMPT }, { "parameters", MP4_PARAMETERS },
+		{ "comment", MP4_COMMENT }, { "com.apple.quicktime.comment", MP4_COMMENT },
+		{ "description", MP4_DESCRIPTION }, { "com.apple.quicktime.description", MP4_DESCRIPTION },
+		{ "\xa9" "cmt", MP4_COMMENT }, { "\xa9" "des", MP4_DESCRIPTION }, { "desc", MP4_DESCRIPTION },
+		{ NULL, 0 } };
+	for(int i=0; names[i].name; i++) {
+		if(strlen(names[i].name)==len && !memcmp(names[i].name, name, len)) return names[i].slot;
+	}
+	return -1;
+}
+
+// Parse a meta box payload (keys + ilst) into the slots.
+static void mp4_parse_meta(const unsigned char *p, DWORD len, TCHAR **slots)
+{
+	// ISO meta is a FullBox (4 bytes version/flags); QuickTime's isn't. A child box can't
+	// start with a zero size, so a leading zero word means version/flags.
+	if(len>=4 && mp4_be32(p)==0) { p+=4; len-=4; }
+	const unsigned char *end = p+len;
+
+	const unsigned char *keyName[256];
+	DWORD keyLen[256];
+	DWORD nkeys = 0;
+	DWORD klen;
+	const unsigned char *keys = mp4_find_box(p, end, "keys", &klen);
+	if(keys && klen>=8) {
+		DWORD count = mp4_be32(keys+4);
+		const unsigned char *k = keys+8, *kend = keys+klen;
+		for(DWORD i=0; i<count && nkeys<256 && kend-k>=8; i++) {
+			DWORD ksz = mp4_be32(k);
+			if(ksz<8 || ksz>(DWORD)(kend-k)) break;
+			keyName[nkeys] = k+8;          // skip size + namespace ("mdta")
+			keyLen[nkeys]  = ksz-8;
+			nkeys++;
+			k += ksz;
+		}
+	}
+
+	DWORD ilen;
+	const unsigned char *ilst = mp4_find_box(p, end, "ilst", &ilen);
+	if(!ilst) return;
+	const unsigned char *it = ilst, *iend = ilst+ilen;
+	while(iend-it >= 8) {
+		DWORD isz = mp4_be32(it);
+		if(isz<8 || isz>(DWORD)(iend-it)) break;
+		// With a keys table the item type is a 1-based key index, otherwise a fourcc.
+		DWORD idx = mp4_be32(it+4);
+		int slot = (nkeys && idx>=1 && idx<=nkeys) ? mp4_slot_for_name(keyName[idx-1], keyLen[idx-1])
+		                                           : mp4_slot_for_name(it+4, 4);
+		DWORD dlen;
+		const unsigned char *data = mp4_find_box(it+8, it+isz, "data", &dlen);
+		if(slot>=0 && !slots[slot] && data && dlen>8) {
+			DWORD dtype = mp4_be32(data) & 0xFFFFFF;   // 1=UTF-8, 2=UTF-16BE
+			slots[slot] = mp4_decode_text(data+8, dlen-8, dtype==2);
+		}
+		it += isz;
+	}
+}
+
+// Read the moov box (it may sit before or after mdat) without loading the media data.
+static unsigned char *mp4_read_moov(const TCHAR *fn, DWORD *outLen)
+{
+	HANDLE fh = CreateFile(fn, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL, NULL);
+	if(fh==INVALID_HANDLE_VALUE) return NULL;
+	LARGE_INTEGER fsz;
+	if(!GetFileSizeEx(fh, &fsz)) { CloseHandle(fh); return NULL; }
+	unsigned char *buf = NULL;
+	unsigned __int64 off = 0, total = (unsigned __int64)fsz.QuadPart;
+	while(off+8 <= total) {
+		LARGE_INTEGER li; li.QuadPart = (LONGLONG)off;
+		unsigned char h[16]; DWORD got = 0;
+		if(!SetFilePointerEx(fh, li, NULL, FILE_BEGIN) || !ReadFile(fh, h, 16, &got, NULL) || got<8) break;
+		unsigned __int64 sz = mp4_be32(h);
+		DWORD hdr = 8;
+		if(sz==1) {
+			if(got<16) break;
+			sz = ((unsigned __int64)mp4_be32(h+8)<<32) | mp4_be32(h+12);
+			hdr = 16;
+		}
+		else if(sz==0) sz = total-off;
+		if(sz<hdr || sz>total-off) break;
+		if(!memcmp(h+4, "moov", 4)) {
+			if(sz-hdr > 64UL*1024*1024) break;
+			DWORD n = (DWORD)(sz-hdr);
+			buf = (unsigned char*)malloc(n ? n : 1);
+			li.QuadPart = (LONGLONG)(off+hdr);
+			if(!buf || !SetFilePointerEx(fh, li, NULL, FILE_BEGIN) ||
+			   !ReadFile(fh, buf, n, &got, NULL) || got!=n) {
+				free(buf); buf = NULL;
+			}
+			else *outLen = n;
+			break;
+		}
+		off += sz;
+	}
+	CloseHandle(fh);
+	return buf;
+}
+
+static int twpng_ReadMp4AIParams(const TCHAR *fn, TCHAR **outText)
+{
+	*outText = NULL;
+	DWORD mlen = 0;
+	unsigned char *moov = mp4_read_moov(fn, &mlen);
+	if(!moov) return 0;
+	const unsigned char *mend = moov+mlen;
+
+	TCHAR *slots[MP4_NSLOTS] = { NULL };
+	DWORD len;
+	const unsigned char *udta = mp4_find_box(moov, mend, "udta", &len);
+	if(udta) {
+		DWORD mlen2;
+		const unsigned char *meta = mp4_find_box(udta, udta+len, "meta", &mlen2);
+		if(meta) mp4_parse_meta(meta, mlen2, slots);
+		// Classic QuickTime user data: 0xA9 "cmt" = 16-bit length, 16-bit language, text.
+		DWORD clen;
+		const unsigned char *cmt = mp4_find_box(udta, udta+len, "\xa9" "cmt", &clen);
+		if(cmt && !slots[MP4_COMMENT] && clen>4) {
+			DWORD tl = ((DWORD)cmt[0]<<8) | cmt[1];
+			if(tl > clen-4) tl = clen-4;
+			slots[MP4_COMMENT] = mp4_decode_text(cmt+4, tl, FALSE);
+		}
+	}
+	const unsigned char *meta = mp4_find_box(moov, mend, "meta", &len);
+	if(meta) mp4_parse_meta(meta, len, slots);
+	free(moov);
+
+	for(int i=0; i<MP4_NSLOTS; i++) {
+		if(slots[i] && !*outText) *outText = slots[i];
+		else free(slots[i]);
+	}
+	if(!*outText) return 0;
+
+	// VideoHelperSuite wraps the graph: {"prompt": "<json string>" | {...}, "workflow": ...}.
+	TCHAR *s = *outText;
+	int slen = lstrlen(s);
+	int i = cf_skip_ws(s, 0, slen);
+	int v;
+	if(i<slen && s[i]==_T('{') && cf_find_key(s, i+1, slen, _T("prompt"), &v)) {
+		TCHAR *inner = NULL;
+		if(s[v]==_T('"')) {
+			int after;
+			inner = cf_parse_string(s, v, slen, &after);
+		}
+		else if(s[v]==_T('{')) {
+			int after = cf_match_brace(s, v, slen);
+			if(after>0) {
+				inner = (TCHAR*)malloc(((size_t)(after-v)+1)*sizeof(TCHAR));
+				if(inner) { memcpy(inner, s+v, (size_t)(after-v)*sizeof(TCHAR)); inner[after-v]=0; }
+			}
+		}
+		if(inner && twpng_LooksLikeComfyJson(inner)) { free(s); *outText = inner; }
+		else free(inner);
+	}
+	return 1;
+}
+
+// Sniff a file header: 1=JPEG, 2=WebP, 3=MP4, 4=MOV, 0=other.
+static int twpng_SniffForeignKind(const unsigned char *hdr, DWORD got)
+{
+	if(got>=2 && hdr[0]==0xFF && hdr[1]==0xD8) return 1;
+	if(got>=12 && !memcmp(hdr,"RIFF",4) && !memcmp(hdr+8,"WEBP",4)) return 2;
+	if(got>=12 && !memcmp(hdr+4,"ftyp",4)) return memcmp(hdr+8,"qt  ",4) ? 3 : 4;
+	if(got>=8 && (!memcmp(hdr+4,"moov",4) || !memcmp(hdr+4,"wide",4) ||
+	              !memcmp(hdr+4,"mdat",4) || !memcmp(hdr+4,"free",4))) return 4;
+	return 0;
+}
+
+static int twpng_ReadForeignAIParams(int kind, const TCHAR *fn, TCHAR **outText)
+{
+	*outText = NULL;
+	if(kind==1) return twpng_ReadJpegAIParams(fn, outText);
+	if(kind==2) return twpng_ReadWebpAIParams(fn, outText);
+	if(kind==3 || kind==4) return twpng_ReadMp4AIParams(fn, outText);
+	return 0;
+}
+
+// File-open command: read AI params from a JPEG, WebP or MP4/MOV and show the parsed viewer.
 static void twpng_ReadAIFromFile(HWND owner)
 {
 	OPENFILENAME ofn;
@@ -3267,11 +3513,11 @@ static void twpng_ReadAIFromFile(HWND owner)
 	ZeroMemory(&ofn, sizeof(ofn));
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner   = owner;
-	ofn.lpstrFilter = _T("JPEG and WebP images\0*.jpg;*.jpeg;*.webp\0All files (*.*)\0*.*\0\0");
+	ofn.lpstrFilter = _T("JPEG, WebP and MP4/MOV files\0*.jpg;*.jpeg;*.webp;*.mp4;*.mov;*.m4v\0All files (*.*)\0*.*\0\0");
 	ofn.nFilterIndex= 1;
 	ofn.lpstrFile   = fn;
 	ofn.nMaxFile    = MAX_PATH;
-	ofn.lpstrTitle  = _T("Read AI parameters from JPEG or WebP");
+	ofn.lpstrTitle  = _T("Read AI parameters from JPEG, WebP or MP4/MOV");
 	ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
 	if(!GetOpenFileName(&ofn)) return;
 
@@ -3284,19 +3530,14 @@ static void twpng_ReadAIFromFile(HWND owner)
 	CloseHandle(fh);
 
 	TCHAR *text = NULL;
-	int kind = 0;   // 1=JPEG, 2=WebP, 3=PNG
-	if(got>=2 && hdr[0]==0xFF && hdr[1]==0xD8) kind=1;
-	else if(got>=12 && !memcmp(hdr,"RIFF",4) && !memcmp(hdr+8,"WEBP",4)) kind=2;
-	else if(got>=8 && !memcmp(hdr,"\x89PNG\r\n\x1a\n",8)) kind=3;
-
-	if(kind==1)      twpng_ReadJpegAIParams(fn, &text);
-	else if(kind==2) twpng_ReadWebpAIParams(fn, &text);
-	else if(kind==3) {
+	int kind = twpng_SniffForeignKind(hdr, got);
+	if(kind) twpng_ReadForeignAIParams(kind, fn, &text);
+	else if(got>=8 && !memcmp(hdr,"\x89PNG\r\n\x1a\n",8)) {
 		mesg(MSG_I,_T("For PNG files, use File \xb7 Open and the viewer will pop up automatically."));
 		return;
 	}
 	else {
-		mesg(MSG_W,_T("Unrecognized file format. Expected JPEG, WebP, or PNG."));
+		mesg(MSG_W,_T("Unrecognized file format. Expected JPEG, WebP, MP4/MOV, or PNG."));
 		return;
 	}
 
@@ -5146,7 +5387,7 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			AppendMenu(mtools,MF_SEPARATOR,0,NULL);
 #endif
 			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_VIEWAIPARAMS,_T("&View AI Parameters..."));
-			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_READAIFROMFILE,_T("Read AI parameters from &JPEG/WebP..."));
+			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_READAIFROMFILE,_T("Read AI parameters from &JPEG/WebP/MP4..."));
 			AppendMenu(mtools,MF_SEPARATOR,0,NULL);
 			for(i=0;i<TWPNG_NUMTOOLS;i++) {
 				if(lstrlen(globals.tools[i].name)) {
