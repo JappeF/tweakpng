@@ -5814,6 +5814,27 @@ static void twpng_HandleAboutInitDialog(HWND hwnd)
 	SetDlgItemText(hwnd,IDC_ABOUTTEXT,buf);
 }
 
+// Acrylic backdrop behind the whole window: DWM draws the blur wherever the client area
+// is black (alpha 0), so the frame is extended over the full client area.
+static void twpng_ApplyAcrylic(HWND hwnd)
+{
+	typedef HRESULT (WINAPI *DwmSetWindowAttributeProc)(HWND,DWORD,LPCVOID,DWORD);
+	typedef HRESULT (WINAPI *DwmExtendFrameIntoClientAreaProc)(HWND,const MARGINS*);
+	HMODULE hDwm = LoadLibrary(_T("dwmapi.dll"));
+	if(!hDwm) return;
+	DwmSetWindowAttributeProc pSet =
+		(DwmSetWindowAttributeProc)GetProcAddress(hDwm,"DwmSetWindowAttribute");
+	DwmExtendFrameIntoClientAreaProc pExtend =
+		(DwmExtendFrameIntoClientAreaProc)GetProcAddress(hDwm,"DwmExtendFrameIntoClientArea");
+	if(pSet && pExtend) {
+		int backdrop_type = 3;   // DWMSBT_TRANSIENTWINDOW (acrylic)
+		pSet(hwnd,38,&backdrop_type,sizeof(backdrop_type));
+		MARGINS m = { -1, -1, -1, -1 };
+		pExtend(hwnd,&m);
+	}
+	FreeLibrary(hDwm);
+}
+
 static INT_PTR CALLBACK DlgProcAbout(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	WORD id;
@@ -5822,8 +5843,17 @@ static INT_PTR CALLBACK DlgProcAbout(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 	switch (msg) {
 	case WM_INITDIALOG:
 		twpng_InitDarkDialog(hwnd);
+		twpng_ApplyAcrylic(hwnd);
 		twpng_HandleAboutInitDialog(hwnd);
 		return 1;
+	case WM_CTLCOLORDLG:
+	case WM_CTLCOLORSTATIC:
+	case WM_CTLCOLORBTN:
+		// Black is "transparent" on the extended frame, letting the acrylic show through.
+		SetBkMode((HDC)wParam, TRANSPARENT);
+		SetBkColor((HDC)wParam, RGB(0,0,0));
+		SetTextColor((HDC)wParam, RGB(255,255,255));
+		return (INT_PTR)GetStockObject(BLACK_BRUSH);
 	case WM_NOTIFY:
 		{
 			LPNMHDR nmh = (LPNMHDR)lParam;

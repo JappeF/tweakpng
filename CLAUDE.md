@@ -84,6 +84,10 @@ When touching this, the canonical reference is `adzm/win32-custom-menubar-aero-t
 - **Message boxes**: the OS `MessageBox` can't be fully darkened (it paints a light footer
   in `WM_PAINT`), so `twpng_MessageBox` is a custom dark dialog (`DLG_MSGBOX`) used by
   `mesg()` and every other call site. Supports MB_OK/OKCANCEL/YESNO/YESNOCANCEL + icons.
+- **About dialog acrylic**: `twpng_ApplyAcrylic` sets backdrop type 3 (acrylic) and
+  extends the DWM frame over the whole client area; `DlgProcAbout` returns a black brush
+  with transparent bk mode for `WM_CTLCOLOR*`, since black is what lets the blur show
+  through. Windows shows acrylic as a flat fill while the window is inactive.
 - **System common dialogs** (the `ChooseColor` picker) are dark-themed via a scoped
   `WH_CBT` hook in `twpng_ChooseColorDark`, which themes the chrome on activation while
   leaving owner-drawn swatches/spectrum colorful.
