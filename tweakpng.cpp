@@ -2842,6 +2842,26 @@ static BOOL cf_node_inputs_by_id(const TCHAR *s, int len, const TCHAR *id, int *
 	return id && cf_find_node_by_id(s,len,id,&ns,&ne) && cf_inputs_range(s,len,ns,ne,is,ie);
 }
 
+// String input `key`, or the string behind it when the input is wired to a primitive or
+// string node (PrimitiveStringMultiline, String Literal...).
+static TCHAR *cf_get_text(const TCHAR *s, int len, int is, int ie, const TCHAR *key) {
+	TCHAR *t = cf_get_string(s, is, ie, key);
+	if(t) return t;
+	static const TCHAR *valueKeys[] = { _T("value"), _T("text"), _T("string"), _T("prompt"), NULL };
+	TCHAR *ref = cf_get_ref(s, is, ie, key);
+	for(int hop=0; ref && hop<4 && !t; hop++) {
+		int ns, ne;
+		if(!cf_node_inputs_by_id(s, len, ref, &ns, &ne)) break;
+		for(int k=0; valueKeys[k] && !t; k++) t = cf_get_string(s, ns, ne, valueKeys[k]);
+		TCHAR *next = NULL;
+		for(int k=0; valueKeys[k] && !t && !next; k++) next = cf_get_ref(s, ns, ne, valueKeys[k]);
+		free(ref);
+		ref = next;
+	}
+	free(ref);
+	return t;
+}
+
 // Inputs of the first node whose class_type is `cls`.
 static BOOL cf_find_class_inputs(const TCHAR *s, int len, const TCHAR *cls, int *is, int *ie) {
 	TCHAR needle[96];
@@ -3032,7 +3052,7 @@ static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
 			if(side==0 && !mode && (mode = cf_video_mode(full, len, ref, ns, ne)) != NULL) {
 				vStart = ns; vEnd = ne;
 			}
-			for(int k=0; textKeys[k] && !*outp; k++) *outp = cf_get_string(full, ns, ne, textKeys[k]);
+			for(int k=0; textKeys[k] && !*outp; k++) *outp = cf_get_text(full, len, ns, ne, textKeys[k]);
 			if(*outp) break;
 			TCHAR *next = NULL;
 			for(int k=0; follow[k] && !next; k++) next = cf_get_ref(full, ns, ne, follow[k]);
@@ -3099,8 +3119,13 @@ static BOOL twpng_ParseComfyJson(const TCHAR *full, struct aiparams_ctx *ctx) {
 	if(vStart>=0) {
 		TCHAR refs[600]=_T(""), first[600]=_T(""), last[600]=_T("");
 		cf_collect_images(full, len, vStart, vEnd, refs, first, last, 600);
-		// Quoted so the settings splitter keeps the comma-separated list on one line.
-		if(refs[0])  { StringCchCat(setbuf,1500,_T(", References: \"")); StringCchCat(setbuf,1500,refs); StringCchCat(setbuf,1500,_T("\"")); }
+		// A list is quoted so the settings splitter keeps it on one line.
+		if(refs[0]) {
+			BOOL list = _tcschr(refs, _T(',')) != NULL;
+			StringCchCat(setbuf,1500, list ? _T(", References: \"") : _T(", References: "));
+			StringCchCat(setbuf,1500,refs);
+			if(list) StringCchCat(setbuf,1500,_T("\""));
+		}
 		if(first[0]) { StringCchCat(setbuf,1500,_T(", First frame: "));  StringCchCat(setbuf,1500,first); }
 		if(last[0])  { StringCchCat(setbuf,1500,_T(", Last frame: "));   StringCchCat(setbuf,1500,last); }
 	}

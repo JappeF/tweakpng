@@ -136,6 +136,8 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
   its input images (`cf_collect_images`: `ref_image*` keys as a quoted `References:`
   list, `first_frame`/`start_image` and `last_frame`/`end_image` as `First frame:` /
   `Last frame:`), resolved back to the `LoadImage` file name by `cf_resolve_image`.
+  Text inputs go through `cf_get_text`, which follows a wired input (e.g. `prompt` fed
+  by a `PrimitiveStringMultiline`) to the string node's `value`/`text`/`string`.
 - **View AI Parameters** (`twpng_ViewAIParams`, Edit + Tools menus): re-opens the parsed
   viewer for the current document. Handles both PNG (looks up the `parameters`/`prompt`
   chunk) and foreign files (re-reads metadata via `twpng_ReadForeignAIParams`). Menu enabling lives in `WM_INITMENU` and explicitly
