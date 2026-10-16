@@ -487,6 +487,10 @@ Next to the settings the viewer shows the file's thumbnail (the same one
 Explorer shows; for videos a frame from the video). It loads in the
 background, so on a slow drive it can appear a moment later.
 
+The borders between Prompt, Negative prompt and Settings, and between the
+settings and the thumbnail, can be dragged to resize the boxes;
+double-click a border to put it back. The sizes are remembered.
+
 Double-click the thumbnail (or press F11) to see the image full screen,
 sharp at the size of your screen (for videos: a large frame). Left/Right,
 the mouse wheel or Space browse through the folder there too, and Esc (or

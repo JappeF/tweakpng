@@ -26,7 +26,8 @@ Civitai):
   images that were used.
 - **Browse a folder** - Prev/Next (or the arrow keys) in the viewer step through the
   images and videos in the same folder. Double-click the thumbnail for a full-screen view
-  you can browse with the arrow keys, Esc to go back. **Show in Explorer** selects the
+  you can browse with the arrow keys, Esc to go back. The borders between the prompt,
+  negative prompt, settings and thumbnail can be dragged. **Show in Explorer** selects the
   file in Explorer, and **Save JSON** saves the ComfyUI graph so it can be loaded back into
   ComfyUI. Settings include LoRAs, and for videos the real size, frame count and duration.
 - **Read AI parameters from File** (Tools menu) - one-shot file picker that opens the

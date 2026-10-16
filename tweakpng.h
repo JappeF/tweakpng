@@ -229,6 +229,9 @@ struct globals_struct {
 	int theme_pref;
 	int dark;           // resolved from theme_pref (and the Windows setting for System)
 	int aiparams_only;  // started with /aiparams: main window hidden, viewer only
+	// AI viewer splitters, per mille: prompt and negative prompt share of the boxes'
+	// height, thumbnail share of the width (0 = from the image's aspect ratio).
+	int aip_split_prompt, aip_split_neg, aip_split_thumb;
 	HANDLE hListRowImageList;
 
 	const TCHAR *twpng_homepage;

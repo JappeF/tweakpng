@@ -158,6 +158,12 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
     `SIIGBF_THUMBNAILONLY`) for Explorer's thumbnail on a background thread and posts it
     back (`WM_APP_THUMB`); a generation counter drops results for files no longer shown.
     It is owner-drawn (`IDC_AIP_THUMB`, `SS_NOTIFY`) right of the settings box.
+  - **Splitters**: the gaps between Prompt / Negative prompt / Settings and between
+    Settings and the thumbnail are draggable (`g_aipSplit`, hit-tested in the dialog's
+    own `WM_SETCURSOR` / `WM_LBUTTONDOWN`, since the gaps and the static labels belong to
+    the dialog). Positions live in `globals.aip_split_prompt/neg/thumb` (per mille,
+    registry `aip_split_*`, thumb 0 = from the image aspect); `WM_LBUTTONDBLCLK` on a
+    splitter resets it.
   - **Full screen** (double-click the thumbnail or F11; `twpng_FullscreenOpen`,
     `FullWndProc`, class `TWPNGFULLVIEW`): a popup covering the viewer's monitor.
     `twpng_DecodeFit` decodes on a worker thread (WIC, scaled to the screen, premultiplied

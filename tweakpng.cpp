@@ -1385,6 +1385,9 @@ static int SaveSettings()
 	r=RegSetValueEx(key,_T("zoom"),0,REG_DWORD,(LPBYTE)&globals.vsize,sizeof(DWORD));
 	r=RegSetValueEx(key,_T("open_params"),0,REG_DWORD,(LPBYTE)&globals.open_params_on_load,sizeof(DWORD));
 	r=RegSetValueEx(key,_T("theme"),0,REG_DWORD,(LPBYTE)&globals.theme_pref,sizeof(DWORD));
+	r=RegSetValueEx(key,_T("aip_split_prompt"),0,REG_DWORD,(LPBYTE)&globals.aip_split_prompt,sizeof(DWORD));
+	r=RegSetValueEx(key,_T("aip_split_neg"),0,REG_DWORD,(LPBYTE)&globals.aip_split_neg,sizeof(DWORD));
+	r=RegSetValueEx(key,_T("aip_split_thumb"),0,REG_DWORD,(LPBYTE)&globals.aip_split_thumb,sizeof(DWORD));
 
 	if(IsWindow(globals.hwndMainList)) {
 		for(i=0;i<5;i++) {
@@ -1423,6 +1426,9 @@ static void ReadSettings()
 	globals.autoopen_viewer=0;
 	globals.window_bgcolor=TWPNG_WBG_SAMEASIMAGE;
 	globals.theme_pref=TWPNG_THEME_DARK;
+	globals.aip_split_prompt=500;
+	globals.aip_split_neg=220;
+	globals.aip_split_thumb=0;   // 0 => size the thumbnail from the image's aspect ratio
 
 	for(i=0;i<TWPNG_NUMTOOLS;i++) {
 		StringCchCopy(globals.tools[i].name,MAX_TOOL_NAME,_T(""));
@@ -1515,6 +1521,15 @@ static void ReadSettings()
 	r=RegQueryValueEx(key,_T("theme"),NULL,NULL,(LPBYTE)(&globals.theme_pref),&datasize);
 	if(globals.theme_pref<TWPNG_THEME_SYSTEM || globals.theme_pref>TWPNG_THEME_DARK)
 		globals.theme_pref=TWPNG_THEME_DARK;
+	datasize=sizeof(DWORD);
+	r=RegQueryValueEx(key,_T("aip_split_prompt"),NULL,NULL,(LPBYTE)(&globals.aip_split_prompt),&datasize);
+	datasize=sizeof(DWORD);
+	r=RegQueryValueEx(key,_T("aip_split_neg"),NULL,NULL,(LPBYTE)(&globals.aip_split_neg),&datasize);
+	datasize=sizeof(DWORD);
+	r=RegQueryValueEx(key,_T("aip_split_thumb"),NULL,NULL,(LPBYTE)(&globals.aip_split_thumb),&datasize);
+	if(globals.aip_split_prompt<50 || globals.aip_split_prompt>950) globals.aip_split_prompt=500;
+	if(globals.aip_split_neg<50 || globals.aip_split_neg>950) globals.aip_split_neg=220;
+	if(globals.aip_split_thumb<0 || globals.aip_split_thumb>800) globals.aip_split_thumb=0;
 
 	datasize=sizeof(DWORD);
 	tmpd = 0;
@@ -2724,7 +2739,7 @@ static void twpng_DrawThumb(const DRAWITEMSTRUCT *d, const struct aiparams_ctx *
 	int w = r.right-r.left, h = r.bottom-r.top;
 	int dw = w, dh = MulDiv(w, c->thumbH, c->thumbW);
 	if(dh > h) { dh = h; dw = MulDiv(h, c->thumbW, c->thumbH); }
-	int x = r.right - dw, y = r.top;   // top-right, next to the settings text
+	int x = r.left + (w-dw)/2, y = r.top;   // centered when the column is wider than the image
 	HDC mdc = CreateCompatibleDC(d->hDC);
 	HGDIOBJ old = SelectObject(mdc, c->thumb);
 	BOOL done = FALSE;
@@ -2765,6 +2780,57 @@ static void twpng_FillAIParams(HWND hwnd, struct aiparams_ctx *c)
 	twpng_UpdateAINav(hwnd, c);
 }
 
+// Draggable splitters in the viewer: 0 = prompt/negative, 1 = negative/settings,
+// 2 = settings/thumbnail. The layout records where they are and the sizes they split.
+static struct {
+	RECT rc[3];
+	int avail, promptTop, negTop, promptH, negH, editX, editW;
+	int drag;            // splitter being dragged, or -1
+	int grab;            // mouse offset inside the splitter when the drag started
+	DWORD lastClick;
+	int lastZone;
+} g_aipSplit = { {{0,0,0,0},{0,0,0,0},{0,0,0,0}}, 0,0,0,0,0,0,0, -1, 0, 0, -1 };
+
+static int twpng_AIPSplitHit(HWND hwnd, int x, int y)
+{
+	POINT pt = { x, y };
+	(void)hwnd;
+	for(int i=0; i<3; i++) if(PtInRect(&g_aipSplit.rc[i], pt)) return i;
+	return -1;
+}
+
+static void twpng_LayoutAIParams(HWND hwnd);
+
+static void twpng_AIPSplitDrag(HWND hwnd, int x, int y)
+{
+	const int minH = 30;
+	int avail = g_aipSplit.avail > 0 ? g_aipSplit.avail : 1;
+	if(g_aipSplit.drag==0) {
+		// Prompt grows, negative prompt shrinks; the settings box keeps its size.
+		int sum = g_aipSplit.promptH + g_aipSplit.negH;
+		int ph = y - g_aipSplit.grab - g_aipSplit.promptTop;
+		if(ph < minH) ph = minH;
+		if(ph > sum-minH) ph = sum-minH;
+		globals.aip_split_prompt = MulDiv(ph, 1000, avail);
+		globals.aip_split_neg = MulDiv(sum-ph, 1000, avail);
+	} else if(g_aipSplit.drag==1) {
+		int nh = y - g_aipSplit.grab - g_aipSplit.negTop;
+		if(nh < minH) nh = minH;
+		if(nh > avail-g_aipSplit.promptH-minH) nh = avail-g_aipSplit.promptH-minH;
+		globals.aip_split_neg = MulDiv(nh, 1000, avail);
+	} else if(g_aipSplit.drag==2 && g_aipSplit.editW>0) {
+		int right = g_aipSplit.editX + g_aipSplit.editW;
+		int tw = right - (x - g_aipSplit.grab) - (g_aipSplit.rc[2].right - g_aipSplit.rc[2].left);
+		int pm = MulDiv(tw, 1000, g_aipSplit.editW);
+		if(pm < 100) pm = 100;
+		if(pm > 800) pm = 800;
+		globals.aip_split_thumb = pm;
+	}
+	twpng_LayoutAIParams(hwnd);
+	InvalidateRect(GetDlgItem(hwnd, IDC_AIP_THUMB), NULL, TRUE);
+	UpdateWindow(hwnd);
+}
+
 // Lay out the AI params controls to fill the (resizable) client area.
 static void twpng_LayoutAIParams(HWND hwnd)
 {
@@ -2780,9 +2846,24 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	int top=m;
 	int avail=bottomY-gap-top-3*labelH-2*gap;   // vertical space shared by 3 edits
 	if(avail<90) avail=90;
-	int promptH=(int)(avail*0.50);              // prompt is the largest box
-	int negH=(int)(avail*0.22);
+	// Box heights follow the draggable splitters (per mille of the shared space).
+	const int minH=30;
+	int promptH=MulDiv(avail, globals.aip_split_prompt, 1000);
+	int negH=MulDiv(avail, globals.aip_split_neg, 1000);
+	if(promptH>avail-2*minH) promptH=avail-2*minH;
+	if(promptH<minH) promptH=minH;
+	if(negH>avail-promptH-minH) negH=avail-promptH-minH;
+	if(negH<minH) negH=minH;
 	int setH=avail-promptH-negH;
+	g_aipSplit.avail=avail;
+	g_aipSplit.promptTop=top+labelH;
+	g_aipSplit.negTop=top+2*labelH+promptH+gap;
+	g_aipSplit.promptH=promptH;
+	g_aipSplit.negH=negH;
+	g_aipSplit.editX=editX;
+	g_aipSplit.editW=editW;
+	SetRect(&g_aipSplit.rc[0], editX, top+labelH+promptH, editX+editW, top+labelH+promptH+gap);
+	SetRect(&g_aipSplit.rc[1], editX, g_aipSplit.negTop+negH, editX+editW, g_aipSplit.negTop+negH+gap);
 
 	int y=top;
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_LBLPROMPT),NULL,editX,y,editW,labelH,SWP_NOZORDER);
@@ -2797,14 +2878,20 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	y+=negH+gap;
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_LBLSET),NULL,editX,y,editW,labelH,SWP_NOZORDER);
 	y+=labelH;
-	// The thumbnail sits right of the settings, as tall as the box and at most half as wide.
+	// The thumbnail sits right of the settings: as wide as its splitter says, or by default
+	// as tall as the box and at most half as wide.
 	struct aiparams_ctx *c = (struct aiparams_ctx*)GetWindowLongPtr(hwnd,DWLP_USER);
 	int thumbW = 0;
 	if(c && c->thumb && c->thumbH>0) {
-		thumbW = MulDiv(setH, c->thumbW, c->thumbH);
-		if(thumbW > editW/2) thumbW = editW/2;
+		if(globals.aip_split_thumb>0) thumbW = MulDiv(editW, globals.aip_split_thumb, 1000);
+		else {
+			thumbW = MulDiv(setH, c->thumbW, c->thumbH);
+			if(thumbW > editW/2) thumbW = editW/2;
+		}
 	}
 	int setW = thumbW ? editW-thumbW-gap : editW;
+	if(thumbW) SetRect(&g_aipSplit.rc[2], editX+setW, y, editX+setW+gap, y+setH);
+	else SetRectEmpty(&g_aipSplit.rc[2]);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SETTINGS),NULL,editX,y,setW,setH,SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_THUMB),NULL,editX+editW-thumbW,y,thumbW?thumbW:1,setH,SWP_NOZORDER);
 	ShowWindow(GetDlgItem(hwnd,IDC_AIP_THUMB), thumbW ? SW_SHOW : SW_HIDE);
@@ -2850,6 +2937,71 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			mm->ptMinTrackSize.y=300;
 			return 0;
 		}
+
+	case WM_SETCURSOR:
+		if((HWND)wParam==hwnd && LOWORD(lParam)==HTCLIENT) {
+			POINT pt;
+			GetCursorPos(&pt);
+			ScreenToClient(hwnd, &pt);
+			int z = g_aipSplit.drag>=0 ? g_aipSplit.drag : twpng_AIPSplitHit(hwnd, pt.x, pt.y);
+			if(z>=0) {
+				SetCursor(LoadCursor(NULL, z==2 ? IDC_SIZEWE : IDC_SIZENS));
+				SetWindowLongPtr(hwnd, DWLP_MSGRESULT, TRUE);
+				return TRUE;
+			}
+		}
+		break;
+
+	case WM_LBUTTONDOWN:
+		{
+			int x = (short)LOWORD(lParam), y = (short)HIWORD(lParam);
+			int z = twpng_AIPSplitHit(hwnd, x, y);
+			if(z<0) break;
+			DWORD now = GetMessageTime();
+			if(z==g_aipSplit.lastZone && now - g_aipSplit.lastClick <= GetDoubleClickTime()) {
+				// Double-click resets that splitter to its default.
+				if(z==2) globals.aip_split_thumb = 0;
+				else { globals.aip_split_prompt = 500; globals.aip_split_neg = 220; }
+				g_aipSplit.lastZone = -1;
+				twpng_LayoutAIParams(hwnd);
+				InvalidateRect(GetDlgItem(hwnd, IDC_AIP_THUMB), NULL, TRUE);
+				return TRUE;
+			}
+			g_aipSplit.lastZone = z;
+			g_aipSplit.lastClick = now;
+			g_aipSplit.drag = z;
+			g_aipSplit.grab = (z==2) ? x - g_aipSplit.rc[2].left : y - g_aipSplit.rc[z].top;
+			SetCapture(hwnd);
+			return TRUE;
+		}
+
+	case WM_LBUTTONDBLCLK:
+		{
+			// The dialog class sends the second click of a double-click here.
+			int z = twpng_AIPSplitHit(hwnd, (short)LOWORD(lParam), (short)HIWORD(lParam));
+			if(z<0) break;
+			if(z==2) globals.aip_split_thumb = 0;
+			else { globals.aip_split_prompt = 500; globals.aip_split_neg = 220; }
+			g_aipSplit.lastZone = -1;
+			twpng_LayoutAIParams(hwnd);
+			InvalidateRect(GetDlgItem(hwnd, IDC_AIP_THUMB), NULL, TRUE);
+			return TRUE;
+		}
+
+	case WM_MOUSEMOVE:
+		if(g_aipSplit.drag>=0) {
+			twpng_AIPSplitDrag(hwnd, (short)LOWORD(lParam), (short)HIWORD(lParam));
+			return TRUE;
+		}
+		break;
+
+	case WM_LBUTTONUP:
+		if(g_aipSplit.drag>=0) { ReleaseCapture(); return TRUE; }
+		break;
+
+	case WM_CAPTURECHANGED:
+		g_aipSplit.drag = -1;
+		break;
 
 	case WM_DRAWITEM:
 		if(wParam==IDC_AIP_THUMB) {
