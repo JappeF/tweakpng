@@ -54,6 +54,8 @@
 #include <shlwapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <wincodec.h>
+#pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
@@ -113,6 +115,11 @@ struct globals_struct globals;
 static HWND g_hwndAIParams = NULL;
 // Modeless "Folder Overview" window (one instance at a time).
 static HWND g_hwndAIFolder = NULL;
+// Full-screen image view opened from the AI viewer.
+static HWND g_hwndFull = NULL;
+static void twpng_FullscreenOpen();
+static void twpng_FullLoad();
+static void twpng_ShowInExplorer(const TCHAR *path);
 static void twpng_ShowFolderOverview(const TCHAR *dir, BOOL focusSearch);
 static LRESULT CALLBACK MainListSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
@@ -1653,6 +1660,11 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 
 	while(GetMessage(&msg,NULL,0,0)){
 		if(twpng_IsModelessEditorMessage(&msg)) continue;
+		if(g_hwndFull && msg.hwnd==g_hwndFull) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+			continue;
+		}
 		if(g_hwndAIParams && twpng_AIParamsKey(&msg)) continue;
 		if(g_hwndAIParams && IsDialogMessage(g_hwndAIParams,&msg)) continue;
 		if(g_hwndAIFolder && IsDialogMessage(g_hwndAIFolder,&msg)) continue;
@@ -2749,6 +2761,7 @@ static void twpng_FillAIParams(HWND hwnd, struct aiparams_ctx *c)
 		json = (i<len && c->full[i]==_T('{'));
 	}
 	EnableWindow(GetDlgItem(hwnd,IDC_AIP_SAVEJSON), json);
+	EnableWindow(GetDlgItem(hwnd,IDC_AIP_EXPLORER), c->path[0]!=0);
 	twpng_UpdateAINav(hwnd, c);
 }
 
@@ -2803,6 +2816,7 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SAVEJSON),NULL,saveX,bottomY,84,btnH,SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_PREV),NULL,m,bottomY,navW,btnH,SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_NEXT),NULL,m+navW+gap,bottomY,navW,btnH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_EXPLORER),NULL,m+2*(navW+gap),bottomY,110,btnH,SWP_NOZORDER);
 }
 
 static void twpng_SaveAIJson(HWND hwnd, struct aiparams_ctx *c);
@@ -2860,6 +2874,8 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		case IDC_AIP_SAVEJSON:   twpng_SaveAIJson(hwnd,c); return 1;
 		case IDC_AIP_PREV:       twpng_AIParamsNavigate(-1); return 1;
 		case IDC_AIP_NEXT:       twpng_AIParamsNavigate(1); return 1;
+		case IDC_AIP_EXPLORER:   if(c && c->path[0]) twpng_ShowInExplorer(c->path); return 1;
+		case IDC_AIP_THUMB:      if(HIWORD(wParam)==STN_DBLCLK) twpng_FullscreenOpen(); return 1;
 		case IDOK: case IDCANCEL: DestroyWindow(hwnd); return 1;
 		}
 		break;
@@ -2867,6 +2883,7 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 	case WM_NCDESTROY:
 		if(g_hwndAIParams==hwnd){
 			g_hwndAIParams=NULL;
+			if(g_hwndFull) DestroyWindow(g_hwndFull);
 			twpng_FreeAIParamsCtx(g_aiParamsCtx);
 			g_aiParamsCtx=NULL;
 			// Started from the Explorer menu: the viewer is the whole app.
@@ -2931,7 +2948,7 @@ static int twpng_ShowAIParams(const TCHAR *text, const TCHAR *extra, const TCHAR
 		twpng_FillAIParams(g_hwndAIParams, c);
 		twpng_FreeAIParamsCtx(old);
 		if(IsIconic(g_hwndAIParams)) ShowWindow(g_hwndAIParams, SW_RESTORE);
-		SetForegroundWindow(g_hwndAIParams);
+		if(!g_hwndFull) SetForegroundWindow(g_hwndAIParams);
 		return 1;
 	}
 
@@ -3073,16 +3090,301 @@ static void twpng_OpenInViewer(const TCHAR *path)
 	free(text);
 }
 
-// Viewer shortcuts: Alt+Left/Right and Ctrl+PageUp/PageDown browse, F5 re-reads the folder,
-// Ctrl+F opens the folder overview with its search box.
+// ---- Full-screen image view (double-click the thumbnail, or F11) -----------------------
+
+#define WM_APP_FULLIMG (WM_APP+24)
+
+static struct {
+	HBITMAP bmp;
+	int w, h;
+	BOOL premul;          // WIC output: premultiplied BGRA, drawn with AlphaBlend
+	BOOL loading;
+	LONG gen;
+	TCHAR path[MAX_PATH];
+	HFONT font;
+} g_full;
+
+struct twpng_fulljob { HWND hwnd; TCHAR path[MAX_PATH]; LONG gen; int maxW, maxH; HBITMAP bmp; BOOL premul; };
+
+// The image scaled to fit maxW x maxH: still images through WIC at full quality, anything
+// else (videos) as a large thumbnail from the shell. Runs on a worker thread.
+static HBITMAP twpng_DecodeFit(const TCHAR *path, int maxW, int maxH, BOOL *premul)
+{
+	*premul = FALSE;
+	HBITMAP bmp = NULL;
+	IWICImagingFactory *f = NULL;
+	if(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))) {
+		IWICBitmapDecoder *dec = NULL;
+		IWICBitmapFrameDecode *fr = NULL;
+		IWICBitmapScaler *sc = NULL;
+		IWICFormatConverter *cv = NULL;
+		UINT w = 0, h = 0;
+		if(SUCCEEDED(f->CreateDecoderFromFilename(path, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) &&
+		   SUCCEEDED(dec->GetFrame(0, &fr)) && SUCCEEDED(fr->GetSize(&w, &h)) && w && h) {
+			double s = (double)maxW/w < (double)maxH/h ? (double)maxW/w : (double)maxH/h;
+			UINT tw = (UINT)(w*s + 0.5), th = (UINT)(h*s + 0.5);
+			if(tw<1) tw = 1;
+			if(th<1) th = 1;
+			if(SUCCEEDED(f->CreateBitmapScaler(&sc)) &&
+			   SUCCEEDED(sc->Initialize(fr, tw, th, WICBitmapInterpolationModeHighQualityCubic)) &&
+			   SUCCEEDED(f->CreateFormatConverter(&cv)) &&
+			   SUCCEEDED(cv->Initialize(sc, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, NULL, 0, WICBitmapPaletteTypeCustom))) {
+				BITMAPINFO bi;
+				ZeroMemory(&bi, sizeof(bi));
+				bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+				bi.bmiHeader.biWidth = (LONG)tw;
+				bi.bmiHeader.biHeight = -(LONG)th;
+				bi.bmiHeader.biPlanes = 1;
+				bi.bmiHeader.biBitCount = 32;
+				bi.bmiHeader.biCompression = BI_RGB;
+				void *bits = NULL;
+				HBITMAP b = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+				if(b && SUCCEEDED(cv->CopyPixels(NULL, tw*4, tw*4*th, (BYTE*)bits))) { bmp = b; *premul = TRUE; }
+				else if(b) DeleteObject(b);
+			}
+		}
+		if(cv) cv->Release();
+		if(sc) sc->Release();
+		if(fr) fr->Release();
+		if(dec) dec->Release();
+		f->Release();
+	}
+	if(!bmp) {
+		IShellItemImageFactory *sf = NULL;
+		if(SUCCEEDED(SHCreateItemFromParsingName(path, NULL, IID_PPV_ARGS(&sf)))) {
+			SIZE sz = { maxW, maxH };
+			if(FAILED(sf->GetImage(sz, SIIGBF_RESIZETOFIT | SIIGBF_THUMBNAILONLY, &bmp))) bmp = NULL;
+			sf->Release();
+		}
+	}
+	return bmp;
+}
+
+static DWORD WINAPI twpng_FullThread(LPVOID p)
+{
+	struct twpng_fulljob *j = (struct twpng_fulljob*)p;
+	if(j->gen == g_full.gen) {   // skip it if the user already moved on
+		HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+		j->bmp = twpng_DecodeFit(j->path, j->maxW, j->maxH, &j->premul);
+		if(SUCCEEDED(hr)) CoUninitialize();
+	}
+	if(!PostMessage(j->hwnd, WM_APP_FULLIMG, 0, (LPARAM)j)) {
+		if(j->bmp) DeleteObject(j->bmp);
+		free(j);
+	}
+	return 0;
+}
+
+// Load the viewer's current file into the full-screen window (no-op if already shown).
+static void twpng_FullLoad()
+{
+	if(!g_hwndFull || !g_aiParamsCtx) return;
+	if(!lstrcmpi(g_full.path, g_aiParamsCtx->path) && (g_full.bmp || g_full.loading)) return;
+	if(g_full.bmp) { DeleteObject(g_full.bmp); g_full.bmp = NULL; }
+	StringCchCopy(g_full.path, MAX_PATH, g_aiParamsCtx->path);
+	g_full.loading = TRUE;
+	g_full.gen++;
+	struct twpng_fulljob *j = (struct twpng_fulljob*)calloc(1, sizeof(struct twpng_fulljob));
+	if(j) {
+		RECT rc;
+		GetClientRect(g_hwndFull, &rc);
+		j->hwnd = g_hwndFull;
+		StringCchCopy(j->path, MAX_PATH, g_full.path);
+		j->gen = g_full.gen;
+		j->maxW = rc.right > 0 ? rc.right : 1920;
+		j->maxH = rc.bottom > 0 ? rc.bottom : 1080;
+		HANDLE th = CreateThread(NULL, 0, twpng_FullThread, j, 0, NULL);
+		if(th) CloseHandle(th); else { free(j); g_full.loading = FALSE; }
+	}
+	InvalidateRect(g_hwndFull, NULL, FALSE);
+}
+
+// Draw `bmp` (w x h) centered and fitted into the client area.
+static void twpng_FullBlit(HDC dc, const RECT *rc, HBITMAP bmp, int w, int h, BOOL premul)
+{
+	int cw = rc->right, ch = rc->bottom;
+	int dw = cw, dh = MulDiv(cw, h, w);
+	if(dh > ch) { dh = ch; dw = MulDiv(ch, w, h); }
+	int x = (cw-dw)/2, y = (ch-dh)/2;
+	HDC mdc = CreateCompatibleDC(dc);
+	HGDIOBJ old = SelectObject(mdc, bmp);
+	BOOL done = FALSE;
+	if(premul) {
+		BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+		done = AlphaBlend(dc, x, y, dw, dh, mdc, 0, 0, w, h, bf);
+	}
+	if(!done) {
+		SetStretchBltMode(dc, HALFTONE);
+		SetBrushOrgEx(dc, 0, 0, NULL);
+		StretchBlt(dc, x, y, dw, dh, mdc, 0, 0, w, h, SRCCOPY);
+	}
+	SelectObject(mdc, old);
+	DeleteDC(mdc);
+}
+
+static void twpng_FullPaint(HWND hwnd, HDC hdc)
+{
+	RECT rc;
+	GetClientRect(hwnd, &rc);
+	// Paint into a buffer so browsing doesn't flicker.
+	HDC dc = CreateCompatibleDC(hdc);
+	HBITMAP buf = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+	HGDIOBJ oldBuf = SelectObject(dc, buf);
+	FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(g_full.bmp) {
+		BITMAP bm;
+		GetObject(g_full.bmp, sizeof(bm), &bm);
+		twpng_FullBlit(dc, &rc, g_full.bmp, bm.bmWidth, bm.bmHeight<0 ? -bm.bmHeight : bm.bmHeight, g_full.premul);
+	} else if(c && c->thumb && !lstrcmpi(c->path, g_full.path)) {
+		// The small thumbnail stands in until the full image is decoded.
+		twpng_FullBlit(dc, &rc, c->thumb, c->thumbW, c->thumbH, FALSE);
+	}
+
+	// File name and position at the bottom.
+	TCHAR line[MAX_PATH+120];
+	const TCHAR *base = _tcsrchr(g_full.path, _T('\\'));
+	base = base ? base+1 : g_full.path;
+	TCHAR **list;
+	int idx = -1, n = g_full.path[0] ? twpng_GetSiblings(g_full.path, &list, &idx, FALSE) : 0;
+	if(idx>=0) StringCchPrintf(line, MAX_PATH+120, _T("%s  (%d/%d)"), base, idx+1, n);
+	else StringCchCopy(line, MAX_PATH+120, base);
+	if(g_full.loading) StringCchCat(line, MAX_PATH+120, _T("   loading..."));
+	else if(!g_full.bmp) StringCchCat(line, MAX_PATH+120, _T("   no preview"));
+	StringCchCat(line, MAX_PATH+120, _T("      Left/Right: browse   Esc: close"));
+	HGDIOBJ oldFont = SelectObject(dc, g_full.font ? g_full.font : globals.hUiFont);
+	SetBkMode(dc, TRANSPARENT);
+	RECT tr = { 16, rc.bottom-40, rc.right-16, rc.bottom-12 };
+	RECT sh = tr;
+	OffsetRect(&sh, 1, 1);
+	SetTextColor(dc, RGB(0,0,0));
+	DrawText(dc, line, -1, &sh, DT_LEFT|DT_BOTTOM|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
+	SetTextColor(dc, RGB(200,200,200));
+	DrawText(dc, line, -1, &tr, DT_LEFT|DT_BOTTOM|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
+	SelectObject(dc, oldFont);
+
+	BitBlt(hdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+	SelectObject(dc, oldBuf);
+	DeleteObject(buf);
+	DeleteDC(dc);
+}
+
+static void twpng_FullBrowse(HWND hwnd, int dir)
+{
+	twpng_AIParamsNavigate(dir);
+	if(!IsWindow(hwnd)) return;
+	twpng_FullLoad();
+	SetForegroundWindow(hwnd);
+}
+
+static LRESULT CALLBACK FullWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch(msg) {
+	case WM_ERASEBKGND:
+		return 1;
+	case WM_PAINT:
+		{
+			PAINTSTRUCT ps;
+			HDC hdc = BeginPaint(hwnd, &ps);
+			twpng_FullPaint(hwnd, hdc);
+			EndPaint(hwnd, &ps);
+			return 0;
+		}
+	case WM_KEYDOWN:
+		switch(wParam) {
+		case VK_ESCAPE: case VK_F11: DestroyWindow(hwnd); return 0;
+		case VK_LEFT: case VK_PRIOR: case VK_UP: twpng_FullBrowse(hwnd, -1); return 0;
+		case VK_RIGHT: case VK_NEXT: case VK_DOWN: case VK_SPACE: twpng_FullBrowse(hwnd, 1); return 0;
+		}
+		break;
+	case WM_MOUSEWHEEL:
+		twpng_FullBrowse(hwnd, GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -1 : 1);
+		return 0;
+	case WM_LBUTTONDBLCLK:
+		DestroyWindow(hwnd);
+		return 0;
+	case WM_APP_FULLIMG:
+		{
+			struct twpng_fulljob *j = (struct twpng_fulljob*)lParam;
+			if(j->gen==g_full.gen) {
+				if(g_full.bmp) DeleteObject(g_full.bmp);
+				g_full.bmp = j->bmp;
+				g_full.premul = j->premul;
+				g_full.loading = FALSE;
+				j->bmp = NULL;
+				InvalidateRect(hwnd, NULL, FALSE);
+			}
+			if(j->bmp) DeleteObject(j->bmp);
+			free(j);
+			return 0;
+		}
+	case WM_DESTROY:
+		if(g_full.bmp) { DeleteObject(g_full.bmp); g_full.bmp = NULL; }
+		if(g_full.font) { DeleteObject(g_full.font); g_full.font = NULL; }
+		g_full.path[0] = 0;
+		g_full.loading = FALSE;
+		g_full.gen++;
+		g_hwndFull = NULL;
+		if(g_hwndAIParams) SetForegroundWindow(g_hwndAIParams);
+		return 0;
+	}
+	return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// Cover the monitor the viewer is on with the current file's image.
+static void twpng_FullscreenOpen()
+{
+	if(g_hwndFull || !g_aiParamsCtx || !g_aiParamsCtx->path[0]) return;
+	static BOOL registered = FALSE;
+	if(!registered) {
+		WNDCLASS wc;
+		ZeroMemory(&wc, sizeof(wc));
+		wc.style = CS_DBLCLKS;
+		wc.lpfnWndProc = FullWndProc;
+		wc.hInstance = globals.hInst;
+		wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+		wc.lpszClassName = _T("TWPNGFULLVIEW");
+		registered = RegisterClass(&wc)!=0;
+		if(!registered) return;
+	}
+	MONITORINFO mi;
+	mi.cbSize = sizeof(mi);
+	GetMonitorInfo(MonitorFromWindow(g_hwndAIParams, MONITOR_DEFAULTTONEAREST), &mi);
+	RECT r = mi.rcMonitor;
+	g_hwndFull = CreateWindowEx(0, _T("TWPNGFULLVIEW"), _T("TweakPNG"), WS_POPUP,
+		r.left, r.top, r.right-r.left, r.bottom-r.top, NULL, NULL, globals.hInst, NULL);
+	if(!g_hwndFull) return;
+	UINT dpi = GetDpiForWindow(g_hwndFull);
+	g_full.font = CreateFont(-MulDiv(11, dpi ? dpi : 96, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, _T("Segoe UI"));
+	SendMessage(g_hwndFull, WM_SETICON, ICON_BIG, (LPARAM)LoadIcon(globals.hInst,_T("ICONMAIN")));
+	g_full.path[0] = 0;
+	ShowWindow(g_hwndFull, SW_SHOW);
+	twpng_FullLoad();
+	SetForegroundWindow(g_hwndFull);
+}
+
+static void twpng_ShowInExplorer(const TCHAR *path)
+{
+	PIDLIST_ABSOLUTE pidl = ILCreateFromPath(path);
+	if(!pidl) return;
+	SHOpenFolderAndSelectItems(pidl, 0, NULL, 0);
+	ILFree(pidl);
+}
+
+// Viewer shortcuts: Left/Right (also with Alt) and Ctrl+PageUp/PageDown browse, F11 shows
+// the image full screen, F5 re-reads the folder, Ctrl+F opens the folder overview.
+// Shift+Left/Right is left to the edit boxes for selecting text.
 static BOOL twpng_AIParamsKey(const MSG *m)
 {
 	if(m->message!=WM_KEYDOWN && m->message!=WM_SYSKEYDOWN) return FALSE;
 	if(m->hwnd!=g_hwndAIParams && !IsChild(g_hwndAIParams, m->hwnd)) return FALSE;
 	BOOL alt = (GetKeyState(VK_MENU) & 0x8000)!=0, ctrl = (GetKeyState(VK_CONTROL) & 0x8000)!=0;
+	BOOL shift = (GetKeyState(VK_SHIFT) & 0x8000)!=0;
 	int dir = 0;
-	if(alt && !ctrl && m->wParam==VK_LEFT) dir = -1;
-	else if(alt && !ctrl && m->wParam==VK_RIGHT) dir = 1;
+	if(!ctrl && !shift && m->wParam==VK_LEFT) dir = -1;
+	else if(!ctrl && !shift && m->wParam==VK_RIGHT) dir = 1;
 	else if(ctrl && !alt && m->wParam==VK_PRIOR) dir = -1;
 	else if(ctrl && !alt && m->wParam==VK_NEXT) dir = 1;
 	if(dir) { twpng_AIParamsNavigate(dir); return TRUE; }
@@ -3091,6 +3393,10 @@ static BOOL twpng_AIParamsKey(const MSG *m)
 		StringCchCopy(d, MAX_PATH, g_aiParamsCtx->path);
 		TCHAR *sl = _tcsrchr(d, _T('\\'));
 		if(sl) { sl[1] = 0; twpng_ShowFolderOverview(d, TRUE); }
+		return TRUE;
+	}
+	if(m->wParam==VK_F11 && !alt && !ctrl) {
+		twpng_FullscreenOpen();
 		return TRUE;
 	}
 	if(m->wParam==VK_F5 && !alt && !ctrl && g_aiParamsCtx && g_aiParamsCtx->path[0]) {
@@ -5782,6 +6088,198 @@ static void twpng_DocFolder(TCHAR *out)
 	if(sl) sl[1] = 0; else out[0] = 0;
 }
 
+// ---- Options > Folder Indexes: see and delete the folder overview's index files --------
+
+struct twpng_idxinfo { TCHAR file[MAX_PATH]; TCHAR dir[MAX_PATH]; DWORD count; ULONGLONG size; FILETIME time; };
+
+static int twpng_CmpIdxTime(const void *a, const void *b)
+{
+	return -CompareFileTime(&((const struct twpng_idxinfo*)a)->time, &((const struct twpng_idxinfo*)b)->time);
+}
+
+// All index files with the folder and file count from their headers, newest first.
+static int twpng_ListIndexes(struct twpng_idxinfo **out)
+{
+	*out = NULL;
+	TCHAR dir[MAX_PATH], base[MAX_PATH], pat[MAX_PATH];
+	if(FAILED(SHGetFolderPath(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base))) return 0;
+	StringCchPrintf(dir, MAX_PATH, _T("%s\\TweakPNG\\index"), base);
+	StringCchPrintf(pat, MAX_PATH, _T("%s\\*.idx"), dir);
+	WIN32_FIND_DATA fd;
+	HANDLE h = FindFirstFile(pat, &fd);
+	if(h==INVALID_HANDLE_VALUE) return 0;
+	struct twpng_idxinfo *list = NULL;
+	int n = 0, cap = 0;
+	do {
+		if(n==cap) {
+			cap = cap ? cap*2 : 32;
+			struct twpng_idxinfo *nl = (struct twpng_idxinfo*)realloc(list, (size_t)cap*sizeof(*list));
+			if(!nl) break;
+			list = nl;
+		}
+		struct twpng_idxinfo *x = &list[n];
+		ZeroMemory(x, sizeof(*x));
+		StringCchPrintf(x->file, MAX_PATH, _T("%s\\%s"), dir, fd.cFileName);
+		x->size = ((ULONGLONG)fd.nFileSizeHigh<<32) | fd.nFileSizeLow;
+		x->time = fd.ftLastWriteTime;
+		StringCchCopy(x->dir, MAX_PATH, _T("(unknown folder)"));
+		HANDLE fh = CreateFile(x->file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		if(fh!=INVALID_HANDLE_VALUE) {
+			unsigned char head[4096];
+			DWORD got = 0;
+			ReadFile(fh, head, sizeof(head), &got, NULL);
+			CloseHandle(fh);
+			struct twpng_rd r = { head, head+got, FALSE };
+			if(rd_u32(&r)==TWPNG_INDEX_MAGIC && rd_u32(&r)==TWPNG_INDEX_VER) {
+				TCHAR *d = rd_str(&r);
+				DWORD cnt = rd_u32(&r);
+				if(d && !r.bad) { StringCchCopy(x->dir, MAX_PATH, d); x->count = cnt; }
+				free(d);
+			}
+		}
+		n++;
+	} while(FindNextFile(h, &fd));
+	FindClose(h);
+	if(n) qsort(list, n, sizeof(*list), twpng_CmpIdxTime);
+	*out = list;
+	return n;
+}
+
+static void twpng_FormatSize(ULONGLONG b, TCHAR *out, int cap)
+{
+	if(b >= 1024ULL*1024*1024) StringCchPrintf(out, cap, _T("%.1f GB"), b/(1024.0*1024*1024));
+	else if(b >= 1024*1024) StringCchPrintf(out, cap, _T("%.1f MB"), b/(1024.0*1024));
+	else StringCchPrintf(out, cap, _T("%.0f KB"), b/1024.0 + 0.5);
+}
+
+struct twpng_idxdlg { struct twpng_idxinfo *list; int n; };
+
+static void twpng_IndexDlgFill(HWND hwnd, struct twpng_idxdlg *x)
+{
+	free(x->list);
+	x->n = twpng_ListIndexes(&x->list);
+	HWND lv = GetDlgItem(hwnd, IDC_AX_LIST);
+	ListView_DeleteAllItems(lv);
+	ULONGLONG total = 0;
+	for(int i=0; i<x->n; i++) {
+		TCHAR buf[64];
+		LVITEM it;
+		ZeroMemory(&it, sizeof(it));
+		it.mask = LVIF_TEXT;
+		it.iItem = i;
+		it.pszText = x->list[i].dir;
+		ListView_InsertItem(lv, &it);
+		StringCchPrintf(buf, 64, _T("%u"), x->list[i].count);
+		ListView_SetItemText(lv, i, 1, buf);
+		twpng_FormatSize(x->list[i].size, buf, 64);
+		ListView_SetItemText(lv, i, 2, buf);
+		SYSTEMTIME st, lt;
+		FileTimeToSystemTime(&x->list[i].time, &st);
+		SystemTimeToTzSpecificLocalTime(NULL, &st, &lt);
+		StringCchPrintf(buf, 64, _T("%04d-%02d-%02d %02d:%02d"), lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute);
+		ListView_SetItemText(lv, i, 3, buf);
+		total += x->list[i].size;
+	}
+	TCHAR sz[32], line[200];
+	twpng_FormatSize(total, sz, 32);
+	StringCchPrintf(line, 200, _T("%d folder index%s, %s in total."), x->n, x->n==1 ? _T("") : _T("es"), sz);
+	SetDlgItemText(hwnd, IDC_AX_TOTAL, line);
+	EnableWindow(GetDlgItem(hwnd, IDC_AX_DELALL), x->n>0);
+	EnableWindow(GetDlgItem(hwnd, IDC_AX_DELETE), ListView_GetSelectedCount(lv)>0);
+}
+
+// Delete the selected indexes (or all), after asking.
+static void twpng_IndexDlgDelete(HWND hwnd, struct twpng_idxdlg *x, BOOL all)
+{
+	HWND lv = GetDlgItem(hwnd, IDC_AX_LIST);
+	int cnt = 0;
+	ULONGLONG bytes = 0;
+	for(int i=0; i<x->n; i++)
+		if(all || (ListView_GetItemState(lv, i, LVIS_SELECTED) & LVIS_SELECTED)) { cnt++; bytes += x->list[i].size; }
+	if(!cnt) return;
+	TCHAR sz[32], q[300];
+	twpng_FormatSize(bytes, sz, 32);
+	StringCchPrintf(q, 300, _T("Delete %d folder index%s (%s)?\r\n\r\nThose folders are scanned again the next time you open them in the Folder Overview."),
+		cnt, cnt==1 ? _T("") : _T("es"), sz);
+	if(twpng_MessageBox(hwnd, q, _T("Folder Indexes"), MB_OKCANCEL|MB_ICONQUESTION)!=IDOK) return;
+	for(int i=0; i<x->n; i++)
+		if(all || (ListView_GetItemState(lv, i, LVIS_SELECTED) & LVIS_SELECTED)) DeleteFile(x->list[i].file);
+	twpng_IndexDlgFill(hwnd, x);
+}
+
+static void twpng_LayoutIndexDlg(HWND hwnd)
+{
+	RECT rc;
+	GetClientRect(hwnd, &rc);
+	int m = 10, gap = 8, btnH = 24, btnW = 90;
+	SetWindowPos(GetDlgItem(hwnd,IDC_AX_TOTAL), NULL, m, m, rc.right-2*m, 20, SWP_NOZORDER);
+	int by = rc.bottom-m-btnH;
+	SetWindowPos(GetDlgItem(hwnd,IDC_AX_LIST), NULL, m, m+24, rc.right-2*m, by-gap-m-24, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AX_DELETE), NULL, m, by, btnW, btnH, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AX_DELALL), NULL, m+btnW+gap, by, btnW, btnH, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDCANCEL), NULL, rc.right-m-70, by, 70, btnH, SWP_NOZORDER);
+}
+
+static INT_PTR CALLBACK DlgProcIndexes(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	struct twpng_idxdlg *x = (struct twpng_idxdlg*)GetWindowLongPtr(hwnd, DWLP_USER);
+	switch(msg) {
+	case WM_INITDIALOG:
+		{
+			x = (struct twpng_idxdlg*)lParam;
+			SetWindowLongPtr(hwnd, DWLP_USER, lParam);
+			HWND lv = GetDlgItem(hwnd, IDC_AX_LIST);
+			ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);
+			static const struct { const TCHAR *name; int w; int fmt; } cols[] = {
+				{ _T("Folder"), 380, LVCFMT_LEFT }, { _T("Files"), 70, LVCFMT_RIGHT },
+				{ _T("Size"), 80, LVCFMT_RIGHT }, { _T("Updated"), 120, LVCFMT_LEFT }, { NULL, 0, 0 } };
+			for(int i=0; cols[i].name; i++) {
+				LVCOLUMN c;
+				ZeroMemory(&c, sizeof(c));
+				c.mask = LVCF_TEXT|LVCF_WIDTH|LVCF_FMT;
+				c.pszText = (LPTSTR)cols[i].name;
+				c.cx = cols[i].w;
+				c.fmt = cols[i].fmt;
+				ListView_InsertColumn(lv, i, &c);
+			}
+			SetWindowSubclass(lv, MainListSubclassProc, 1, 0);
+			twpng_InitDarkDialog(hwnd);
+			twpng_LayoutIndexDlg(hwnd);
+			twpng_IndexDlgFill(hwnd, x);
+			return TRUE;
+		}
+	case WM_SIZE:
+		twpng_LayoutIndexDlg(hwnd);
+		return TRUE;
+	case WM_GETMINMAXINFO:
+		((LPMINMAXINFO)lParam)->ptMinTrackSize.x = 420;
+		((LPMINMAXINFO)lParam)->ptMinTrackSize.y = 220;
+		return TRUE;
+	case WM_NOTIFY:
+		if(x && ((LPNMHDR)lParam)->idFrom==IDC_AX_LIST && ((LPNMHDR)lParam)->code==LVN_ITEMCHANGED)
+			EnableWindow(GetDlgItem(hwnd, IDC_AX_DELETE), ListView_GetSelectedCount(GetDlgItem(hwnd, IDC_AX_LIST))>0);
+		break;
+	case WM_COMMAND:
+		if(!x) break;
+		switch(LOWORD(wParam)) {
+		case IDC_AX_DELETE: twpng_IndexDlgDelete(hwnd, x, FALSE); return TRUE;
+		case IDC_AX_DELALL: twpng_IndexDlgDelete(hwnd, x, TRUE); return TRUE;
+		case IDOK: case IDCANCEL: EndDialog(hwnd, 0); return TRUE;
+		}
+		break;
+	}
+	INT_PTR dr = 0;
+	if(twpng_HandleDlgDarkMsg(msg, wParam, lParam, &dr)) return dr;
+	return FALSE;
+}
+
+static void twpng_ManageIndexes(HWND owner)
+{
+	struct twpng_idxdlg x = { NULL, 0 };
+	DialogBoxParam(globals.hInst, _T("DLG_AIINDEX"), owner, DlgProcIndexes, (LPARAM)&x);
+	free(x.list);
+}
+
 // File-open command: show the parsed viewer for a file without loading it as the document.
 static void twpng_ReadAIFromFile(HWND owner)
 {
@@ -7932,6 +8430,9 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			return 0;
 		case ID_COMPAREAI:
 			twpng_CompareAIParams(hwnd);
+			return 0;
+		case ID_AIINDEX:
+			twpng_ManageIndexes(hwnd);
 			return 0;
 		case ID_AIFOLDER:
 			{

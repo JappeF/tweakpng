@@ -24,15 +24,18 @@ Civitai):
 - **ComfyUI video workflows** - for MP4/MOV the settings also show the generation mode
   (reference/image/first-last frame/text to video) and the reference or first/last frame
   images that were used.
-- **Browse a folder** - Prev/Next in the viewer step through the images and videos in the
-  same folder, and **Save JSON** saves the ComfyUI graph so it can be loaded back into
+- **Browse a folder** - Prev/Next (or the arrow keys) in the viewer step through the
+  images and videos in the same folder. Double-click the thumbnail for a full-screen view
+  you can browse with the arrow keys, Esc to go back. **Show in Explorer** selects the
+  file in Explorer, and **Save JSON** saves the ComfyUI graph so it can be loaded back into
   ComfyUI. Settings include LoRAs, and for videos the real size, frame count and duration.
 - **Read AI parameters from File** (Tools menu) - one-shot file picker that opens the
   parsed viewer without loading the file as a document.
 - **Folder Overview** (Tools menu, or Ctrl+F in the viewer) - all images and videos of a
   folder in one list with seed, model, mode, duration and prompt, a search box, and
   Export CSV. Scans in the background with a progress bar and keeps an index, so a folder
-  with 22,000 files opens in well under a second the second time.
+  with 22,000 files opens in well under a second the second time. Options > Folder
+  Indexes shows the indexes and deletes the ones you no longer need.
 - **Compare AI Parameters** (Tools menu) - shows what changed between two files: settings
   side by side and a word-level diff of the prompts.
 - **Strip AI Metadata** (Edit menu) - removes prompt/seed/workflow/EXIF metadata so a file

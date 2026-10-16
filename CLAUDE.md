@@ -143,8 +143,9 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
   text and appends `extra` (container info such as the MP4 video size) to the settings.
   Showing again while the viewer is open updates it in place (new ctx swapped in). The
   ctx remembers the source `path` and whether it is the open document (`isDoc`).
-  - **Prev / Next** (`twpng_AIParamsNavigate`, also Alt+Left/Right and Ctrl+PageUp/Down
-    via `twpng_AIParamsKey` in the message loop): steps through the supported files in
+  - **Prev / Next** (`twpng_AIParamsNavigate`, also Left/Right, Alt+Left/Right and
+    Ctrl+PageUp/Down via `twpng_AIParamsKey` in the message loop; Shift+arrows stay with
+    the edit boxes): steps through the supported files in
     the same folder; the title shows the position. The listing (`twpng_ListDir`, natural
     sort via `StrCmpLogicalW`) is cached in `g_sib` and built on a background thread
     (`WM_APP_SIBLINGS` back to the main window), because folders can hold 20k+ files on
@@ -156,7 +157,18 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
   - **Thumbnail**: `twpng_RequestThumb` asks the shell (`IShellItemImageFactory`,
     `SIIGBF_THUMBNAILONLY`) for Explorer's thumbnail on a background thread and posts it
     back (`WM_APP_THUMB`); a generation counter drops results for files no longer shown.
-    It is owner-drawn (`IDC_AIP_THUMB`) right of the settings box.
+    It is owner-drawn (`IDC_AIP_THUMB`, `SS_NOTIFY`) right of the settings box.
+  - **Full screen** (double-click the thumbnail or F11; `twpng_FullscreenOpen`,
+    `FullWndProc`, class `TWPNGFULLVIEW`): a popup covering the viewer's monitor.
+    `twpng_DecodeFit` decodes on a worker thread (WIC, scaled to the screen, premultiplied
+    BGRA; videos and anything WIC can't read fall back to a large shell thumbnail) and
+    posts `WM_APP_FULLIMG`; the small thumbnail is drawn meanwhile. Left/Right, PageUp/Down,
+    Space and the mouse wheel browse (through `twpng_AIParamsNavigate`, so the viewer
+    follows), Esc / F11 / double-click close. Its messages bypass the main window's
+    accelerators in the message loop (Delete would otherwise delete a chunk), and
+    `twpng_ShowAIParams` doesn't pull the viewer to the front while it is open.
+  - **Show in Explorer** (`IDC_AIP_EXPLORER`): `SHOpenFolderAndSelectItems`; an already
+    open Explorer window on that folder is reused.
   - **Save JSON** writes `ctx->full` as UTF-8 when it is JSON (the ComfyUI graph), so it
     can be loaded back into ComfyUI. Parser `twpng_ParseA1111` splits on the
   `Negative prompt:` and `Steps:` line markers; `twpng_SettingsToLines` reformats the
@@ -280,6 +292,9 @@ fixed columns for the common settings plus "Other settings").
   size, last-write time and the parsed prompt / negative / settings in UTF-8. A file is
   only read again when its size or time changed. A stopped scan still saves what it has,
   plus the old records of files it didn't reach.
+- **Options > Folder Indexes** (`ID_AIINDEX`, `DLG_AIINDEX`, `DlgProcIndexes`): lists the
+  index files with the folder and file count from their headers, size and date, and
+  deletes the selected ones or all after a confirm.
 - Measured: 22,000 local files take about 3.4 s the first time and 0.2 s from the index;
   on RaiDrive (cloud WebDAV) a first read costs about 50 ms per video.
 

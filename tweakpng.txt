@@ -487,15 +487,22 @@ Next to the settings the viewer shows the file's thumbnail (the same one
 Explorer shows; for videos a frame from the video). It loads in the
 background, so on a slow drive it can appear a moment later.
 
+Double-click the thumbnail (or press F11) to see the image full screen,
+sharp at the size of your screen (for videos: a large frame). Left/Right,
+the mouse wheel or Space browse through the folder there too, and Esc (or
+a double-click) brings you back to the viewer.
+
 Buttons at the bottom:
 
 - < Prev / Next >: show the previous or next image or video in the same
   folder (in Explorer's name order). The title bar shows the position, for
   example "shot_15_00001_.mp4 (41/44)". When the viewer belongs to the
-  open document, the main window follows along. Keyboard: Alt+Left /
-  Alt+Right or Ctrl+PageUp / Ctrl+PageDown. Large folders (also on network
+  open document, the main window follows along. Keyboard: Left / Right
+  (Shift+Left/Right still selects text), or Ctrl+PageUp / Ctrl+PageDown. Large folders (also on network
   drives) are listed in the background, and the list is kept, so browsing
   stays fast; press F5 to read the folder again.
+- Show in Explorer: opens the file's folder in Explorer with the file
+  selected.
 - Save JSON...: saves the ComfyUI graph as a .json file, which can be
   loaded back into ComfyUI.
 - Copy All: copies the complete metadata text.
@@ -531,6 +538,11 @@ The results are kept in an index (in %LOCALAPPDATA%\TweakPNG\index), so the
 next time only new or changed files are read: a folder with 22,000 files
 then opens in well under a second. On a network or cloud drive the first
 scan takes longer, as every file is fetched over the network.
+
+The indexes can grow with big folders. Options > Folder Indexes lists
+them with their folder, number of files, size and date; select one or
+more and click Delete, or use Delete all. A deleted folder is simply
+scanned again the next time.
 
 
 Tools > Compare AI Parameters

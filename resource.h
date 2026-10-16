@@ -114,6 +114,11 @@
 #define IDC_AF_LBLSEARCH                1129
 #define IDC_AF_LBLFOLDER                1130
 #define IDC_AF_RESCAN                   1131
+#define IDC_AIP_EXPLORER                1132
+#define IDC_AX_LIST                     1133
+#define IDC_AX_TOTAL                    1134
+#define IDC_AX_DELETE                   1135
+#define IDC_AX_DELALL                   1136
 #define ID_EXIT                         40001
 #define ID_OPEN                         40002
 #define ID_SAVEAS                       40003
@@ -187,6 +192,7 @@
 #define ID_THEME_DARK                   40106
 #define ID_COMPAREAI                    40107
 #define ID_AIFOLDER                     40108
+#define ID_AIINDEX                      40109
 
 // Next default values for new objects
 //
