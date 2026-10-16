@@ -2893,7 +2893,7 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	if(thumbW) SetRect(&g_aipSplit.rc[2], editX+setW, y, editX+setW+gap, y+setH);
 	else SetRectEmpty(&g_aipSplit.rc[2]);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SETTINGS),NULL,editX,y,setW,setH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_THUMB),NULL,editX+editW-thumbW,y,thumbW?thumbW:1,setH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_THUMB),NULL,editX+editW-thumbW,y,thumbW?thumbW:1,setH,SWP_NOZORDER|SWP_NOCOPYBITS);
 	ShowWindow(GetDlgItem(hwnd,IDC_AIP_THUMB), thumbW ? SW_SHOW : SW_HIDE);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYSET),NULL,copyX,y,copyW,copyH,SWP_NOZORDER);
 
@@ -2904,6 +2904,9 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_PREV),NULL,m,bottomY,navW,btnH,SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_NEXT),NULL,m+navW+gap,bottomY,navW,btnH,SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_EXPLORER),NULL,m+2*(navW+gap),bottomY,110,btnH,SWP_NOZORDER);
+	// Moved controls keep stale pixels (the owner-drawn thumbnail only paints what is newly
+	// exposed), so repaint everything after a layout pass.
+	RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
 }
 
 static void twpng_SaveAIJson(HWND hwnd, struct aiparams_ctx *c);
