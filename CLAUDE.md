@@ -143,11 +143,20 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
   text and appends `extra` (container info such as the MP4 video size) to the settings.
   Showing again while the viewer is open updates it in place (new ctx swapped in). The
   ctx remembers the source `path` and whether it is the open document (`isDoc`).
-  - **Prev / Next** (`twpng_AIParamsNavigate`): steps through the supported files in the
-    same folder (`twpng_ListSiblings`, natural sort via `StrCmpLogicalW`); the title shows
-    the position. For the open document it opens the next file as the document, with
+  - **Prev / Next** (`twpng_AIParamsNavigate`, also Alt+Left/Right and Ctrl+PageUp/Down
+    via `twpng_AIParamsKey` in the message loop): steps through the supported files in
+    the same folder; the title shows the position. The listing (`twpng_ListDir`, natural
+    sort via `StrCmpLogicalW`) is cached in `g_sib` and built on a background thread
+    (`WM_APP_SIBLINGS` back to the main window), because folders can hold 20k+ files on
+    slow network drives. `twpng_GetSiblings` re-lists when the folder changes (its
+    last-write time), the list is older than 5 minutes, the file is missing from it, or
+    F5 is pressed; the old list stays usable meanwhile. For the open document it opens the next file as the document, with
     `g_keepAIView` set so the document change doesn't close the viewer; otherwise it just
     reads the next file (`twpng_ReadAnyAIParams`).
+  - **Thumbnail**: `twpng_RequestThumb` asks the shell (`IShellItemImageFactory`,
+    `SIIGBF_THUMBNAILONLY`) for Explorer's thumbnail on a background thread and posts it
+    back (`WM_APP_THUMB`); a generation counter drops results for files no longer shown.
+    It is owner-drawn (`IDC_AIP_THUMB`) right of the settings box.
   - **Save JSON** writes `ctx->full` as UTF-8 when it is JSON (the ComfyUI graph), so it
     can be loaded back into ComfyUI. Parser `twpng_ParseA1111` splits on the
   `Negative prompt:` and `Steps:` line markers; `twpng_SettingsToLines` reformats the

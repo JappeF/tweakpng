@@ -483,12 +483,19 @@ For video workflows it adds:
 - FPS, and Frames where the graph has a fixed count
 - Video size, Frames and Duration as stored in the MP4/MOV file itself
 
+Next to the settings the viewer shows the file's thumbnail (the same one
+Explorer shows; for videos a frame from the video). It loads in the
+background, so on a slow drive it can appear a moment later.
+
 Buttons at the bottom:
 
 - < Prev / Next >: show the previous or next image or video in the same
   folder (in Explorer's name order). The title bar shows the position, for
   example "shot_15_00001_.mp4 (41/44)". When the viewer belongs to the
-  open document, the main window follows along.
+  open document, the main window follows along. Keyboard: Alt+Left /
+  Alt+Right or Ctrl+PageUp / Ctrl+PageDown. Large folders (also on network
+  drives) are listed in the background, and the list is kept, so browsing
+  stays fast; press F5 to read the folder again.
 - Save JSON...: saves the ComfyUI graph as a .json file, which can be
   loaded back into ComfyUI.
 - Copy All: copies the complete metadata text.

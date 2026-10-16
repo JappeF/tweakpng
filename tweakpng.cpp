@@ -53,6 +53,8 @@
 #include <vssym32.h>
 #include <shlwapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
+#pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
 #include "resource.h"
@@ -114,6 +116,9 @@ static void twpng_CloseAIParamsView();
 static int  twpng_ShowAIParams(const TCHAR *text, const TCHAR *extra, const TCHAR *path, BOOL isDoc);
 static int  twpng_ReadMp4VideoInfo(const TCHAR *fn, TCHAR *out, int cap);
 static int  OkToClosePNG();
+static BOOL twpng_AIParamsKey(const MSG *m);
+#define WM_APP_SIBLINGS (WM_APP+21)
+#define WM_APP_THUMB    (WM_APP+22)
 static int  cf_skip_ws(const TCHAR *s, int i, int len);
 static int  twpng_ReadJpegAIParams(const TCHAR *fn, TCHAR **outText);
 static int  twpng_ReadWebpAIParams(const TCHAR *fn, TCHAR **outText);
@@ -1636,6 +1641,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 
 	while(GetMessage(&msg,NULL,0,0)){
 		if(twpng_IsModelessEditorMessage(&msg)) continue;
+		if(g_hwndAIParams && twpng_AIParamsKey(&msg)) continue;
 		if(g_hwndAIParams && IsDialogMessage(g_hwndAIParams,&msg)) continue;
 		if (!TranslateAccelerator(globals.hwndMain, hAccTable, &msg)) {
 			TranslateMessage(&msg);
@@ -2407,6 +2413,10 @@ struct aiparams_ctx {
 	TCHAR *setRaw;  // settings line, original single line (NULL if none)
 	TCHAR path[MAX_PATH];  // file the parameters came from
 	BOOL isDoc;     // path is the open document, so browsing opens the next file as one
+	HBITMAP thumb;  // Explorer thumbnail, arrives later from a background thread
+	int thumbW, thumbH;
+	BOOL thumbAlpha;
+	LONG thumbGen;
 };
 
 static void twpng_ParseA1111(const TCHAR *full, struct aiparams_ctx *c)
@@ -2436,6 +2446,7 @@ static void twpng_FreeAIParamsCtx(struct aiparams_ctx *c)
 {
 	if(!c) return;
 	free(c->full); free(c->pos); free(c->neg); free(c->setRaw);
+	if(c->thumb) DeleteObject(c->thumb);
 	free(c);
 }
 
@@ -2472,18 +2483,14 @@ static void twpng_FreeList(TCHAR **list, int n)
 	free(list);
 }
 
-// Supported files in the folder of `fn`, in Explorer order. *outIdx is fn's index or -1.
-static int twpng_ListSiblings(const TCHAR *fn, TCHAR ***outList, int *outIdx)
+// Supported files in `dir` (ending in a backslash), in Explorer order.
+static int twpng_ListDir(const TCHAR *dir, TCHAR ***outList)
 {
-	*outList = NULL; *outIdx = -1;
-	TCHAR dir[MAX_PATH], pat[MAX_PATH];
-	StringCchCopy(dir, MAX_PATH, fn);
-	TCHAR *sl = _tcsrchr(dir, _T('\\'));
-	if(!sl) return 0;
-	sl[1] = 0;
+	*outList = NULL;
+	TCHAR pat[MAX_PATH];
 	StringCchPrintf(pat, MAX_PATH, _T("%s*"), dir);
 	WIN32_FIND_DATA fd;
-	HANDLE h = FindFirstFile(pat, &fd);
+	HANDLE h = FindFirstFileEx(pat, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
 	if(h==INVALID_HANDLE_VALUE) return 0;
 	TCHAR **list = NULL;
 	int n = 0, cap = 0;
@@ -2491,7 +2498,7 @@ static int twpng_ListSiblings(const TCHAR *fn, TCHAR ***outList, int *outIdx)
 		if((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !twpng_IsBrowsableFile(fd.cFileName))
 			continue;
 		if(n==cap) {
-			cap = cap ? cap*2 : 64;
+			cap = cap ? cap*2 : 256;
 			TCHAR **nl = (TCHAR**)realloc(list, (size_t)cap*sizeof(TCHAR*));
 			if(!nl) break;
 			list = nl;
@@ -2502,9 +2509,91 @@ static int twpng_ListSiblings(const TCHAR *fn, TCHAR ***outList, int *outIdx)
 	} while(FindNextFile(h, &fd));
 	FindClose(h);
 	if(n) qsort(list, n, sizeof(TCHAR*), twpng_CmpNames);
-	for(int i=0; i<n; i++) if(!lstrcmpi(list[i], fn)) *outIdx = i;
 	*outList = list;
 	return n;
+}
+
+// The folder listing is cached and rebuilt on a background thread: a folder can hold tens
+// of thousands of files, on a network drive that takes seconds to list.
+struct twpng_sibjob { TCHAR dir[MAX_PATH]; TCHAR **list; int n; FILETIME stamp; };
+static struct {
+	TCHAR dir[MAX_PATH];
+	TCHAR **list;
+	int n;
+	FILETIME stamp;       // the folder's last-write time when it was listed
+	ULONGLONG tick;       // when it was listed
+	BOOL loading;
+} g_sib;
+
+static BOOL twpng_DirStamp(const TCHAR *dir, FILETIME *ft)
+{
+	WIN32_FILE_ATTRIBUTE_DATA fa;
+	if(!GetFileAttributesEx(dir, GetFileExInfoStandard, &fa)) return FALSE;
+	*ft = fa.ftLastWriteTime;
+	return TRUE;
+}
+
+static DWORD WINAPI twpng_SibThread(LPVOID p)
+{
+	struct twpng_sibjob *j = (struct twpng_sibjob*)p;
+	twpng_DirStamp(j->dir, &j->stamp);   // before listing, so a change meanwhile shows up next time
+	j->n = twpng_ListDir(j->dir, &j->list);
+	if(!PostMessage(globals.hwndMain, WM_APP_SIBLINGS, 0, (LPARAM)j)) {
+		twpng_FreeList(j->list, j->n);
+		free(j);
+	}
+	return 0;
+}
+
+static void twpng_StartSibListing(const TCHAR *dir)
+{
+	if(g_sib.loading) return;   // one at a time; the result handler re-checks the viewer
+	struct twpng_sibjob *j = (struct twpng_sibjob*)calloc(1, sizeof(struct twpng_sibjob));
+	if(!j) return;
+	StringCchCopy(j->dir, MAX_PATH, dir);
+	HANDLE th = CreateThread(NULL, 0, twpng_SibThread, j, 0, NULL);
+	if(th) { CloseHandle(th); g_sib.loading = TRUE; }
+	else free(j);
+}
+
+// Called on the main thread when a listing is done.
+static void twpng_SibListingDone(struct twpng_sibjob *j)
+{
+	twpng_FreeList(g_sib.list, g_sib.n);
+	StringCchCopy(g_sib.dir, MAX_PATH, j->dir);
+	g_sib.list = j->list;
+	g_sib.n = j->n;
+	g_sib.stamp = j->stamp;
+	g_sib.tick = GetTickCount64();
+	g_sib.loading = FALSE;
+	free(j);
+}
+
+// Cached list of the supported files next to `fn` (owned by the cache, valid until the
+// next listing arrives). Starts a background re-list when the folder is new, changed or
+// the list is old; returns 0 while the first listing of a folder is still running.
+static int twpng_GetSiblings(const TCHAR *fn, TCHAR ***outList, int *outIdx, BOOL force)
+{
+	*outList = NULL; *outIdx = -1;
+	TCHAR dir[MAX_PATH];
+	StringCchCopy(dir, MAX_PATH, fn);
+	TCHAR *sl = _tcsrchr(dir, _T('\\'));
+	if(!sl) return 0;
+	sl[1] = 0;
+	BOOL same = g_sib.list && !lstrcmpi(dir, g_sib.dir);
+	int idx = -1;
+	if(same) for(int i=0; i<g_sib.n; i++) if(!lstrcmpi(g_sib.list[i], fn)) { idx = i; break; }
+	ULONGLONG age = GetTickCount64() - g_sib.tick;
+	BOOL stale = force || !same || age > 5*60*1000 || (idx<0 && age > 3000);
+	if(!stale) {
+		FILETIME ft;
+		if(twpng_DirStamp(dir, &ft) && CompareFileTime(&ft, &g_sib.stamp)) stale = TRUE;
+	}
+	if(stale) twpng_StartSibListing(dir);
+	if(!same) return 0;
+	*outList = g_sib.list;
+	*outIdx = idx;
+	return g_sib.n;
 }
 
 // Title shows the file and its position in the folder; Prev/Next enable at the ends.
@@ -2513,11 +2602,13 @@ static void twpng_UpdateAINav(HWND hwnd, struct aiparams_ctx *c)
 	TCHAR title[MAX_PATH+80];
 	TCHAR **list = NULL;
 	int idx = -1, n = 0;
-	if(c->path[0]) n = twpng_ListSiblings(c->path, &list, &idx);
+	if(c->path[0]) n = twpng_GetSiblings(c->path, &list, &idx, FALSE);
 	const TCHAR *base = _tcsrchr(c->path, _T('\\'));
 	base = base ? base+1 : c->path;
 	if(base[0] && idx>=0)
 		StringCchPrintf(title, MAX_PATH+80, _T("AI Generation Parameters - %s (%d/%d)"), base, idx+1, n);
+	else if(base[0] && g_sib.loading)
+		StringCchPrintf(title, MAX_PATH+80, _T("AI Generation Parameters - %s (listing folder...)"), base);
 	else if(base[0])
 		StringCchPrintf(title, MAX_PATH+80, _T("AI Generation Parameters - %s"), base);
 	else
@@ -2525,7 +2616,103 @@ static void twpng_UpdateAINav(HWND hwnd, struct aiparams_ctx *c)
 	SetWindowText(hwnd, title);
 	EnableWindow(GetDlgItem(hwnd,IDC_AIP_PREV), idx>0);
 	EnableWindow(GetDlgItem(hwnd,IDC_AIP_NEXT), idx>=0 && idx<n-1);
-	twpng_FreeList(list, n);
+}
+
+// ---- Thumbnail ------------------------------------------------------------------------
+
+static volatile LONG g_thumbGen = 0;
+struct twpng_thumbjob { TCHAR path[MAX_PATH]; LONG gen; HBITMAP bmp; };
+
+static DWORD WINAPI twpng_ThumbThread(LPVOID p)
+{
+	struct twpng_thumbjob *j = (struct twpng_thumbjob*)p;
+	if(j->gen == g_thumbGen) {   // skip it if another file was shown meanwhile
+		HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+		IShellItemImageFactory *f = NULL;
+		if(SUCCEEDED(SHCreateItemFromParsingName(j->path, NULL, IID_PPV_ARGS(&f)))) {
+			SIZE sz = { 512, 512 };
+			if(FAILED(f->GetImage(sz, SIIGBF_RESIZETOFIT | SIIGBF_THUMBNAILONLY, &j->bmp))) j->bmp = NULL;
+			f->Release();
+		}
+		if(SUCCEEDED(hr)) CoUninitialize();
+	}
+	if(!j->bmp || !PostMessage(globals.hwndMain, WM_APP_THUMB, 0, (LPARAM)j)) {
+		if(j->bmp) DeleteObject(j->bmp);
+		free(j);
+	}
+	return 0;
+}
+
+// Ask the shell (Explorer's thumbnail cache) for the file's thumbnail in the background.
+static void twpng_RequestThumb(struct aiparams_ctx *c)
+{
+	c->thumbGen = InterlockedIncrement(&g_thumbGen);
+	if(!c->path[0]) return;
+	struct twpng_thumbjob *j = (struct twpng_thumbjob*)calloc(1, sizeof(struct twpng_thumbjob));
+	if(!j) return;
+	StringCchCopy(j->path, MAX_PATH, c->path);
+	j->gen = c->thumbGen;
+	HANDLE th = CreateThread(NULL, 0, twpng_ThumbThread, j, 0, NULL);
+	if(th) CloseHandle(th); else free(j);
+}
+
+static void twpng_LayoutAIParams(HWND hwnd);
+
+// Called on the main thread when a thumbnail is ready.
+static void twpng_ThumbDone(struct twpng_thumbjob *j)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(g_hwndAIParams && c && c->thumbGen==j->gen && !c->thumb) {
+		DIBSECTION ds;
+		ZeroMemory(&ds, sizeof(ds));
+		if(GetObject(j->bmp, sizeof(ds), &ds) >= (int)sizeof(BITMAP) && ds.dsBm.bmWidth>0) {
+			c->thumb = j->bmp;
+			j->bmp = NULL;
+			c->thumbW = ds.dsBm.bmWidth;
+			c->thumbH = ds.dsBm.bmHeight<0 ? -ds.dsBm.bmHeight : ds.dsBm.bmHeight;
+			// Only blend when the alpha channel is really used; many thumbnails leave it 0.
+			if(ds.dsBm.bmBitsPixel==32 && ds.dsBm.bmBits) {
+				const BYTE *px = (const BYTE*)ds.dsBm.bmBits;
+				size_t cnt = (size_t)c->thumbW * c->thumbH;
+				BOOL some = FALSE, partial = FALSE;
+				for(size_t i=0; i<cnt; i++) {
+					BYTE a = px[i*4+3];
+					if(a) some = TRUE;
+					if(a!=255) partial = TRUE;
+				}
+				c->thumbAlpha = some && partial;
+			}
+			twpng_LayoutAIParams(g_hwndAIParams);
+			InvalidateRect(GetDlgItem(g_hwndAIParams, IDC_AIP_THUMB), NULL, TRUE);
+		}
+	}
+	if(j->bmp) DeleteObject(j->bmp);
+	free(j);
+}
+
+static void twpng_DrawThumb(const DRAWITEMSTRUCT *d, const struct aiparams_ctx *c)
+{
+	RECT r = d->rcItem;
+	FillRect(d->hDC, &r, globals.hUiBgBrush ? globals.hUiBgBrush : GetSysColorBrush(COLOR_BTNFACE));
+	if(!c || !c->thumb || c->thumbW<=0 || c->thumbH<=0) return;
+	int w = r.right-r.left, h = r.bottom-r.top;
+	int dw = w, dh = MulDiv(w, c->thumbH, c->thumbW);
+	if(dh > h) { dh = h; dw = MulDiv(h, c->thumbW, c->thumbH); }
+	int x = r.right - dw, y = r.top;   // top-right, next to the settings text
+	HDC mdc = CreateCompatibleDC(d->hDC);
+	HGDIOBJ old = SelectObject(mdc, c->thumb);
+	BOOL done = FALSE;
+	if(c->thumbAlpha) {
+		BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+		done = AlphaBlend(d->hDC, x, y, dw, dh, mdc, 0, 0, c->thumbW, c->thumbH, bf);
+	}
+	if(!done) {
+		SetStretchBltMode(d->hDC, HALFTONE);
+		SetBrushOrgEx(d->hDC, 0, 0, NULL);
+		StretchBlt(d->hDC, x, y, dw, dh, mdc, 0, 0, c->thumbW, c->thumbH, SRCCOPY);
+	}
+	SelectObject(mdc, old);
+	DeleteDC(mdc);
 }
 
 static void twpng_FillAIParams(HWND hwnd, struct aiparams_ctx *c)
@@ -2583,7 +2770,17 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	y+=negH+gap;
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_LBLSET),NULL,editX,y,editW,labelH,SWP_NOZORDER);
 	y+=labelH;
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SETTINGS),NULL,editX,y,editW,setH,SWP_NOZORDER);
+	// The thumbnail sits right of the settings, as tall as the box and at most half as wide.
+	struct aiparams_ctx *c = (struct aiparams_ctx*)GetWindowLongPtr(hwnd,DWLP_USER);
+	int thumbW = 0;
+	if(c && c->thumb && c->thumbH>0) {
+		thumbW = MulDiv(setH, c->thumbW, c->thumbH);
+		if(thumbW > editW/2) thumbW = editW/2;
+	}
+	int setW = thumbW ? editW-thumbW-gap : editW;
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SETTINGS),NULL,editX,y,setW,setH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_THUMB),NULL,editX+editW-thumbW,y,thumbW?thumbW:1,setH,SWP_NOZORDER);
+	ShowWindow(GetDlgItem(hwnd,IDC_AIP_THUMB), thumbW ? SW_SHOW : SW_HIDE);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYSET),NULL,copyX,y,copyW,copyH,SWP_NOZORDER);
 
 	int closeX=W-m-copyW, copyAllX=closeX-gap-58, saveX=copyAllX-gap-84, navW=64;
@@ -2625,6 +2822,14 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			mm->ptMinTrackSize.y=300;
 			return 0;
 		}
+
+	case WM_DRAWITEM:
+		if(wParam==IDC_AIP_THUMB) {
+			twpng_DrawThumb((const DRAWITEMSTRUCT*)lParam, c);
+			SetWindowLongPtr(hwnd, DWLP_MSGRESULT, TRUE);
+			return TRUE;
+		}
+		break;
 
 	case WM_EXITSIZEMOVE:
 	case WM_DESTROY:
@@ -2670,9 +2875,6 @@ static void twpng_CloseAIParamsView()
 	if(g_hwndAIParams && !g_keepAIView) DestroyWindow(g_hwndAIParams);
 }
 
-// Show the parsed viewer, or update it in place if it is already open. `text` may be NULL
-// for a file without AI parameters; `extra` is appended to the settings (container info
-// such as the video size). Returns 1 on success.
 // Parsed parameters for `text` (may be NULL), with `extra` appended to the settings.
 static struct aiparams_ctx *twpng_BuildAICtx(const TCHAR *text, const TCHAR *extra)
 {
@@ -2697,12 +2899,16 @@ static struct aiparams_ctx *twpng_BuildAICtx(const TCHAR *text, const TCHAR *ext
 	return c;
 }
 
+// Show the parsed viewer, or update it in place if it is already open. `text` may be NULL
+// for a file without AI parameters; `extra` is appended to the settings (container info
+// such as the video size). Returns 1 on success.
 static int twpng_ShowAIParams(const TCHAR *text, const TCHAR *extra, const TCHAR *path, BOOL isDoc)
 {
 	struct aiparams_ctx *c = twpng_BuildAICtx(text, extra);
 	if(!c) return 0;
 	if(path) StringCchCopy(c->path, MAX_PATH, path);
 	c->isDoc = isDoc;
+	twpng_RequestThumb(c);
 
 	if(g_hwndAIParams) {
 		struct aiparams_ctx *old = g_aiParamsCtx;
@@ -2821,11 +3027,10 @@ static void twpng_AIParamsNavigate(int dir)
 	struct aiparams_ctx *c = g_aiParamsCtx;
 	if(!c || !c->path[0]) return;
 	TCHAR **list;
-	int idx, n = twpng_ListSiblings(c->path, &list, &idx);
-	if(idx<0 || idx+dir<0 || idx+dir>=n) { twpng_FreeList(list, n); return; }
+	int idx, n = twpng_GetSiblings(c->path, &list, &idx, FALSE);
+	if(idx<0 || idx+dir<0 || idx+dir>=n) return;
 	TCHAR next[MAX_PATH];
 	StringCchCopy(next, MAX_PATH, list[idx+dir]);
-	twpng_FreeList(list, n);
 
 	BOOL isDoc = c->isDoc;   // c may be replaced while the next file opens
 	TCHAR *text = NULL, extra[200] = _T("");
@@ -2841,6 +3046,27 @@ static void twpng_AIParamsNavigate(int dir)
 	}
 	twpng_ShowAIParams(text, extra, next, isDoc);
 	free(text);
+}
+
+// Viewer shortcuts: Alt+Left/Right and Ctrl+PageUp/PageDown browse, F5 re-reads the folder.
+static BOOL twpng_AIParamsKey(const MSG *m)
+{
+	if(m->message!=WM_KEYDOWN && m->message!=WM_SYSKEYDOWN) return FALSE;
+	if(m->hwnd!=g_hwndAIParams && !IsChild(g_hwndAIParams, m->hwnd)) return FALSE;
+	BOOL alt = (GetKeyState(VK_MENU) & 0x8000)!=0, ctrl = (GetKeyState(VK_CONTROL) & 0x8000)!=0;
+	int dir = 0;
+	if(alt && !ctrl && m->wParam==VK_LEFT) dir = -1;
+	else if(alt && !ctrl && m->wParam==VK_RIGHT) dir = 1;
+	else if(ctrl && !alt && m->wParam==VK_PRIOR) dir = -1;
+	else if(ctrl && !alt && m->wParam==VK_NEXT) dir = 1;
+	if(dir) { twpng_AIParamsNavigate(dir); return TRUE; }
+	if(m->wParam==VK_F5 && !alt && !ctrl && g_aiParamsCtx && g_aiParamsCtx->path[0]) {
+		TCHAR **list; int idx;
+		twpng_GetSiblings(g_aiParamsCtx->path, &list, &idx, TRUE);
+		twpng_UpdateAINav(g_hwndAIParams, g_aiParamsCtx);
+		return TRUE;
+	}
+	return FALSE;
 }
 
 // Save the ComfyUI graph JSON (UTF-8) so it can be loaded back into ComfyUI.
@@ -6418,6 +6644,15 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			SetTextColor((HDC)wParam,GetSysColor(COLOR_WINDOWTEXT));
 			return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
 		}
+		return 0;
+
+	case WM_APP_SIBLINGS:
+		twpng_SibListingDone((struct twpng_sibjob*)lParam);
+		if(g_hwndAIParams && g_aiParamsCtx) twpng_UpdateAINav(g_hwndAIParams, g_aiParamsCtx);
+		return 0;
+
+	case WM_APP_THUMB:
+		twpng_ThumbDone((struct twpng_thumbjob*)lParam);
 		return 0;
 
 	case WM_SETTINGCHANGE:

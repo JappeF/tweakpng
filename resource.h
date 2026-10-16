@@ -101,6 +101,7 @@
 #define IDC_ADDAIMENU                   1116
 #define IDC_CMP_TEXT                    1117
 #define IDC_CMP_COPY                    1118
+#define IDC_AIP_THUMB                   1119
 #define ID_EXIT                         40001
 #define ID_OPEN                         40002
 #define ID_SAVEAS                       40003
