@@ -508,6 +508,31 @@ Pick any supported image or video and show its parameters in the viewer
 without opening it as the current document.
 
 
+Tools > Folder Overview
+-----------------------
+
+Lists every image and video in a folder with its seed, model, mode,
+duration and prompt. Opens for the folder of the current file (or asks for
+one); Ctrl+F in the AI parameters viewer opens it with the search box
+ready.
+
+- Search: type words to filter the list. Every word must appear in the
+  file name, the prompt, the negative prompt or the settings, for example
+  "canonical_egg" or "saito rain".
+- Double-click a row to open that file in the viewer.
+- Export CSV...: saves the rows that are shown as a CSV file for Excel or
+  a spreadsheet: file, prompt, negative prompt, one column per common
+  setting, and the remaining settings in "Other settings".
+- Change... picks another folder, Rescan reads the folder again.
+
+The folder is scanned in the background with a progress bar and a Stop
+button, and only the part of each file that holds the metadata is read.
+The results are kept in an index (in %LOCALAPPDATA%\TweakPNG\index), so the
+next time only new or changed files are read: a folder with 22,000 files
+then opens in well under a second. On a network or cloud drive the first
+scan takes longer, as every file is fetched over the network.
+
+
 Tools > Compare AI Parameters
 -----------------------------
 

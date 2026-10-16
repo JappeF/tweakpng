@@ -255,6 +255,34 @@ metadata-only path so AI prompts can be inspected.
   since graphs often compute these (ResolutionSelector, math nodes) instead of storing
   them.
 
+## Folder overview (search and CSV)
+
+Tools > Folder Overview (`ID_AIFOLDER`, also Ctrl+F in the viewer) opens the modeless,
+unowned `DLG_AIFOLDER` (`DlgProcAIFolder`, `g_hwndAIFolder`, routed in the message loop
+like the viewer). It lists every supported file of a folder in a virtual list view
+(`LVS_OWNERDATA`, text from `LVN_GETDISPINFO`; `twpng_FindSetting` pulls single values
+out of a settings line), filtered by the search box (every word must appear in the file
+name, prompts or settings; 250 ms debounce timer), double-click opens the file in the
+viewer (`twpng_OpenInViewer`), and Export CSV writes the shown rows (UTF-8 with BOM,
+fixed columns for the common settings plus "Other settings").
+
+- **Scan** (`twpng_ScanThread`, one `struct twpng_scan` per run, ref-counted between the
+  dialog and the worker): lists the folder with sizes and times, allocates all records
+  up front (so the UI can read `recs[0..done)` without locks while the worker fills the
+  rest), and posts `WM_APP_SCAN` progress about every 100 ms. Stop / closing the dialog
+  only sets `cancel`; the worker frees the scan when it ends.
+- **Metadata-only reads** (`twpng_ScanFileAI`, no UI, worker-safe): PNG text chunks with
+  IDAT skipped by seeking (`twpng_ScanPngAIText`, iTXt/zTXt via `twpng_Inflate`), the
+  first 2 MB of a JPEG, WebP chunk headers up to `EXIF`, and the MP4 `moov` readers.
+  Results are parsed with `twpng_BuildAICtx` like the viewer does.
+- **Index** (`twpng_LoadIndex` / `twpng_SaveIndex`): `%LOCALAPPDATA%\TweakPNG\index\<FNV-1a
+  of the folder path>.idx`, a binary file (magic `TWAI`, version 1) with per file name,
+  size, last-write time and the parsed prompt / negative / settings in UTF-8. A file is
+  only read again when its size or time changed. A stopped scan still saves what it has,
+  plus the old records of files it didn't reach.
+- Measured: 22,000 local files take about 3.4 s the first time and 0.2 s from the index;
+  on RaiDrive (cloud WebDAV) a first read costs about 50 ms per video.
+
 ## Explorer menu and `/aiparams`
 
 `tweakpng.exe /aiparams "<file>"` starts with the main window hidden and shows only the

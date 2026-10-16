@@ -29,6 +29,10 @@ Civitai):
   ComfyUI. Settings include LoRAs, and for videos the real size, frame count and duration.
 - **Read AI parameters from File** (Tools menu) - one-shot file picker that opens the
   parsed viewer without loading the file as a document.
+- **Folder Overview** (Tools menu, or Ctrl+F in the viewer) - all images and videos of a
+  folder in one list with seed, model, mode, duration and prompt, a search box, and
+  Export CSV. Scans in the background with a progress bar and keeps an index, so a folder
+  with 22,000 files opens in well under a second the second time.
 - **Compare AI Parameters** (Tools menu) - shows what changed between two files: settings
   side by side and a word-level diff of the prompts.
 - **Strip AI Metadata** (Edit menu) - removes prompt/seed/workflow/EXIF metadata so a file

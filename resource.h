@@ -102,6 +102,18 @@
 #define IDC_CMP_TEXT                    1117
 #define IDC_CMP_COPY                    1118
 #define IDC_AIP_THUMB                   1119
+#define IDC_AF_PATH                     1120
+#define IDC_AF_CHANGE                   1121
+#define IDC_AF_SEARCH                   1122
+#define IDC_AF_COUNT                    1123
+#define IDC_AF_PROGRESS                 1124
+#define IDC_AF_STATUS                   1125
+#define IDC_AF_STOP                     1126
+#define IDC_AF_LIST                     1127
+#define IDC_AF_EXPORT                   1128
+#define IDC_AF_LBLSEARCH                1129
+#define IDC_AF_LBLFOLDER                1130
+#define IDC_AF_RESCAN                   1131
 #define ID_EXIT                         40001
 #define ID_OPEN                         40002
 #define ID_SAVEAS                       40003
@@ -174,6 +186,7 @@
 #define ID_THEME_LIGHT                  40105
 #define ID_THEME_DARK                   40106
 #define ID_COMPAREAI                    40107
+#define ID_AIFOLDER                     40108
 
 // Next default values for new objects
 //

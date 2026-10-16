@@ -167,6 +167,7 @@ struct windowprefs_struct {
 	// New members must be appended at the end (saved as a binary blob; older saved
 	// data simply lacks the tail, which keeps its default).
 	struct windowpos_struct aiparams;
+	struct windowpos_struct aifolder;
 };
 
 #define MAX_TOOL_NAME   80
