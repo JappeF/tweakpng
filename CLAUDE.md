@@ -38,7 +38,7 @@ The default build links `libpng` and `zlib`, expected as **sibling directories**
 repo root (`..\..\..\libpng`, `..\..\..\zlib`) with prebuilt `.lib`s under
 `Debug32`/`Release32`/`Debug64`/`Release64`. Also links `comctl32.lib` and `uxtheme.lib`, plus
 (via `#pragma comment` in `tweakpng.cpp`) WIC, msimg32, shlwapi and Media Foundation
-(`mfplat.lib`, `mfuuid.lib`) for video playback.
+(`mfplat.lib`, `mfuuid.lib`, `mfreadwrite.lib`) and `winmm.lib` for video playback.
 
 Feature flags live in `twpng-config.h`:
 - `TWPNG_SUPPORT_VIEWER` — image viewer (needs libpng + zlib)
@@ -195,6 +195,17 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
     `twpng_VideoFileChanged` (from `twpng_ShowAIParams`) stops it or, if it was playing,
     starts the next file. Speed is `g_vidRate` percent (25..400, steps of 25) through
     `SetPlaybackRate`. Space toggles unless the focus is an Edit; -/+ always.
+  - **Video sound**: the engine time-stretches (pitch kept) with no way to turn that off,
+    so it is muted and the sound is played by us with the pitch following the speed.
+    `twpng_PcmThread` decodes the first audio track with `IMFSourceReader` to 16-bit PCM
+    (max 10 minutes, cached in `g_pcm` for the last file, posted back as `WM_APP_PCM`);
+    `twpng_AudioTryOpen` (once PCM and metadata are there) opens `waveOut` at the file's
+    rate with a pump thread (`CALLBACK_EVENT`, 5 x 25 ms buffers) that reads the PCM at
+    `step` = speed with linear interpolation, wrapping at the video's duration. The video
+    is the clock: `twpng_AudioSync` (150 ms host timer and engine events) follows
+    pause/play/speed and restarts the sound at the engine position on more than 0.1 s
+    drift, except within 0.5 s of the loop point, where the engine stalls briefly. If
+    decoding fails the engine's own sound is unmuted.
   - **Show in Explorer** (`IDC_AIP_EXPLORER`): `SHOpenFolderAndSelectItems`; an already
     open Explorer window on that folder is reused.
   - **Save JSON** writes `ctx->full` as UTF-8 when it is JSON (the ComfyUI graph), so it

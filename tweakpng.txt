@@ -502,8 +502,9 @@ folder there too; Esc, F11 or a middle click brings you back to the viewer.
 For a video the viewer has Play, - and + buttons. Play (or Space, when the
 focus is not in one of the text boxes) plays the video in place of the
 thumbnail, over and over, with its sound; press it again to pause. - and +
-(also the keys) change the speed in steps of 25%, from 25% to 400%;
-double-click the percentage to go back to 100%. While a video plays, Next
+(also the keys) change the speed in steps of 25%, from 25% to 400%; like
+a tape, the sound goes up or down in pitch with the speed. Double-click
+the percentage to go back to 100%. While a video plays, Next
 and Prev start the next one playing too, and the full-screen view takes
 the video along (Space, - and + work there as well).
 

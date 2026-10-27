@@ -57,9 +57,14 @@
 #include <wincodec.h>
 #include <mfapi.h>
 #include <mfmediaengine.h>
+#include <mfreadwrite.h>
+#include <mmsystem.h>
+#include <math.h>
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
@@ -146,6 +151,9 @@ static BOOL twpng_VideoAspect(int *w, int *h);
 static BOOL twpng_VideoPlaying();
 static void twpng_ThumbMouse(UINT msg);
 static void twpng_AIParamsNavigate(int dir);
+struct twpng_pcm;
+static void twpng_PcmDone(struct twpng_pcm *j);
+#define WM_APP_PCM      (WM_APP+26)
 #define WM_APP_SIBLINGS (WM_APP+21)
 #define WM_APP_THUMB    (WM_APP+22)
 static int  cf_skip_ws(const TCHAR *s, int i, int len);
@@ -3827,8 +3835,306 @@ static void twpng_VideoUI()
 	}
 }
 
+// ---- Video sound: our own playback, so a faster or slower speed shifts the pitch -------
+// The media engine time-stretches its sound (the pitch stays the same at any speed), and
+// there is no switch for that. So the audio track is decoded to 16-bit PCM in the
+// background (twpng_PcmThread, cached for the last file), the engine is muted, and the PCM
+// is played through waveOut, read at `rate` source frames per output frame like a tape.
+// The video stays the clock: twpng_AudioSync (on a timer and on every state change)
+// restarts the sound at the engine's position when it drifts more than 0.1 s.
+
+struct twpng_pcm {
+	TCHAR path[MAX_PATH];
+	LONG gen;
+	short *data;
+	UINT32 frames, ch, rate;
+	BOOL failed;          // no usable audio track: the engine plays its own sound
+};
+
+static struct twpng_pcm *g_pcm;        // decoded sound of g_pcm->path (or failed), or NULL
+static volatile LONG g_pcmGen = 0;
+
+#define TWPNG_NBUF 5
+#define TWPNG_BUFMS 25
+#define TWPNG_AUDIOTIMER 1
+
+static struct {
+	HWAVEOUT wo;
+	WAVEHDR hdr[TWPNG_NBUF];
+	HANDLE ev, th;
+	CRITICAL_SECTION cs;
+	BOOL csInit;
+	volatile LONG quit;
+	double pos;           // next source frame to write
+	double pos0;          // source frame at output sample 0 (since the last restart)
+	double step;          // source frames per output frame (the speed)
+	double loopLen;       // frames per loop: the video's duration
+	BOOL running;
+} g_aud;
+
+static DWORD WINAPI twpng_PcmThread(LPVOID p)
+{
+	struct twpng_pcm *j = (struct twpng_pcm*)p;
+	HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	IMFSourceReader *rd = NULL;
+	size_t cap = 0, used = 0;   // in shorts
+	j->failed = TRUE;
+	if(j->gen==g_pcmGen && SUCCEEDED(MFCreateSourceReaderFromURL(j->path, NULL, &rd))) {
+		IMFMediaType *mt = NULL, *cur = NULL;
+		BOOL ok = FALSE;
+		rd->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+		if(SUCCEEDED(rd->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE)) &&
+		   SUCCEEDED(MFCreateMediaType(&mt))) {
+			mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+			mt->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+			mt->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+			mt->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+			if(FAILED(rd->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, NULL, mt))) {
+				mt->DeleteItem(MF_MT_AUDIO_NUM_CHANNELS);
+				rd->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, NULL, mt);
+			}
+			mt->Release();
+			if(SUCCEEDED(rd->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, &cur))) {
+				GUID sub = GUID_NULL;
+				cur->GetGUID(MF_MT_SUBTYPE, &sub);
+				j->ch = MFGetAttributeUINT32(cur, MF_MT_AUDIO_NUM_CHANNELS, 0);
+				j->rate = MFGetAttributeUINT32(cur, MF_MT_AUDIO_SAMPLES_PER_SECOND, 0);
+				ok = sub==MFAudioFormat_PCM && MFGetAttributeUINT32(cur, MF_MT_AUDIO_BITS_PER_SAMPLE, 0)==16 &&
+				     j->ch>=1 && j->ch<=2 && j->rate>=8000;
+				cur->Release();
+			}
+		}
+		// At most 10 minutes; longer videos keep the engine's own sound.
+		size_t maxShorts = ok ? (size_t)j->rate * j->ch * 600 : 0;
+		while(ok && j->gen==g_pcmGen) {
+			DWORD flags = 0;
+			IMFSample *s = NULL;
+			if(FAILED(rd->ReadSample((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, NULL, &flags, NULL, &s))) { ok = FALSE; break; }
+			if(s) {
+				IMFMediaBuffer *b = NULL;
+				if(SUCCEEDED(s->ConvertToContiguousBuffer(&b))) {
+					BYTE *d = NULL;
+					DWORD len = 0;
+					if(SUCCEEDED(b->Lock(&d, NULL, &len))) {
+						size_t n = len/2;
+						if(used+n > maxShorts) ok = FALSE;
+						else {
+							if(used+n > cap) {
+								size_t nc = cap ? cap*2 : (size_t)j->rate*j->ch*16;
+								while(nc < used+n) nc *= 2;
+								short *nd = (short*)realloc(j->data, nc*sizeof(short));
+								if(!nd) ok = FALSE; else { j->data = nd; cap = nc; }
+							}
+							if(ok) { memcpy(j->data+used, d, n*sizeof(short)); used += n; }
+						}
+						b->Unlock();
+					}
+					b->Release();
+				}
+				s->Release();
+			}
+			if(flags & (MF_SOURCE_READERF_ENDOFSTREAM|MF_SOURCE_READERF_ERROR)) break;
+		}
+		rd->Release();
+		if(ok && used) { j->frames = (UINT32)(used / j->ch); j->failed = FALSE; }
+	}
+	if(SUCCEEDED(hr)) CoUninitialize();
+	if(j->failed) { free(j->data); j->data = NULL; j->frames = 0; }
+	if(!PostMessage(globals.hwndMain, WM_APP_PCM, 0, (LPARAM)j)) { free(j->data); free(j); }
+	return 0;
+}
+
+static void twpng_PcmFree(struct twpng_pcm *j)
+{
+	if(j) { free(j->data); free(j); }
+}
+
+static BOOL twpng_PcmFor(const TCHAR *path)
+{
+	return g_pcm && !lstrcmpi(g_pcm->path, path);
+}
+
+// Decode the sound of `path` unless it is cached or already being decoded.
+static void twpng_PcmRequest(const TCHAR *path)
+{
+	if(twpng_PcmFor(path)) return;
+	struct twpng_pcm *j = (struct twpng_pcm*)calloc(1, sizeof(struct twpng_pcm));
+	if(!j) return;
+	twpng_PcmFree(g_pcm);
+	g_pcm = NULL;
+	StringCchCopy(j->path, MAX_PATH, path);
+	j->gen = InterlockedIncrement(&g_pcmGen);   // an older decode still running is dropped
+	HANDLE th = CreateThread(NULL, 0, twpng_PcmThread, j, 0, NULL);
+	if(th) CloseHandle(th);
+	else free(j);
+}
+
+// Fill one waveOut buffer from the PCM at the current speed (linear interpolation).
+static void twpng_AudioFill(WAVEHDR *h)
+{
+	const struct twpng_pcm *pc = g_pcm;
+	int ch = (int)pc->ch;
+	short *o = (short*)h->lpData;
+	int n = (int)(h->dwBufferLength / (2*ch));
+	for(int i=0; i<n; i++) {
+		double p = g_aud.pos;
+		UINT32 i0 = (UINT32)p, i1 = i0+1;
+		double f = p - i0;
+		if(i1 >= (UINT32)g_aud.loopLen) i1 = 0;
+		for(int c=0; c<ch; c++) {
+			int s0 = i0 < pc->frames ? pc->data[(size_t)i0*ch+c] : 0;
+			int s1 = i1 < pc->frames ? pc->data[(size_t)i1*ch+c] : 0;
+			o[i*ch+c] = (short)(s0 + (s1-s0)*f);
+		}
+		g_aud.pos += g_aud.step;
+		if(g_aud.pos >= g_aud.loopLen) g_aud.pos -= g_aud.loopLen;
+	}
+}
+
+// Queue every buffer the device has finished with. Call with g_aud.cs held.
+static void twpng_AudioPump()
+{
+	for(int k=0; k<TWPNG_NBUF; k++) {
+		if(g_aud.hdr[k].dwFlags & WHDR_INQUEUE) continue;
+		twpng_AudioFill(&g_aud.hdr[k]);
+		waveOutWrite(g_aud.wo, &g_aud.hdr[k], sizeof(WAVEHDR));
+	}
+}
+
+static DWORD WINAPI twpng_AudioThread(LPVOID p)
+{
+	(void)p;
+	while(!g_aud.quit) {
+		WaitForSingleObject(g_aud.ev, 50);
+		EnterCriticalSection(&g_aud.cs);
+		if(g_aud.wo && g_aud.running) twpng_AudioPump();
+		LeaveCriticalSection(&g_aud.cs);
+	}
+	return 0;
+}
+
+static void twpng_AudioClose()
+{
+	if(!g_aud.wo) return;
+	g_aud.quit = 1;
+	SetEvent(g_aud.ev);
+	WaitForSingleObject(g_aud.th, 2000);
+	CloseHandle(g_aud.th);
+	waveOutReset(g_aud.wo);
+	for(int k=0; k<TWPNG_NBUF; k++) {
+		waveOutUnprepareHeader(g_aud.wo, &g_aud.hdr[k], sizeof(WAVEHDR));
+		free(g_aud.hdr[k].lpData);
+	}
+	waveOutClose(g_aud.wo);
+	CloseHandle(g_aud.ev);
+	g_aud.wo = NULL;
+	g_aud.running = FALSE;
+}
+
+// Start the sound from source frame `at` (paused if the video is paused).
+static void twpng_AudioRestart(double at, BOOL play)
+{
+	EnterCriticalSection(&g_aud.cs);
+	waveOutPause(g_aud.wo);
+	waveOutReset(g_aud.wo);
+	g_aud.step = g_vidRate/100.0;
+	if(at < 0) at = 0;
+	g_aud.pos = g_aud.pos0 = fmod(at, g_aud.loopLen);
+	g_aud.running = play;
+	if(play) {
+		twpng_AudioPump();
+		waveOutRestart(g_aud.wo);
+	}
+	LeaveCriticalSection(&g_aud.cs);
+}
+
+// Keep the sound with the video: follow pause/play and speed, resync on drift.
+static void twpng_AudioSync()
+{
+	if(!g_aud.wo || !g_vid.eng || !g_pcm) return;
+	BOOL play = !g_vid.eng->IsPaused();
+	double rate = g_pcm->rate;
+	double te = g_vid.eng->GetCurrentTime() * rate;
+	if(!play) {
+		if(g_aud.running) {
+			EnterCriticalSection(&g_aud.cs);
+			waveOutPause(g_aud.wo);
+			g_aud.running = FALSE;
+			LeaveCriticalSection(&g_aud.cs);
+		}
+		return;
+	}
+	double lead = 0.04 * rate * (g_vidRate/100.0);   // roughly the output latency
+	if(!g_aud.running || g_aud.step != g_vidRate/100.0) { twpng_AudioRestart(te+lead, TRUE); return; }
+	MMTIME mt;
+	mt.wType = TIME_SAMPLES;
+	if(waveOutGetPosition(g_aud.wo, &mt, sizeof(mt)) != MMSYSERR_NOERROR || mt.wType != TIME_SAMPLES) return;
+	double heard = fmod(g_aud.pos0 + mt.u.sample * g_aud.step, g_aud.loopLen);
+	te = fmod(te, g_aud.loopLen);
+	// The engine stalls a moment when it jumps back to the start; the sound just runs on
+	// through the loop point, so leave the half second around it alone.
+	double guard = 0.5 * rate;
+	if(guard > g_aud.loopLen/4) guard = g_aud.loopLen/4;
+	if(te < guard || te > g_aud.loopLen-guard || heard < guard || heard > g_aud.loopLen-guard) return;
+	double diff = heard - te;
+	if(diff > g_aud.loopLen/2) diff -= g_aud.loopLen;
+	if(diff < -g_aud.loopLen/2) diff += g_aud.loopLen;
+	if(fabs(diff) > 0.1*rate) twpng_AudioRestart(te+lead, TRUE);
+}
+
+// Open the sound device once both the PCM and the video's duration are known.
+static void twpng_AudioTryOpen()
+{
+	if(g_aud.wo || !g_vid.eng || !g_vid.vw || !twpng_PcmFor(g_vid.path)) return;
+	if(g_pcm->failed) { g_vid.eng->SetMuted(FALSE); return; }
+	if(!g_aud.csInit) { InitializeCriticalSection(&g_aud.cs); g_aud.csInit = TRUE; }
+	WAVEFORMATEX wf;
+	ZeroMemory(&wf, sizeof(wf));
+	wf.wFormatTag = WAVE_FORMAT_PCM;
+	wf.nChannels = (WORD)g_pcm->ch;
+	wf.nSamplesPerSec = g_pcm->rate;
+	wf.wBitsPerSample = 16;
+	wf.nBlockAlign = (WORD)(2*g_pcm->ch);
+	wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+	g_aud.ev = CreateEvent(NULL, FALSE, FALSE, NULL);
+	if(!g_aud.ev) return;
+	if(waveOutOpen(&g_aud.wo, WAVE_MAPPER, &wf, (DWORD_PTR)g_aud.ev, 0, CALLBACK_EVENT) != MMSYSERR_NOERROR) {
+		g_aud.wo = NULL;
+		CloseHandle(g_aud.ev);
+		g_vid.eng->SetMuted(FALSE);
+		return;
+	}
+	waveOutPause(g_aud.wo);
+	DWORD bytes = (g_pcm->rate * TWPNG_BUFMS / 1000) * wf.nBlockAlign;
+	for(int k=0; k<TWPNG_NBUF; k++) {
+		ZeroMemory(&g_aud.hdr[k], sizeof(WAVEHDR));
+		g_aud.hdr[k].lpData = (LPSTR)calloc(1, bytes);
+		g_aud.hdr[k].dwBufferLength = bytes;
+		waveOutPrepareHeader(g_aud.wo, &g_aud.hdr[k], sizeof(WAVEHDR));
+	}
+	double dur = g_vid.eng->GetDuration();
+	g_aud.loopLen = (dur > 0 && dur < 1e7) ? dur * g_pcm->rate : (double)g_pcm->frames;
+	if(g_aud.loopLen < 2) g_aud.loopLen = 2;
+	g_aud.running = FALSE;
+	g_aud.quit = 0;
+	g_aud.th = CreateThread(NULL, 0, twpng_AudioThread, NULL, 0, NULL);
+	g_vid.eng->SetMuted(TRUE);
+	SetTimer(g_vid.host, TWPNG_AUDIOTIMER, 150, NULL);
+	twpng_AudioSync();
+}
+
+// Called on the main thread when a decode is done.
+static void twpng_PcmDone(struct twpng_pcm *j)
+{
+	if(j->gen != g_pcmGen) { twpng_PcmFree(j); return; }
+	twpng_PcmFree(g_pcm);
+	g_pcm = j;
+	twpng_AudioTryOpen();
+}
+
 static void twpng_VideoStop()
 {
+	twpng_AudioClose();
 	if(!g_vid.eng) return;
 	IMFMediaEngine *eng = g_vid.eng;
 	HWND host = g_vid.host;
@@ -3849,6 +4155,9 @@ static void twpng_VideoStop()
 static void twpng_VideoShutdown()
 {
 	twpng_VideoStop();
+	InterlockedIncrement(&g_pcmGen);
+	twpng_PcmFree(g_pcm);
+	g_pcm = NULL;
 	if(g_mfStarted) { MFShutdown(); g_mfStarted = FALSE; }
 }
 
@@ -3864,11 +4173,18 @@ static void twpng_VideoEvent(DWORD ev)
 			HWND parent = GetParent(g_vid.host);
 			if(parent==g_hwndAIParams && g_aiParamsCtx && !g_aiParamsCtx->thumb) twpng_LayoutAIParams(parent);
 			else twpng_VideoPlace();
+			twpng_AudioTryOpen();
 		}
+		break;
+	case MF_MEDIA_ENGINE_EVENT_PAUSE:
+	case MF_MEDIA_ENGINE_EVENT_SEEKED:
+	case MF_MEDIA_ENGINE_EVENT_RATECHANGE:
+		twpng_AudioSync();
 		break;
 	case MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY:
 	case MF_MEDIA_ENGINE_EVENT_LOADEDDATA:
 	case MF_MEDIA_ENGINE_EVENT_PLAYING:
+		if(ev==MF_MEDIA_ENGINE_EVENT_PLAYING) twpng_AudioSync();
 		// Shown once there is a frame, so the thumbnail doesn't blink to black first.
 		if(!g_vid.shown) {
 			g_vid.shown = TRUE;
@@ -3915,6 +4231,9 @@ static LRESULT CALLBACK VideoHostProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 	case WM_APP_VIDEO:
 		if(hwnd==g_vid.host) twpng_VideoEvent((DWORD)wParam);
 		return 0;
+	case WM_TIMER:
+		if(wParam==TWPNG_AUDIOTIMER && hwnd==g_vid.host) twpng_AudioSync();
+		return 0;
 	}
 	return DefWindowProc(hwnd, msg, wParam, lParam);
 }
@@ -3958,6 +4277,8 @@ static void twpng_VideoStart(HWND parent, const TCHAR *path, double at, BOOL pla
 	if(SUCCEEDED(hr)) {
 		eng->SetLoop(TRUE);
 		eng->SetDefaultPlaybackRate(g_vidRate/100.0);
+		// Our own sound takes over once decoded; until then the engine's plays at 100%.
+		eng->SetMuted(g_vidRate!=100 || (twpng_PcmFor(path) && !g_pcm->failed));
 		BSTR url = SysAllocString(path);
 		hr = url ? eng->SetSource(url) : E_OUTOFMEMORY;
 		SysFreeString(url);
@@ -3976,6 +4297,7 @@ static void twpng_VideoStart(HWND parent, const TCHAR *path, double at, BOOL pla
 	g_vid.vw = g_vid.vh = 0;
 	g_vid.seek = at;
 	g_vid.shown = FALSE;
+	twpng_PcmRequest(path);
 	twpng_VideoPlace();
 	if(play) {
 		eng->Play();
@@ -4010,6 +4332,7 @@ static void twpng_VideoToggle()
 		g_vid.eng->SetPlaybackRate(g_vidRate/100.0);
 	}
 	else g_vid.eng->Pause();
+	twpng_AudioSync();
 	twpng_VideoUI();
 }
 
@@ -4023,7 +4346,10 @@ static void twpng_VideoSpeed(int dir)
 	if(g_vid.eng) {
 		g_vid.eng->SetDefaultPlaybackRate(r/100.0);
 		g_vid.eng->SetPlaybackRate(r/100.0);
+		// Not decoded (yet): rather silence than the engine's time-stretched sound.
+		if(!g_aud.wo) g_vid.eng->SetMuted(r!=100 && !(twpng_PcmFor(g_vid.path) && g_pcm->failed));
 	}
+	twpng_AudioSync();
 	twpng_VideoUI();
 }
 
@@ -8914,6 +9240,10 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 	case WM_APP_THUMB:
 		twpng_ThumbDone((struct twpng_thumbjob*)lParam);
+		return 0;
+
+	case WM_APP_PCM:
+		twpng_PcmDone((struct twpng_pcm*)lParam);
 		return 0;
 
 	case WM_SETTINGCHANGE:
