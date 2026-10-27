@@ -55,7 +55,11 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <wincodec.h>
+#include <mfapi.h>
+#include <mfmediaengine.h>
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
@@ -129,6 +133,19 @@ static int  twpng_ShowAIParams(const TCHAR *text, const TCHAR *extra, const TCHA
 static int  twpng_ReadMp4VideoInfo(const TCHAR *fn, TCHAR *out, int cap);
 static int  OkToClosePNG();
 static BOOL twpng_AIParamsKey(const MSG *m);
+static BOOL twpng_IsVideoPath(const TCHAR *path);
+static void twpng_VideoStop();
+static void twpng_VideoShutdown();
+static void twpng_VideoToggle();
+static void twpng_VideoSpeed(int dir);
+static void twpng_VideoFileChanged();
+static void twpng_VideoMoveTo(HWND parent);
+static void twpng_VideoPlace();
+static void twpng_VideoUI();
+static BOOL twpng_VideoAspect(int *w, int *h);
+static BOOL twpng_VideoPlaying();
+static void twpng_ThumbMouse(UINT msg);
+static void twpng_AIParamsNavigate(int dir);
 #define WM_APP_SIBLINGS (WM_APP+21)
 #define WM_APP_THUMB    (WM_APP+22)
 static int  cf_skip_ws(const TCHAR *s, int i, int len);
@@ -1675,7 +1692,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 
 	while(GetMessage(&msg,NULL,0,0)){
 		if(twpng_IsModelessEditorMessage(&msg)) continue;
-		if(g_hwndFull && msg.hwnd==g_hwndFull) {
+		if(g_hwndFull && (msg.hwnd==g_hwndFull || GetAncestor(msg.hwnd, GA_ROOT)==g_hwndFull)) {
 			TranslateMessage(&msg);
 			DispatchMessage(&msg);
 			continue;
@@ -1692,6 +1709,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 #ifdef TWPNG_SUPPORT_VIEWER
 	Viewer::GlobalDestroy();
 #endif
+	twpng_VideoShutdown();
 	BufferedPaintUnInit();
 	CoUninitialize();
 	return (int)msg.wParam;
@@ -2659,6 +2677,63 @@ static void twpng_UpdateAINav(HWND hwnd, struct aiparams_ctx *c)
 	EnableWindow(GetDlgItem(hwnd,IDC_AIP_NEXT), idx>=0 && idx<n-1);
 }
 
+// Video playback state (see "Video playback" below the full-screen view).
+class TwpngVideoNotify;
+static struct {
+	IMFMediaEngine *eng;
+	TwpngVideoNotify *nt;
+	HWND host;            // child window the engine renders into (viewer or full screen)
+	TCHAR path[MAX_PATH];
+	DWORD vw, vh;         // native video size, once the metadata is loaded
+	double seek;          // start position to apply once the metadata is loaded
+	BOOL shown;
+} g_vid;
+static int g_vidRate = 100;   // playback speed in percent, kept while browsing
+
+#define TWPNG_CLICKTIMER 7
+
+// Left click on the thumbnail: previous file (after the double-click time, since a
+// double-click opens the full-screen view), right click: next file.
+static void twpng_ThumbMouse(UINT msg)
+{
+	HWND h = g_hwndAIParams;
+	if(!h) return;
+	HWND play = GetDlgItem(h, IDC_AIP_PLAY);
+	if(GetWindowLongPtr(play, GWL_STYLE) & WS_VISIBLE) SendMessage(h, WM_NEXTDLGCTL, (WPARAM)play, TRUE);
+	switch(msg) {
+	case WM_LBUTTONDOWN:
+		SetTimer(h, TWPNG_CLICKTIMER, GetDoubleClickTime(), NULL);
+		break;
+	case WM_LBUTTONDBLCLK:
+		KillTimer(h, TWPNG_CLICKTIMER);
+		twpng_FullscreenOpen();
+		break;
+	case WM_RBUTTONDOWN:
+	case WM_RBUTTONDBLCLK:
+		KillTimer(h, TWPNG_CLICKTIMER);
+		twpng_AIParamsNavigate(1);
+		break;
+	}
+}
+
+static LRESULT CALLBACK ThumbSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+	(void)dwRefData;
+	switch(msg) {
+	case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
+	case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK:
+		twpng_ThumbMouse(msg);
+		return 0;
+	case WM_RBUTTONUP:
+		return 0;
+	case WM_NCDESTROY:
+		RemoveWindowSubclass(hwnd, ThumbSubclassProc, uIdSubclass);
+		break;
+	}
+	return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
 // ---- Thumbnail ------------------------------------------------------------------------
 
 static volatile LONG g_thumbGen = 0;
@@ -2778,6 +2853,7 @@ static void twpng_FillAIParams(HWND hwnd, struct aiparams_ctx *c)
 	EnableWindow(GetDlgItem(hwnd,IDC_AIP_SAVEJSON), json);
 	EnableWindow(GetDlgItem(hwnd,IDC_AIP_EXPLORER), c->path[0]!=0);
 	twpng_UpdateAINav(hwnd, c);
+	twpng_VideoUI();
 }
 
 // Draggable splitters in the viewer: 0 = prompt/negative, 1 = negative/settings,
@@ -2789,7 +2865,41 @@ static struct {
 	int grab;            // mouse offset inside the splitter when the drag started
 	DWORD lastClick;
 	int lastZone;
-} g_aipSplit = { {{0,0,0,0},{0,0,0,0},{0,0,0,0}}, 0,0,0,0,0,0,0, -1, 0, 0, -1 };
+	int hover;           // splitter under the mouse (its grip is drawn brighter), or -1
+} g_aipSplit = { {{0,0,0,0},{0,0,0,0},{0,0,0,0}}, 0,0,0,0,0,0,0, -1, 0, 0, -1, -1 };
+
+// Five small dots in the middle of each splitter, so it is clear the borders can be dragged.
+static void twpng_AIPDrawGrips(HDC dc)
+{
+	for(int i=0; i<3; i++) {
+		const RECT *r = &g_aipSplit.rc[i];
+		if(IsRectEmpty(r)) continue;
+		BOOL hot = (i==g_aipSplit.hover || i==g_aipSplit.drag);
+		COLORREF col = globals.dark ? (hot ? RGB(160,160,160) : RGB(80,80,80))
+		                            : (hot ? RGB(80,80,80) : RGB(175,175,175));
+		HBRUSH br = CreateSolidBrush(col);
+		int cx = (r->left+r->right)/2, cy = (r->top+r->bottom)/2;
+		for(int k=-2; k<=2; k++) {
+			RECT d;
+			if(i==2) SetRect(&d, cx-1, cy+k*5-1, cx+1, cy+k*5+1);
+			else SetRect(&d, cx+k*5-1, cy-1, cx+k*5+1, cy+1);
+			FillRect(dc, &d, br);
+		}
+		DeleteObject(br);
+	}
+}
+
+static void twpng_AIPSetHover(HWND hwnd, int z)
+{
+	if(z==g_aipSplit.hover) return;
+	if(g_aipSplit.hover>=0) InvalidateRect(hwnd, &g_aipSplit.rc[g_aipSplit.hover], TRUE);
+	g_aipSplit.hover = z;
+	if(z>=0) {
+		InvalidateRect(hwnd, &g_aipSplit.rc[z], TRUE);
+		TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, hwnd, 0 };
+		TrackMouseEvent(&t);
+	}
+}
 
 static int twpng_AIPSplitHit(HWND hwnd, int x, int y)
 {
@@ -2881,11 +2991,13 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	// The thumbnail sits right of the settings: as wide as its splitter says, or by default
 	// as tall as the box and at most half as wide.
 	struct aiparams_ctx *c = (struct aiparams_ctx*)GetWindowLongPtr(hwnd,DWLP_USER);
-	int thumbW = 0;
-	if(c && c->thumb && c->thumbH>0) {
+	int thumbW = 0, aw = 0, ah = 0;
+	if(c && c->thumb && c->thumbH>0) { aw = c->thumbW; ah = c->thumbH; }
+	else twpng_VideoAspect(&aw, &ah);   // a playing video without a shell thumbnail
+	if(aw>0 && ah>0) {
 		if(globals.aip_split_thumb>0) thumbW = MulDiv(editW, globals.aip_split_thumb, 1000);
 		else {
-			thumbW = MulDiv(setH, c->thumbW, c->thumbH);
+			thumbW = MulDiv(setH, aw, ah);
 			if(thumbW > editW/2) thumbW = editW/2;
 		}
 	}
@@ -2904,6 +3016,12 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_PREV),NULL,m,bottomY,navW,btnH,SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_NEXT),NULL,m+navW+gap,bottomY,navW,btnH,SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_EXPLORER),NULL,m+2*(navW+gap),bottomY,110,btnH,SWP_NOZORDER);
+	int px = m+2*(navW+gap)+110+gap;
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_PLAY),NULL,px,bottomY,60,btnH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SLOWER),NULL,px+60+gap,bottomY,btnH,btnH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SPEED),NULL,px+60+gap+btnH,bottomY+(btnH-labelH)/2,44,labelH,SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_FASTER),NULL,px+60+gap+btnH+44,bottomY,btnH,btnH,SWP_NOZORDER);
+	twpng_VideoPlace();
 	// Moved controls keep stale pixels (the owner-drawn thumbnail only paints what is newly
 	// exposed), so repaint everything after a layout pass.
 	RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
@@ -2921,9 +3039,15 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		c = (struct aiparams_ctx*)lParam;
 		SetWindowLongPtr(hwnd,DWLP_USER,lParam);
 		SendMessage(hwnd,WM_SETICON,ICON_BIG,(LPARAM)LoadIcon(globals.hInst,_T("ICONMAIN")));
+		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_THUMB), ThumbSubclassProc, 0, 0);
 		if(c) twpng_FillAIParams(hwnd,c);
 		twpng_LayoutAIParams(hwnd);
 		twpng_InitDarkDialog(hwnd);
+		if(c && twpng_IsVideoPath(c->path)) {
+			// Focus off the text boxes, so Space plays the video right away.
+			SetFocus(GetDlgItem(hwnd,IDC_AIP_PLAY));
+			return 0;
+		}
 		return 1;
 	}
 	c = (struct aiparams_ctx*)GetWindowLongPtr(hwnd,DWLP_USER);
@@ -2996,6 +3120,30 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			twpng_AIPSplitDrag(hwnd, (short)LOWORD(lParam), (short)HIWORD(lParam));
 			return TRUE;
 		}
+		twpng_AIPSetHover(hwnd, twpng_AIPSplitHit(hwnd, (short)LOWORD(lParam), (short)HIWORD(lParam)));
+		break;
+
+	case WM_MOUSELEAVE:
+		twpng_AIPSetHover(hwnd, -1);
+		break;
+
+	case WM_PAINT:
+		{
+			PAINTSTRUCT ps;
+			HDC dc = BeginPaint(hwnd, &ps);
+			twpng_AIPDrawGrips(dc);
+			EndPaint(hwnd, &ps);
+			SetWindowLongPtr(hwnd, DWLP_MSGRESULT, 0);
+			return TRUE;
+		}
+
+	case WM_TIMER:
+		if(wParam==TWPNG_CLICKTIMER) {
+			// A single click on the thumbnail (no double-click followed): previous file.
+			KillTimer(hwnd, TWPNG_CLICKTIMER);
+			twpng_AIParamsNavigate(-1);
+			return TRUE;
+		}
 		break;
 
 	case WM_LBUTTONUP:
@@ -3003,6 +3151,7 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		break;
 
 	case WM_CAPTURECHANGED:
+		if(g_aipSplit.drag>=0) InvalidateRect(hwnd, &g_aipSplit.rc[g_aipSplit.drag], TRUE);
 		g_aipSplit.drag = -1;
 		break;
 
@@ -3014,8 +3163,11 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		}
 		break;
 
-	case WM_EXITSIZEMOVE:
 	case WM_DESTROY:
+		KillTimer(hwnd, TWPNG_CLICKTIMER);
+		if(g_vid.host && GetParent(g_vid.host)==hwnd) twpng_VideoStop();
+		// fall through
+	case WM_EXITSIZEMOVE:
 		// Remember the window position/size (kept current so it survives app exit too).
 		twpng_StoreWindowPos(hwnd,&globals.window_prefs.aiparams);
 		break;
@@ -3030,7 +3182,10 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		case IDC_AIP_PREV:       twpng_AIParamsNavigate(-1); return 1;
 		case IDC_AIP_NEXT:       twpng_AIParamsNavigate(1); return 1;
 		case IDC_AIP_EXPLORER:   if(c && c->path[0]) twpng_ShowInExplorer(c->path); return 1;
-		case IDC_AIP_THUMB:      if(HIWORD(wParam)==STN_DBLCLK) twpng_FullscreenOpen(); return 1;
+		case IDC_AIP_PLAY:       twpng_VideoToggle(); return 1;
+		case IDC_AIP_SLOWER:     twpng_VideoSpeed(-1); return 1;
+		case IDC_AIP_FASTER:     twpng_VideoSpeed(1); return 1;
+		case IDC_AIP_SPEED:      if(HIWORD(wParam)==STN_DBLCLK) twpng_VideoSpeed(0); return 1;
 		case IDOK: case IDCANCEL: DestroyWindow(hwnd); return 1;
 		}
 		break;
@@ -3100,6 +3255,7 @@ static int twpng_ShowAIParams(const TCHAR *text, const TCHAR *extra, const TCHAR
 		struct aiparams_ctx *old = g_aiParamsCtx;
 		g_aiParamsCtx = c;
 		SetWindowLongPtr(g_hwndAIParams, DWLP_USER, (LONG_PTR)c);
+		twpng_VideoFileChanged();
 		twpng_FillAIParams(g_hwndAIParams, c);
 		twpng_FreeAIParamsCtx(old);
 		if(IsIconic(g_hwndAIParams)) ShowWindow(g_hwndAIParams, SW_RESTORE);
@@ -3388,7 +3544,9 @@ static void twpng_FullPaint(HWND hwnd, HDC hdc)
 	FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
 	struct aiparams_ctx *c = g_aiParamsCtx;
-	if(g_full.bmp) {
+	if(g_vid.shown && g_vid.host && GetParent(g_vid.host)==hwnd) {
+		// The video window covers it; the still image would only peek out at the edges.
+	} else if(g_full.bmp) {
 		BITMAP bm;
 		GetObject(g_full.bmp, sizeof(bm), &bm);
 		twpng_FullBlit(dc, &rc, g_full.bmp, bm.bmWidth, bm.bmHeight<0 ? -bm.bmHeight : bm.bmHeight, g_full.premul);
@@ -3405,9 +3563,16 @@ static void twpng_FullPaint(HWND hwnd, HDC hdc)
 	int idx = -1, n = g_full.path[0] ? twpng_GetSiblings(g_full.path, &list, &idx, FALSE) : 0;
 	if(idx>=0) StringCchPrintf(line, MAX_PATH+120, _T("%s  (%d/%d)"), base, idx+1, n);
 	else StringCchCopy(line, MAX_PATH+120, base);
-	if(g_full.loading) StringCchCat(line, MAX_PATH+120, _T("   loading..."));
+	BOOL vid = twpng_IsVideoPath(g_full.path);
+	if(vid) {
+		TCHAR st[60];
+		StringCchPrintf(st, 60, _T("   %s %d%%"), twpng_VideoPlaying() ? _T("playing at") : _T("paused,"), g_vidRate);
+		StringCchCat(line, MAX_PATH+120, st);
+	}
+	else if(g_full.loading) StringCchCat(line, MAX_PATH+120, _T("   loading..."));
 	else if(!g_full.bmp) StringCchCat(line, MAX_PATH+120, _T("   no preview"));
-	StringCchCat(line, MAX_PATH+120, _T("      Left/Right: browse   Esc: close"));
+	StringCchCat(line, MAX_PATH+120, vid ? _T("      Left/Right or click: browse   Space: play/pause   -/+: speed   Esc: close")
+	                                     : _T("      Left/Right or click: browse   Esc: close"));
 	HGDIOBJ oldFont = SelectObject(dc, g_full.font ? g_full.font : globals.hUiFont);
 	SetBkMode(dc, TRANSPARENT);
 	RECT tr = { 16, rc.bottom-40, rc.right-16, rc.bottom-12 };
@@ -3450,13 +3615,28 @@ static LRESULT CALLBACK FullWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		switch(wParam) {
 		case VK_ESCAPE: case VK_F11: DestroyWindow(hwnd); return 0;
 		case VK_LEFT: case VK_PRIOR: case VK_UP: twpng_FullBrowse(hwnd, -1); return 0;
-		case VK_RIGHT: case VK_NEXT: case VK_DOWN: case VK_SPACE: twpng_FullBrowse(hwnd, 1); return 0;
+		case VK_RIGHT: case VK_NEXT: case VK_DOWN: twpng_FullBrowse(hwnd, 1); return 0;
+		case VK_SPACE:
+			if(twpng_IsVideoPath(g_full.path)) twpng_VideoToggle();
+			else twpng_FullBrowse(hwnd, 1);
+			return 0;
+		case VK_OEM_PLUS: case VK_ADD: twpng_VideoSpeed(1); return 0;
+		case VK_OEM_MINUS: case VK_SUBTRACT: twpng_VideoSpeed(-1); return 0;
 		}
 		break;
 	case WM_MOUSEWHEEL:
 		twpng_FullBrowse(hwnd, GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -1 : 1);
 		return 0;
-	case WM_LBUTTONDBLCLK:
+	// No CS_DBLCLKS, so quick clicks browse quickly instead of becoming double-clicks.
+	case WM_LBUTTONDOWN:
+		twpng_FullBrowse(hwnd, -1);
+		return 0;
+	case WM_RBUTTONDOWN:
+		twpng_FullBrowse(hwnd, 1);
+		return 0;
+	case WM_RBUTTONUP:
+		return 0;
+	case WM_MBUTTONDOWN:
 		DestroyWindow(hwnd);
 		return 0;
 	case WM_APP_FULLIMG:
@@ -3481,6 +3661,11 @@ static LRESULT CALLBACK FullWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		g_full.loading = FALSE;
 		g_full.gen++;
 		g_hwndFull = NULL;
+		// A video playing here carries on in the viewer.
+		if(g_vid.host && GetParent(g_vid.host)==hwnd) {
+			if(g_hwndAIParams) twpng_VideoMoveTo(g_hwndAIParams);
+			else twpng_VideoStop();
+		}
 		if(g_hwndAIParams) SetForegroundWindow(g_hwndAIParams);
 		return 0;
 	}
@@ -3495,7 +3680,6 @@ static void twpng_FullscreenOpen()
 	if(!registered) {
 		WNDCLASS wc;
 		ZeroMemory(&wc, sizeof(wc));
-		wc.style = CS_DBLCLKS;
 		wc.lpfnWndProc = FullWndProc;
 		wc.hInstance = globals.hInst;
 		wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -3507,7 +3691,7 @@ static void twpng_FullscreenOpen()
 	mi.cbSize = sizeof(mi);
 	GetMonitorInfo(MonitorFromWindow(g_hwndAIParams, MONITOR_DEFAULTTONEAREST), &mi);
 	RECT r = mi.rcMonitor;
-	g_hwndFull = CreateWindowEx(0, _T("TWPNGFULLVIEW"), _T("TweakPNG"), WS_POPUP,
+	g_hwndFull = CreateWindowEx(0, _T("TWPNGFULLVIEW"), _T("TweakPNG"), WS_POPUP|WS_CLIPCHILDREN,
 		r.left, r.top, r.right-r.left, r.bottom-r.top, NULL, NULL, globals.hInst, NULL);
 	if(!g_hwndFull) return;
 	UINT dpi = GetDpiForWindow(g_hwndFull);
@@ -3517,7 +3701,340 @@ static void twpng_FullscreenOpen()
 	g_full.path[0] = 0;
 	ShowWindow(g_hwndFull, SW_SHOW);
 	twpng_FullLoad();
+	if(g_vid.host) twpng_VideoMoveTo(g_hwndFull);
 	SetForegroundWindow(g_hwndFull);
+}
+
+// ---- Video playback (Media Foundation media engine) ------------------------------------
+// The engine renders straight into a child window (g_vid.host) laid over the thumbnail in
+// the viewer, or over the full-screen view. Moving between the two recreates the engine
+// at the same position. Speed changes go through the engine's playback rate.
+
+#define WM_APP_VIDEO (WM_APP+25)
+#define TWPNG_FULLBAND 56     // status line height under a video in the full-screen view
+
+class TwpngVideoNotify : public IMFMediaEngineNotify {
+	LONG m_ref;
+public:
+	HWND m_hwnd;          // cleared before the engine shuts down
+	TwpngVideoNotify(HWND h) : m_ref(1), m_hwnd(h) {}
+	STDMETHODIMP QueryInterface(REFIID riid, void **ppv) {
+		if(riid==__uuidof(IUnknown) || riid==__uuidof(IMFMediaEngineNotify)) {
+			*ppv = static_cast<IMFMediaEngineNotify*>(this);
+			AddRef();
+			return S_OK;
+		}
+		*ppv = NULL;
+		return E_NOINTERFACE;
+	}
+	STDMETHODIMP_(ULONG) AddRef() { return InterlockedIncrement(&m_ref); }
+	STDMETHODIMP_(ULONG) Release() { LONG r = InterlockedDecrement(&m_ref); if(!r) delete this; return r; }
+	// Called on a Media Foundation worker thread.
+	STDMETHODIMP EventNotify(DWORD ev, DWORD_PTR p1, DWORD p2) {
+		(void)p2;
+		if(ev==MF_MEDIA_ENGINE_EVENT_NOTIFYSTABLESTATE) { SetEvent((HANDLE)p1); return S_OK; }
+		HWND h = m_hwnd;
+		if(h) PostMessage(h, WM_APP_VIDEO, ev, 0);
+		return S_OK;
+	}
+};
+
+static BOOL g_mfStarted = FALSE;
+
+static BOOL twpng_IsVideoPath(const TCHAR *path)
+{
+	const TCHAR *e = PathFindExtension(path);
+	return !lstrcmpi(e, _T(".mp4")) || !lstrcmpi(e, _T(".mov")) || !lstrcmpi(e, _T(".m4v"));
+}
+
+static BOOL twpng_VideoPlaying()
+{
+	return g_vid.eng && !g_vid.eng->IsPaused();
+}
+
+static BOOL twpng_VideoAspect(int *w, int *h)
+{
+	if(!g_vid.eng || !g_vid.vw || !g_vid.vh || !g_aiParamsCtx || lstrcmpi(g_vid.path, g_aiParamsCtx->path))
+		return FALSE;
+	*w = (int)g_vid.vw;
+	*h = (int)g_vid.vh;
+	return TRUE;
+}
+
+// Fit the video window into the thumbnail area (top-aligned like the thumbnail) or the
+// full-screen view above its status line.
+static void twpng_VideoPlace()
+{
+	if(!g_vid.host) return;
+	HWND parent = GetParent(g_vid.host);
+	int aw = (int)g_vid.vw, ah = (int)g_vid.vh;
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if((!aw || !ah) && c && c->thumb) { aw = c->thumbW; ah = c->thumbH; }
+	if(!aw || !ah) { aw = 16; ah = 9; }
+	RECT box;
+	BOOL full = (parent==g_hwndFull);
+	if(full) {
+		GetClientRect(parent, &box);
+		box.bottom -= TWPNG_FULLBAND;
+	} else {
+		HWND th = GetDlgItem(parent, IDC_AIP_THUMB);
+		if(!(GetWindowLongPtr(th, GWL_STYLE) & WS_VISIBLE)) SetRectEmpty(&box);
+		else {
+			GetWindowRect(th, &box);
+			MapWindowPoints(NULL, parent, (POINT*)&box, 2);
+		}
+	}
+	int w = box.right-box.left, h = box.bottom-box.top;
+	int dw = w, dh = w>0 ? MulDiv(w, ah, aw) : 0;
+	if(dh > h) { dh = h; dw = MulDiv(h, aw, ah); }
+	int x = box.left + (w-dw)/2, y = full ? box.top + (h-dh)/2 : box.top;
+	SetWindowPos(g_vid.host, HWND_TOP, x, y, dw, dh, SWP_NOACTIVATE);
+	IMFMediaEngineEx *ex = NULL;
+	if(dw>0 && dh>0 && SUCCEEDED(g_vid.eng->QueryInterface(IID_PPV_ARGS(&ex)))) {
+		RECT d = { 0, 0, dw, dh };
+		MFARGB black = { 0, 0, 0, 255 };
+		ex->UpdateVideoStream(NULL, &d, &black);
+		ex->Release();
+	}
+}
+
+// Play/Pause button text, speed label and which controls show; the full-screen status line.
+static void twpng_VideoUI()
+{
+	HWND h = g_hwndAIParams;
+	if(h) {
+		struct aiparams_ctx *c = g_aiParamsCtx;
+		BOOL vid = c && twpng_IsVideoPath(c->path);
+		static const int ids[] = { IDC_AIP_PLAY, IDC_AIP_SLOWER, IDC_AIP_SPEED, IDC_AIP_FASTER };
+		HWND f = GetFocus();
+		for(int i=0; i<4; i++) {
+			HWND w = GetDlgItem(h, ids[i]);
+			if(!vid && f==w) SendMessage(h, WM_NEXTDLGCTL, (WPARAM)GetDlgItem(h, IDC_AIP_NEXT), TRUE);
+			ShowWindow(w, vid ? SW_SHOWNA : SW_HIDE);
+		}
+		SetDlgItemText(h, IDC_AIP_PLAY, twpng_VideoPlaying() ? _T("Pause") : _T("Play"));
+		TCHAR s[16];
+		StringCchPrintf(s, 16, _T("%d%%"), g_vidRate);
+		SetDlgItemText(h, IDC_AIP_SPEED, s);
+		EnableWindow(GetDlgItem(h, IDC_AIP_SLOWER), g_vidRate>25);
+		EnableWindow(GetDlgItem(h, IDC_AIP_FASTER), g_vidRate<400);
+	}
+	if(g_hwndFull) {
+		RECT r;
+		GetClientRect(g_hwndFull, &r);
+		r.top = r.bottom - TWPNG_FULLBAND;
+		InvalidateRect(g_hwndFull, &r, FALSE);
+	}
+}
+
+static void twpng_VideoStop()
+{
+	if(!g_vid.eng) return;
+	IMFMediaEngine *eng = g_vid.eng;
+	HWND host = g_vid.host;
+	g_vid.nt->m_hwnd = NULL;
+	g_vid.eng = NULL;
+	g_vid.host = NULL;
+	eng->Shutdown();
+	eng->Release();
+	g_vid.nt->Release();
+	g_vid.nt = NULL;
+	if(IsWindow(host)) DestroyWindow(host);
+	g_vid.path[0] = 0;
+	g_vid.vw = g_vid.vh = 0;
+	g_vid.shown = FALSE;
+	twpng_VideoUI();
+}
+
+static void twpng_VideoShutdown()
+{
+	twpng_VideoStop();
+	if(g_mfStarted) { MFShutdown(); g_mfStarted = FALSE; }
+}
+
+static void twpng_VideoEvent(DWORD ev)
+{
+	if(!g_vid.eng) return;
+	switch(ev) {
+	case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
+		{
+			DWORD w = 0, h = 0;
+			if(SUCCEEDED(g_vid.eng->GetNativeVideoSize(&w, &h))) { g_vid.vw = w; g_vid.vh = h; }
+			if(g_vid.seek > 0) { g_vid.eng->SetCurrentTime(g_vid.seek); g_vid.seek = 0; }
+			HWND parent = GetParent(g_vid.host);
+			if(parent==g_hwndAIParams && g_aiParamsCtx && !g_aiParamsCtx->thumb) twpng_LayoutAIParams(parent);
+			else twpng_VideoPlace();
+		}
+		break;
+	case MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY:
+	case MF_MEDIA_ENGINE_EVENT_LOADEDDATA:
+	case MF_MEDIA_ENGINE_EVENT_PLAYING:
+		// Shown once there is a frame, so the thumbnail doesn't blink to black first.
+		if(!g_vid.shown) {
+			g_vid.shown = TRUE;
+			twpng_VideoPlace();
+			ShowWindow(g_vid.host, SW_SHOWNA);
+			if(g_hwndFull && GetParent(g_vid.host)==g_hwndFull) InvalidateRect(g_hwndFull, NULL, FALSE);
+		}
+		break;
+	case MF_MEDIA_ENGINE_EVENT_ERROR:
+		twpng_VideoStop();
+		return;
+	}
+	twpng_VideoUI();
+}
+
+static LRESULT CALLBACK VideoHostProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch(msg) {
+	case WM_ERASEBKGND:
+		return 1;
+	case WM_PAINT:
+		{
+			PAINTSTRUCT ps;
+			BeginPaint(hwnd, &ps);
+			EndPaint(hwnd, &ps);
+			return 0;
+		}
+	case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
+	case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK:
+	case WM_MBUTTONDOWN:
+		{
+			// Clicks act like clicks on the picture underneath. Posted, because browsing
+			// destroys this window.
+			HWND p = GetParent(hwnd);
+			if(p==g_hwndFull) {
+				UINT m = msg==WM_LBUTTONDBLCLK ? WM_LBUTTONDOWN : msg==WM_RBUTTONDBLCLK ? WM_RBUTTONDOWN : msg;
+				PostMessage(p, m, 0, 0);
+			}
+			else if(msg!=WM_MBUTTONDOWN) PostMessage(GetDlgItem(p, IDC_AIP_THUMB), msg, 0, 0);
+			return 0;
+		}
+	case WM_RBUTTONUP:
+		return 0;
+	case WM_APP_VIDEO:
+		if(hwnd==g_vid.host) twpng_VideoEvent((DWORD)wParam);
+		return 0;
+	}
+	return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// Start `path` in a new video window inside `parent`, at `at` seconds.
+static void twpng_VideoStart(HWND parent, const TCHAR *path, double at, BOOL play)
+{
+	twpng_VideoStop();
+	if(!parent || !path[0]) return;
+	if(!g_mfStarted) {
+		if(FAILED(MFStartup(MF_VERSION))) return;
+		g_mfStarted = TRUE;
+	}
+	static BOOL registered = FALSE;
+	if(!registered) {
+		WNDCLASS wc;
+		ZeroMemory(&wc, sizeof(wc));
+		wc.style = CS_DBLCLKS;
+		wc.lpfnWndProc = VideoHostProc;
+		wc.hInstance = globals.hInst;
+		wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+		wc.lpszClassName = _T("TWPNGVIDEO");
+		registered = RegisterClass(&wc)!=0;
+		if(!registered) return;
+	}
+	HWND host = CreateWindowEx(0, _T("TWPNGVIDEO"), NULL, WS_CHILD|WS_CLIPSIBLINGS,
+		0, 0, 1, 1, parent, NULL, globals.hInst, NULL);
+	if(!host) return;
+	TwpngVideoNotify *nt = new TwpngVideoNotify(host);
+	IMFMediaEngineClassFactory *cf = NULL;
+	IMFAttributes *attr = NULL;
+	IMFMediaEngine *eng = NULL;
+	HRESULT hr = CoCreateInstance(CLSID_MFMediaEngineClassFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&cf));
+	if(SUCCEEDED(hr)) hr = MFCreateAttributes(&attr, 3);
+	if(SUCCEEDED(hr)) hr = attr->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, nt);
+	if(SUCCEEDED(hr)) hr = attr->SetUINT64(MF_MEDIA_ENGINE_PLAYBACK_HWND, (UINT64)(UINT_PTR)host);
+	if(SUCCEEDED(hr)) hr = attr->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, 87);   // DXGI_FORMAT_B8G8R8A8_UNORM
+	if(SUCCEEDED(hr)) hr = cf->CreateInstance(0, attr, &eng);
+	if(attr) attr->Release();
+	if(cf) cf->Release();
+	if(SUCCEEDED(hr)) {
+		eng->SetLoop(TRUE);
+		eng->SetDefaultPlaybackRate(g_vidRate/100.0);
+		BSTR url = SysAllocString(path);
+		hr = url ? eng->SetSource(url) : E_OUTOFMEMORY;
+		SysFreeString(url);
+	}
+	if(FAILED(hr)) {
+		nt->m_hwnd = NULL;
+		if(eng) { eng->Shutdown(); eng->Release(); }
+		nt->Release();
+		DestroyWindow(host);
+		return;
+	}
+	g_vid.eng = eng;
+	g_vid.nt = nt;
+	g_vid.host = host;
+	StringCchCopy(g_vid.path, MAX_PATH, path);
+	g_vid.vw = g_vid.vh = 0;
+	g_vid.seek = at;
+	g_vid.shown = FALSE;
+	twpng_VideoPlace();
+	if(play) {
+		eng->Play();
+		eng->SetPlaybackRate(g_vidRate/100.0);
+	}
+	twpng_VideoUI();
+}
+
+static HWND twpng_VideoParent()
+{
+	return g_hwndFull ? g_hwndFull : g_hwndAIParams;
+}
+
+static void twpng_VideoMoveTo(HWND parent)
+{
+	if(!g_vid.eng) return;
+	double t = g_vid.eng->GetCurrentTime();
+	BOOL play = !g_vid.eng->IsPaused();
+	TCHAR p[MAX_PATH];
+	StringCchCopy(p, MAX_PATH, g_vid.path);
+	twpng_VideoStart(parent, p, t, play);
+}
+
+// Play/pause the viewer's current file (Play button, Space).
+static void twpng_VideoToggle()
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c || !twpng_IsVideoPath(c->path)) return;
+	if(!g_vid.eng || lstrcmpi(g_vid.path, c->path)) twpng_VideoStart(twpng_VideoParent(), c->path, 0, TRUE);
+	else if(g_vid.eng->IsPaused()) {
+		g_vid.eng->Play();
+		g_vid.eng->SetPlaybackRate(g_vidRate/100.0);
+	}
+	else g_vid.eng->Pause();
+	twpng_VideoUI();
+}
+
+// -/+ change the speed in steps of 25%, 0 resets it.
+static void twpng_VideoSpeed(int dir)
+{
+	int r = dir ? g_vidRate + dir*25 : 100;
+	if(r < 25) r = 25;
+	if(r > 400) r = 400;
+	g_vidRate = r;
+	if(g_vid.eng) {
+		g_vid.eng->SetDefaultPlaybackRate(r/100.0);
+		g_vid.eng->SetPlaybackRate(r/100.0);
+	}
+	twpng_VideoUI();
+}
+
+// The viewer moved to another file: a playing video keeps playing with the next one.
+static void twpng_VideoFileChanged()
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(g_vid.eng && c && !lstrcmpi(g_vid.path, c->path)) return;
+	BOOL was = twpng_VideoPlaying();
+	twpng_VideoStop();
+	if(was && c && twpng_IsVideoPath(c->path)) twpng_VideoStart(twpng_VideoParent(), c->path, 0, TRUE);
 }
 
 static void twpng_ShowInExplorer(const TCHAR *path)
@@ -3543,6 +4060,14 @@ static BOOL twpng_AIParamsKey(const MSG *m)
 	else if(ctrl && !alt && m->wParam==VK_PRIOR) dir = -1;
 	else if(ctrl && !alt && m->wParam==VK_NEXT) dir = 1;
 	if(dir) { twpng_AIParamsNavigate(dir); return TRUE; }
+	if(!ctrl && !alt && g_aiParamsCtx && twpng_IsVideoPath(g_aiParamsCtx->path)) {
+		// Space plays/pauses unless a text box has the focus; -/+ change the speed.
+		TCHAR cls[16] = _T("");
+		GetClassName(m->hwnd, cls, 16);
+		if(m->wParam==VK_SPACE && !shift && lstrcmpi(cls, _T("Edit"))) { twpng_VideoToggle(); return TRUE; }
+		if(m->wParam==VK_OEM_PLUS || m->wParam==VK_ADD) { twpng_VideoSpeed(1); return TRUE; }
+		if(m->wParam==VK_OEM_MINUS || m->wParam==VK_SUBTRACT) { twpng_VideoSpeed(-1); return TRUE; }
+	}
 	if(ctrl && !alt && m->wParam=='F' && g_aiParamsCtx && g_aiParamsCtx->path[0]) {
 		TCHAR d[MAX_PATH];
 		StringCchCopy(d, MAX_PATH, g_aiParamsCtx->path);
@@ -6300,6 +6825,56 @@ static int twpng_ListIndexes(struct twpng_idxinfo **out)
 	return n;
 }
 
+static TCHAR g_folderMenuDirs[ID_AIFOLDER_IDXMAX][MAX_PATH];
+
+// Menu text with '&' doubled so it isn't taken as a mnemonic.
+static void twpng_MenuEscape(const TCHAR *s, TCHAR *out, int cap)
+{
+	int o = 0;
+	for(; *s && o<cap-2; s++) {
+		if(*s==_T('&')) out[o++] = _T('&');
+		out[o++] = *s;
+	}
+	out[o] = 0;
+}
+
+// Tools > Folder Overview submenu: the current folder, pick one, or one that has an index
+// (most recently scanned first).
+static HMENU twpng_FolderMenu()
+{
+	HMENU m = CreatePopupMenu();
+	TCHAR d[MAX_PATH], esc[MAX_PATH*2], item[MAX_PATH*2+40];
+	twpng_DocFolder(d);
+	if(d[0]) {
+		TCHAR leaf[MAX_PATH];
+		StringCchCopy(leaf, MAX_PATH, d);
+		int l = lstrlen(leaf);
+		if(l>1 && leaf[l-1]==_T('\\')) leaf[l-1] = 0;
+		const TCHAR *b = _tcsrchr(leaf, _T('\\'));
+		twpng_MenuEscape(b && b[1] ? b+1 : leaf, esc, MAX_PATH*2);
+		StringCchPrintf(item, MAX_PATH*2+40, _T("&Current Folder (%s)"), esc);
+		AppendMenu(m, MF_STRING, ID_AIFOLDER, item);
+	} else AppendMenu(m, MF_STRING|MF_GRAYED, ID_AIFOLDER, _T("&Current Folder"));
+	AppendMenu(m, MF_STRING, ID_AIFOLDER_PICK, _T("C&hoose Folder..."));
+
+	struct twpng_idxinfo *list = NULL;
+	int n = twpng_ListIndexes(&list), shown = 0;
+	for(int i=0; i<ID_AIFOLDER_IDXMAX; i++) g_folderMenuDirs[i][0] = 0;
+	for(int i=0; i<n && shown<ID_AIFOLDER_IDXMAX; i++) {
+		if(!list[i].count || list[i].dir[0]==_T('(')) continue;
+		if(!shown) AppendMenu(m, MF_SEPARATOR, 0, NULL);
+		StringCchCopy(g_folderMenuDirs[shown], MAX_PATH, list[i].dir);
+		twpng_MenuEscape(list[i].dir, esc, MAX_PATH*2);
+		StringCchPrintf(item, MAX_PATH*2+40, _T("%s\t%lu files"), esc, (unsigned long)list[i].count);
+		AppendMenu(m, MF_STRING, ID_AIFOLDER_IDX+shown, item);
+		shown++;
+	}
+	free(list);
+	AppendMenu(m, MF_SEPARATOR, 0, NULL);
+	AppendMenu(m, MF_STRING, ID_AIINDEX, _T("&Manage Folder Indexes..."));
+	return m;
+}
+
 static void twpng_FormatSize(ULONGLONG b, TCHAR *out, int cap)
 {
 	if(b >= 1024ULL*1024*1024) StringCchPrintf(out, cap, _T("%.1f GB"), b/(1024.0*1024*1024));
@@ -8425,7 +9000,7 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_VIEWAIPARAMS,_T("&View AI Parameters..."));
 			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_READAIFROMFILE,_T("Read AI parameters from &File..."));
 			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_COMPAREAI,_T("&Compare AI Parameters..."));
-			AppendMenu(mtools,MF_STRING|MF_ENABLED,ID_AIFOLDER,_T("Folder &Overview..."));
+			AppendMenu(mtools,MF_POPUP|MF_ENABLED,(UINT_PTR)twpng_FolderMenu(),_T("Folder &Overview"));
 			AppendMenu(mtools,MF_SEPARATOR,0,NULL);
 			for(i=0;i<TWPNG_NUMTOOLS;i++) {
 				if(lstrlen(globals.tools[i].name)) {
@@ -8509,6 +9084,11 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		}
 
 	case WM_COMMAND:
+		if(id>=ID_AIFOLDER_IDX && id<ID_AIFOLDER_IDX+ID_AIFOLDER_IDXMAX) {
+			if(g_folderMenuDirs[id-ID_AIFOLDER_IDX][0])
+				twpng_ShowFolderOverview(g_folderMenuDirs[id-ID_AIFOLDER_IDX], FALSE);
+			return 0;
+		}
 		// commands always available
 		switch(id) {
 #ifdef TWPNG_SUPPORT_VIEWER
@@ -8595,6 +9175,9 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 				twpng_DocFolder(d);
 				twpng_ShowFolderOverview(d, FALSE);
 			}
+			return 0;
+		case ID_AIFOLDER_PICK:
+			twpng_ShowFolderOverview(NULL, FALSE);
 			return 0;
 		case ID_READAIFROMFILE:
 			twpng_ReadAIFromFile(hwnd);

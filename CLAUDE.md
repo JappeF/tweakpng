@@ -36,7 +36,9 @@ running the app and inspecting the UI.
 
 The default build links `libpng` and `zlib`, expected as **sibling directories** of the
 repo root (`..\..\..\libpng`, `..\..\..\zlib`) with prebuilt `.lib`s under
-`Debug32`/`Release32`/`Debug64`/`Release64`. Also links `comctl32.lib` and `uxtheme.lib`.
+`Debug32`/`Release32`/`Debug64`/`Release64`. Also links `comctl32.lib` and `uxtheme.lib`, plus
+(via `#pragma comment` in `tweakpng.cpp`) WIC, msimg32, shlwapi and Media Foundation
+(`mfplat.lib`, `mfuuid.lib`) for video playback.
 
 Feature flags live in `twpng-config.h`:
 - `TWPNG_SUPPORT_VIEWER` — image viewer (needs libpng + zlib)
@@ -157,22 +159,42 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
   - **Thumbnail**: `twpng_RequestThumb` asks the shell (`IShellItemImageFactory`,
     `SIIGBF_THUMBNAILONLY`) for Explorer's thumbnail on a background thread and posts it
     back (`WM_APP_THUMB`); a generation counter drops results for files no longer shown.
-    It is owner-drawn (`IDC_AIP_THUMB`, `SS_NOTIFY`) right of the settings box.
+    It is owner-drawn (`IDC_AIP_THUMB`, `SS_NOTIFY`) right of the settings box, and
+    subclassed (`ThumbSubclassProc` -> `twpng_ThumbMouse`): right click = next, left click =
+    previous after a `TWPNG_CLICKTIMER` of the double-click time (so a double-click can still
+    open the full-screen view without browsing first).
   - **Splitters**: the gaps between Prompt / Negative prompt / Settings and between
     Settings and the thumbnail are draggable (`g_aipSplit`, hit-tested in the dialog's
     own `WM_SETCURSOR` / `WM_LBUTTONDOWN`, since the gaps and the static labels belong to
     the dialog). Positions live in `globals.aip_split_prompt/neg/thumb` (per mille,
     registry `aip_split_*`, thumb 0 = from the image aspect); `WM_LBUTTONDBLCLK` on a
-    splitter resets it.
+    splitter resets it. The dialog's own `WM_PAINT` draws five-dot grips in the gaps
+    (`twpng_AIPDrawGrips`, brighter on hover via `TrackMouseEvent` / `WM_MOUSELEAVE`).
   - **Full screen** (double-click the thumbnail or F11; `twpng_FullscreenOpen`,
     `FullWndProc`, class `TWPNGFULLVIEW`): a popup covering the viewer's monitor.
     `twpng_DecodeFit` decodes on a worker thread (WIC, scaled to the screen, premultiplied
     BGRA; videos and anything WIC can't read fall back to a large shell thumbnail) and
     posts `WM_APP_FULLIMG`; the small thumbnail is drawn meanwhile. Left/Right, PageUp/Down,
-    Space and the mouse wheel browse (through `twpng_AIParamsNavigate`, so the viewer
-    follows), Esc / F11 / double-click close. Its messages bypass the main window's
-    accelerators in the message loop (Delete would otherwise delete a chunk), and
-    `twpng_ShowAIParams` doesn't pull the viewer to the front while it is open.
+    Space (images), left/right click and the mouse wheel browse (through
+    `twpng_AIParamsNavigate`, so the viewer follows), Esc / F11 / middle click close. The
+    class has no `CS_DBLCLKS`, so fast clicks stay clicks. Its messages (and its children's)
+    bypass the main window's accelerators in the message loop (Delete would otherwise
+    delete a chunk), and `twpng_ShowAIParams` doesn't pull the viewer to the front while it
+    is open.
+  - **Video playback** (`IDC_AIP_PLAY` / `SLOWER` / `SPEED` / `FASTER`, shown only for
+    .mp4/.mov/.m4v, `twpng_IsVideoPath`): a Media Foundation media engine
+    (`IMFMediaEngine`, rendering mode via `MF_MEDIA_ENGINE_PLAYBACK_HWND`) renders into a
+    child window of class `TWPNGVIDEO` (`g_vid.host`), placed over the thumbnail's image
+    area or over the full-screen view above a `TWPNG_FULLBAND` status strip
+    (`twpng_VideoPlace`). The dialog and the full-screen window have `WS_CLIPCHILDREN` (and
+    the thumbnail `WS_CLIPSIBLINGS`) so GDI painting doesn't overwrite the video. Engine
+    events arrive on an MF thread and are posted to the host as `WM_APP_VIDEO`; the host is
+    shown at the first frame and forwards clicks (posted, since browsing destroys it).
+    There is one engine at a time: moving between viewer and full screen recreates it at
+    the same position (`twpng_VideoMoveTo`, seek applied at `LOADEDMETADATA`), and
+    `twpng_VideoFileChanged` (from `twpng_ShowAIParams`) stops it or, if it was playing,
+    starts the next file. Speed is `g_vidRate` percent (25..400, steps of 25) through
+    `SetPlaybackRate`. Space toggles unless the focus is an Edit; -/+ always.
   - **Show in Explorer** (`IDC_AIP_EXPLORER`): `SHOpenFolderAndSelectItems`; an already
     open Explorer window on that folder is reused.
   - **Save JSON** writes `ctx->full` as UTF-8 when it is JSON (the ComfyUI graph), so it
@@ -275,7 +297,10 @@ metadata-only path so AI prompts can be inspected.
 
 ## Folder overview (search and CSV)
 
-Tools > Folder Overview (`ID_AIFOLDER`, also Ctrl+F in the viewer) opens the modeless,
+Tools > Folder Overview is a submenu built in `WM_INITMENU` (`twpng_FolderMenu`): current
+folder (`ID_AIFOLDER`), Choose Folder (`ID_AIFOLDER_PICK`), up to 20 indexed folders
+(`ID_AIFOLDER_IDX` + n, paths kept in `g_folderMenuDirs`, dispatched before the main
+`WM_COMMAND` switch) and Manage Folder Indexes. Ctrl+F in the viewer opens the modeless,
 unowned `DLG_AIFOLDER` (`DlgProcAIFolder`, `g_hwndAIFolder`, routed in the message loop
 like the viewer). It lists every supported file of a folder in a virtual list view
 (`LVS_OWNERDATA`, text from `LVN_GETDISPINFO`; `twpng_FindSetting` pulls single values

@@ -488,13 +488,24 @@ Explorer shows; for videos a frame from the video). It loads in the
 background, so on a slow drive it can appear a moment later.
 
 The borders between Prompt, Negative prompt and Settings, and between the
-settings and the thumbnail, can be dragged to resize the boxes;
-double-click a border to put it back. The sizes are remembered.
+settings and the thumbnail, can be dragged to resize the boxes (the small
+dots mark them); double-click a border to put it back. The sizes are
+remembered.
 
-Double-click the thumbnail (or press F11) to see the image full screen,
-sharp at the size of your screen (for videos: a large frame). Left/Right,
-the mouse wheel or Space browse through the folder there too, and Esc (or
-a double-click) brings you back to the viewer.
+Click the thumbnail to browse: left click shows the previous file, right
+click the next one. The left click waits for the double-click time first,
+because a double-click on the thumbnail (or F11) shows the image full
+screen, sharp at the size of your screen (for videos: a large frame).
+Left/Right, the mouse wheel, left/right click and Space browse through the
+folder there too; Esc, F11 or a middle click brings you back to the viewer.
+
+For a video the viewer has Play, - and + buttons. Play (or Space, when the
+focus is not in one of the text boxes) plays the video in place of the
+thumbnail, over and over, with its sound; press it again to pause. - and +
+(also the keys) change the speed in steps of 25%, from 25% to 400%;
+double-click the percentage to go back to 100%. While a video plays, Next
+and Prev start the next one playing too, and the full-screen view takes
+the video along (Space, - and + work there as well).
 
 Buttons at the bottom:
 
@@ -523,9 +534,11 @@ Tools > Folder Overview
 -----------------------
 
 Lists every image and video in a folder with its seed, model, mode,
-duration and prompt. Opens for the folder of the current file (or asks for
-one); Ctrl+F in the AI parameters viewer opens it with the search box
-ready.
+duration and prompt. The submenu offers the folder of the current file,
+Choose Folder... to pick another one, and the folders that already have an
+index (most recently scanned first, with their number of files), so those
+open straight away. Ctrl+F in the AI parameters viewer opens it for the
+viewer's folder with the search box ready.
 
 - Search: type words to filter the list. Every word must appear in the
   file name, the prompt, the negative prompt or the settings, for example
@@ -543,7 +556,8 @@ next time only new or changed files are read: a folder with 22,000 files
 then opens in well under a second. On a network or cloud drive the first
 scan takes longer, as every file is fetched over the network.
 
-The indexes can grow with big folders. Options > Folder Indexes lists
+The indexes can grow with big folders. Options > Folder Indexes (also at
+the bottom of the Folder Overview submenu) lists
 them with their folder, number of files, size and date; select one or
 more and click Delete, or use Delete all. A deleted folder is simply
 scanned again the next time.

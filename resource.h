@@ -119,6 +119,10 @@
 #define IDC_AX_TOTAL                    1134
 #define IDC_AX_DELETE                   1135
 #define IDC_AX_DELALL                   1136
+#define IDC_AIP_PLAY                    1137
+#define IDC_AIP_SLOWER                  1138
+#define IDC_AIP_SPEED                   1139
+#define IDC_AIP_FASTER                  1140
 #define ID_EXIT                         40001
 #define ID_OPEN                         40002
 #define ID_SAVEAS                       40003
@@ -193,6 +197,9 @@
 #define ID_COMPAREAI                    40107
 #define ID_AIFOLDER                     40108
 #define ID_AIINDEX                      40109
+#define ID_AIFOLDER_PICK                40110
+#define ID_AIFOLDER_IDX                 40120
+#define ID_AIFOLDER_IDXMAX              20
 
 // Next default values for new objects
 //
