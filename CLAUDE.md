@@ -185,8 +185,10 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
     .mp4/.mov/.m4v, `twpng_IsVideoPath`): a Media Foundation media engine
     (`IMFMediaEngine`, rendering mode via `MF_MEDIA_ENGINE_PLAYBACK_HWND`) renders into a
     child window of class `TWPNGVIDEO` (`g_vid.host`), placed over the thumbnail's image
-    area or over the full-screen view above a `TWPNG_FULLBAND` status strip
-    (`twpng_VideoPlace`). The dialog and the full-screen window have `WS_CLIPCHILDREN` (and
+    area or fitted to the whole full-screen view (`twpng_VideoPlace`). Since the video
+    covers the full-screen window's own status line, that line (`twpng_FullStatusText`)
+    then shows in an owned, semi-transparent, click-through popup (`twpng_FullOSD`, class
+    `TWPNGOSD`, `WS_EX_LAYERED|WS_EX_TRANSPARENT`), updated from `twpng_VideoUI`. The dialog and the full-screen window have `WS_CLIPCHILDREN` (and
     the thumbnail `WS_CLIPSIBLINGS`) so GDI painting doesn't overwrite the video. Engine
     events arrive on an MF thread and are posted to the host as `WM_APP_VIDEO`; the host is
     shown at the first frame and forwards clicks (posted, since browsing destroys it).

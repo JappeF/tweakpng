@@ -3541,6 +3541,27 @@ static void twpng_FullBlit(HDC dc, const RECT *rc, HBITMAP bmp, int w, int h, BO
 	DeleteDC(mdc);
 }
 
+// File name, position and (for videos) play state, shown at the bottom of the full-screen view.
+static void twpng_FullStatusText(TCHAR *line, int cap)
+{
+	const TCHAR *base = _tcsrchr(g_full.path, _T('\\'));
+	base = base ? base+1 : g_full.path;
+	TCHAR **list;
+	int idx = -1, n = g_full.path[0] ? twpng_GetSiblings(g_full.path, &list, &idx, FALSE) : 0;
+	if(idx>=0) StringCchPrintf(line, cap, _T("%s  (%d/%d)"), base, idx+1, n);
+	else StringCchCopy(line, cap, base);
+	BOOL vid = twpng_IsVideoPath(g_full.path);
+	if(vid) {
+		TCHAR st[60];
+		StringCchPrintf(st, 60, _T("   %s %d%%"), twpng_VideoPlaying() ? _T("playing at") : _T("paused,"), g_vidRate);
+		StringCchCat(line, cap, st);
+	}
+	else if(g_full.loading) StringCchCat(line, cap, _T("   loading..."));
+	else if(!g_full.bmp) StringCchCat(line, cap, _T("   no preview"));
+	StringCchCat(line, cap, vid ? _T("      Left/Right or click: browse   Space: play/pause   -/+: speed   Esc: close")
+	                            : _T("      Left/Right or click: browse   Esc: close"));
+}
+
 static void twpng_FullPaint(HWND hwnd, HDC hdc)
 {
 	RECT rc;
@@ -3552,7 +3573,8 @@ static void twpng_FullPaint(HWND hwnd, HDC hdc)
 	FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
 	struct aiparams_ctx *c = g_aiParamsCtx;
-	if(g_vid.shown && g_vid.host && GetParent(g_vid.host)==hwnd) {
+	BOOL vidShown = g_vid.shown && g_vid.host && GetParent(g_vid.host)==hwnd;
+	if(vidShown) {
 		// The video window covers it; the still image would only peek out at the edges.
 	} else if(g_full.bmp) {
 		BITMAP bm;
@@ -3563,34 +3585,21 @@ static void twpng_FullPaint(HWND hwnd, HDC hdc)
 		twpng_FullBlit(dc, &rc, c->thumb, c->thumbW, c->thumbH, FALSE);
 	}
 
-	// File name and position at the bottom.
-	TCHAR line[MAX_PATH+120];
-	const TCHAR *base = _tcsrchr(g_full.path, _T('\\'));
-	base = base ? base+1 : g_full.path;
-	TCHAR **list;
-	int idx = -1, n = g_full.path[0] ? twpng_GetSiblings(g_full.path, &list, &idx, FALSE) : 0;
-	if(idx>=0) StringCchPrintf(line, MAX_PATH+120, _T("%s  (%d/%d)"), base, idx+1, n);
-	else StringCchCopy(line, MAX_PATH+120, base);
-	BOOL vid = twpng_IsVideoPath(g_full.path);
-	if(vid) {
-		TCHAR st[60];
-		StringCchPrintf(st, 60, _T("   %s %d%%"), twpng_VideoPlaying() ? _T("playing at") : _T("paused,"), g_vidRate);
-		StringCchCat(line, MAX_PATH+120, st);
+	// File name and position at the bottom (over a playing video the overlay shows it).
+	if(!vidShown) {
+		TCHAR line[MAX_PATH+120];
+		twpng_FullStatusText(line, MAX_PATH+120);
+		HGDIOBJ oldFont = SelectObject(dc, g_full.font ? g_full.font : globals.hUiFont);
+		SetBkMode(dc, TRANSPARENT);
+		RECT tr = { 16, rc.bottom-40, rc.right-16, rc.bottom-12 };
+		RECT sh = tr;
+		OffsetRect(&sh, 1, 1);
+		SetTextColor(dc, RGB(0,0,0));
+		DrawText(dc, line, -1, &sh, DT_LEFT|DT_BOTTOM|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
+		SetTextColor(dc, RGB(200,200,200));
+		DrawText(dc, line, -1, &tr, DT_LEFT|DT_BOTTOM|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
+		SelectObject(dc, oldFont);
 	}
-	else if(g_full.loading) StringCchCat(line, MAX_PATH+120, _T("   loading..."));
-	else if(!g_full.bmp) StringCchCat(line, MAX_PATH+120, _T("   no preview"));
-	StringCchCat(line, MAX_PATH+120, vid ? _T("      Left/Right or click: browse   Space: play/pause   -/+: speed   Esc: close")
-	                                     : _T("      Left/Right or click: browse   Esc: close"));
-	HGDIOBJ oldFont = SelectObject(dc, g_full.font ? g_full.font : globals.hUiFont);
-	SetBkMode(dc, TRANSPARENT);
-	RECT tr = { 16, rc.bottom-40, rc.right-16, rc.bottom-12 };
-	RECT sh = tr;
-	OffsetRect(&sh, 1, 1);
-	SetTextColor(dc, RGB(0,0,0));
-	DrawText(dc, line, -1, &sh, DT_LEFT|DT_BOTTOM|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
-	SetTextColor(dc, RGB(200,200,200));
-	DrawText(dc, line, -1, &tr, DT_LEFT|DT_BOTTOM|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
-	SelectObject(dc, oldFont);
 
 	BitBlt(hdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
 	SelectObject(dc, oldBuf);
@@ -3719,7 +3728,81 @@ static void twpng_FullscreenOpen()
 // at the same position. Speed changes go through the engine's playback rate.
 
 #define WM_APP_VIDEO (WM_APP+25)
-#define TWPNG_FULLBAND 56     // status line height under a video in the full-screen view
+
+// Over a video in the full-screen view the status line can't be painted by the window
+// itself (the video window covers it), so it goes into a small owned, semi-transparent
+// popup that lets the mouse through.
+static HWND g_hwndOSD = NULL;
+static TCHAR g_osdText[MAX_PATH+120];
+
+static LRESULT CALLBACK OSDWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch(msg) {
+	case WM_NCHITTEST:
+		return HTTRANSPARENT;
+	case WM_ERASEBKGND:
+		return 1;
+	case WM_PAINT:
+		{
+			PAINTSTRUCT ps;
+			HDC dc = BeginPaint(hwnd, &ps);
+			RECT rc;
+			GetClientRect(hwnd, &rc);
+			FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+			HGDIOBJ old = SelectObject(dc, g_full.font ? g_full.font : globals.hUiFont);
+			SetBkMode(dc, TRANSPARENT);
+			SetTextColor(dc, RGB(215,215,215));
+			DrawText(dc, g_osdText, -1, &rc, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+			SelectObject(dc, old);
+			EndPaint(hwnd, &ps);
+			return 0;
+		}
+	case WM_DESTROY:
+		if(g_hwndOSD==hwnd) g_hwndOSD = NULL;
+		return 0;
+	}
+	return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void twpng_FullOSD()
+{
+	BOOL want = g_hwndFull && g_vid.shown && g_vid.host && GetParent(g_vid.host)==g_hwndFull;
+	if(!want) {
+		if(g_hwndOSD) ShowWindow(g_hwndOSD, SW_HIDE);
+		return;
+	}
+	if(!g_hwndOSD) {
+		static BOOL registered = FALSE;
+		if(!registered) {
+			WNDCLASS wc;
+			ZeroMemory(&wc, sizeof(wc));
+			wc.lpfnWndProc = OSDWndProc;
+			wc.hInstance = globals.hInst;
+			wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+			wc.lpszClassName = _T("TWPNGOSD");
+			registered = RegisterClass(&wc)!=0;
+			if(!registered) return;
+		}
+		g_hwndOSD = CreateWindowEx(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,
+			_T("TWPNGOSD"), NULL, WS_POPUP, 0, 0, 1, 1, g_hwndFull, NULL, globals.hInst, NULL);
+		if(!g_hwndOSD) return;
+		SetLayeredWindowAttributes(g_hwndOSD, 0, 170, LWA_ALPHA);
+	}
+	twpng_FullStatusText(g_osdText, MAX_PATH+120);
+	HDC dc = GetDC(g_hwndOSD);
+	HGDIOBJ old = SelectObject(dc, g_full.font ? g_full.font : globals.hUiFont);
+	SIZE sz = { 0, 0 };
+	GetTextExtentPoint32(dc, g_osdText, lstrlen(g_osdText), &sz);
+	SelectObject(dc, old);
+	ReleaseDC(g_hwndOSD, dc);
+	RECT fr;
+	GetWindowRect(g_hwndFull, &fr);
+	int w = sz.cx + 28, h = sz.cy + 12;
+	if(w > fr.right-fr.left-32) w = fr.right-fr.left-32;
+	SetWindowPos(g_hwndOSD, NULL, fr.left+16, fr.bottom-16-h, w, h,
+		SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+	InvalidateRect(g_hwndOSD, NULL, FALSE);
+}
 
 class TwpngVideoNotify : public IMFMediaEngineNotify {
 	LONG m_ref;
@@ -3781,10 +3864,8 @@ static void twpng_VideoPlace()
 	if(!aw || !ah) { aw = 16; ah = 9; }
 	RECT box;
 	BOOL full = (parent==g_hwndFull);
-	if(full) {
-		GetClientRect(parent, &box);
-		box.bottom -= TWPNG_FULLBAND;
-	} else {
+	if(full) GetClientRect(parent, &box);
+	else {
 		HWND th = GetDlgItem(parent, IDC_AIP_THUMB);
 		if(!(GetWindowLongPtr(th, GWL_STYLE) & WS_VISIBLE)) SetRectEmpty(&box);
 		else {
@@ -3828,10 +3909,8 @@ static void twpng_VideoUI()
 		EnableWindow(GetDlgItem(h, IDC_AIP_FASTER), g_vidRate<400);
 	}
 	if(g_hwndFull) {
-		RECT r;
-		GetClientRect(g_hwndFull, &r);
-		r.top = r.bottom - TWPNG_FULLBAND;
-		InvalidateRect(g_hwndFull, &r, FALSE);
+		InvalidateRect(g_hwndFull, NULL, FALSE);
+		twpng_FullOSD();
 	}
 }
 
