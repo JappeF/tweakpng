@@ -34,7 +34,8 @@ Civitai):
 - **Video playback** - videos play right in the viewer and full screen (Play or Space,
   looped). - and + change the speed in steps of 25%, and the sound follows like a tape:
   faster is higher, slower is lower.
-- **Folder Overview** (Tools menu, or Ctrl+F in the viewer) - all images and videos of a
+- **Folder Overview** (Tools menu, or the Folder Overview button / Ctrl+F in the viewer,
+  which then keeps the row of the file you are viewing selected) - all images and videos of a
   folder in one list with date, seed, model, mode, duration and prompt, a search box,
   sortable columns, a right-click menu (open, show in Explorer, copy path or prompt) and
   Export CSV. Scans in the background and keeps an index, so a folder with 22,000 files

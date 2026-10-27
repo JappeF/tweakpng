@@ -123,6 +123,7 @@
 #define IDC_AIP_SLOWER                  1138
 #define IDC_AIP_SPEED                   1139
 #define IDC_AIP_FASTER                  1140
+#define IDC_AIP_FOLDER                  1141
 #define ID_EXIT                         40001
 #define ID_OPEN                         40002
 #define ID_SAVEAS                       40003

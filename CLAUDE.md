@@ -177,6 +177,11 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
     `WS_CLIPCHILDREN`, swallows `WM_ERASEBKGND` and fills the background in `WM_PAINT`) and
     the thumbnail (no erase, drawn through a buffer). Don't go back to
     `RedrawWindow(RDW_ERASE|RDW_ALLCHILDREN)` there: it blinks every edit box on each step.
+    The three edits are subclassed with `BufferedEditSubclassProc` (no erase; `WM_PAINT`
+    fills the parent's `WM_CTLCOLOR*` brush into a buffered-paint DC and lets the edit paint
+    into it via `WM_PAINT` with an HDC). A resized edit otherwise shows its erased state for
+    a moment while a splitter is dragged, mostly while a video plays (its presents make DWM
+    compose the window mid-paint); a window resize is synchronized and didn't show it.
   - **Full screen** (double-click the thumbnail or F11; `twpng_FullscreenOpen`,
     `FullWndProc`, class `TWPNGFULLVIEW`): a popup covering the viewer's monitor.
     `twpng_DecodeFit` decodes on a worker thread (WIC, scaled to the screen, premultiplied
@@ -221,6 +226,13 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
     decoding fails the engine's own sound is unmuted.
   - **Show in Explorer** (`IDC_AIP_EXPLORER`): `SHOpenFolderAndSelectItems`; an already
     open Explorer window on that folder is reused.
+  - **Folder Overview** (`IDC_AIP_FOLDER`, also Ctrl+F; `twpng_FolderForViewer`) opens the
+    overview of the viewer's folder. Every file change in the viewer
+    (`twpng_ShowAIParams`) calls `twpng_FolderFollow`, which selects that file's row when
+    the overview shows the same folder. A row the scan hasn't reached yet waits in
+    `f->follow` and is applied after each `WM_APP_SCAN` batch and swap-in
+    (`twpng_FolderApplyFollow`). Dark mode custom-draws the selection of the unfocused
+    list in a visible gray, since the theme's is close to the background.
   - **Save JSON** writes `ctx->full` as UTF-8 when it is JSON (the ComfyUI graph), so it
     can be loaded back into ComfyUI. Parser `twpng_ParseA1111` splits on the
   `Negative prompt:` and `Steps:` line markers; `twpng_SettingsToLines` reformats the
@@ -328,7 +340,7 @@ folder (`ID_AIFOLDER`), Choose Folder (`ID_AIFOLDER_PICK`), up to 20 indexed fol
 menu under the button (`twpng_FolderChangeMenu`), and `WM_CONTEXTMENU` on the list
 (`twpng_FolderContextMenu`) offers Open in Viewer / Show in Explorer (all selected files in
 one window, `twpng_ShowFilesInExplorer`) / Copy Full Path / Copy Prompt for the selected rows.
-Ctrl+F in the viewer opens the modeless,
+The viewer's Folder Overview button or Ctrl+F opens the modeless,
 unowned `DLG_AIFOLDER` (`DlgProcAIFolder`, `g_hwndAIFolder`, routed in the message loop
 like the viewer). It lists every supported file of a folder in a virtual list view
 (`LVS_OWNERDATA`, text from `LVN_GETDISPINFO`; `twpng_FindSetting` pulls single values

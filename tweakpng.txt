@@ -519,6 +519,9 @@ Buttons at the bottom:
   stays fast; press F5 to read the folder again.
 - Show in Explorer: opens the file's folder in Explorer with the file
   selected.
+- Folder Overview (also Ctrl+F): opens the Folder Overview of the file's
+  folder with the file selected. While both are open, the overview keeps
+  the row of the file in the viewer selected as you browse.
 - Save JSON...: saves the ComfyUI graph as a .json file, which can be
   loaded back into ComfyUI.
 - Copy All: copies the complete metadata text.
@@ -538,8 +541,9 @@ Lists every image and video in a folder with its seed, model, mode,
 duration and prompt. The submenu offers the folder of the current file,
 Choose Folder... to pick another one, and the folders that already have an
 index (most recently scanned first, with their number of files), so those
-open straight away. Ctrl+F in the AI parameters viewer opens it for the
-viewer's folder with the search box ready.
+open straight away. The Folder Overview button (or Ctrl+F) in the AI
+parameters viewer opens it for the viewer's folder; the row of the file in
+the viewer stays selected while you browse there.
 
 - Search: type words to filter the list. Every word must appear in the
   file name, the prompt, the negative prompt or the settings, for example

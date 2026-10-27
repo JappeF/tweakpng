@@ -130,6 +130,8 @@ static void twpng_FullscreenOpen();
 static void twpng_FullLoad();
 static void twpng_ShowInExplorer(const TCHAR *path);
 static void twpng_ShowFolderOverview(const TCHAR *dir, BOOL focusSearch);
+static void twpng_FolderFollow(const TCHAR *path);
+static void twpng_FolderForViewer(BOOL focusSearch);
 static LRESULT CALLBACK MainListSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 static void twpng_ViewAIParams(HWND owner);
@@ -2748,6 +2750,43 @@ static LRESULT CALLBACK ThumbSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 	return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
+// A resized multi-line edit erases its whole client area and then draws the text. A window
+// resize is synchronized by DWM, but while a splitter is dragged the erased state reaches
+// the screen and the text blinks, so these edits paint through a buffer.
+static LRESULT CALLBACK BufferedEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+	(void)dwRefData;
+	switch(msg) {
+	case WM_ERASEBKGND:
+		return 1;
+	case WM_PAINT:
+		if(!wParam) {
+			PAINTSTRUCT ps;
+			HDC hdc = BeginPaint(hwnd, &ps);
+			RECT rc;
+			GetClientRect(hwnd, &rc);
+			HDC mem = NULL;
+			HPAINTBUFFER pb = BeginBufferedPaint(hdc, &rc, BPBF_COMPATIBLEBITMAP, NULL, &mem);
+			HDC dc = pb ? mem : hdc;
+			// The background the edit would have erased with: its parent's WM_CTLCOLOR* brush.
+			UINT cm = (GetWindowLong(hwnd, GWL_STYLE) & ES_READONLY) || !IsWindowEnabled(hwnd) ?
+				WM_CTLCOLORSTATIC : WM_CTLCOLOREDIT;
+			HBRUSH br = (HBRUSH)SendMessage(GetParent(hwnd), cm, (WPARAM)dc, (LPARAM)hwnd);
+			FillRect(dc, &rc, br ? br : GetSysColorBrush(COLOR_WINDOW));
+			DefSubclassProc(hwnd, WM_PAINT, (WPARAM)dc, 0);   // the edit paints into a given DC
+			if(pb) EndBufferedPaint(pb, TRUE);
+			EndPaint(hwnd, &ps);
+			return 0;
+		}
+		break;
+	case WM_NCDESTROY:
+		RemoveWindowSubclass(hwnd, BufferedEditSubclassProc, uIdSubclass);
+		break;
+	}
+	return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
 // ---- Thumbnail ------------------------------------------------------------------------
 
 static volatile LONG g_thumbGen = 0;
@@ -2877,6 +2916,7 @@ static void twpng_FillAIParams(HWND hwnd, struct aiparams_ctx *c)
 	}
 	EnableWindow(GetDlgItem(hwnd,IDC_AIP_SAVEJSON), json);
 	EnableWindow(GetDlgItem(hwnd,IDC_AIP_EXPLORER), c->path[0]!=0);
+	EnableWindow(GetDlgItem(hwnd,IDC_AIP_FOLDER), c->path[0]!=0);
 	twpng_UpdateAINav(hwnd, c);
 	twpng_VideoUI();
 }
@@ -3051,7 +3091,8 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	twpng_LayMove(&dw,hwnd,IDC_AIP_PREV,m,bottomY,navW,btnH,0);
 	twpng_LayMove(&dw,hwnd,IDC_AIP_NEXT,m+navW+gap,bottomY,navW,btnH,0);
 	twpng_LayMove(&dw,hwnd,IDC_AIP_EXPLORER,m+2*(navW+gap),bottomY,110,btnH,0);
-	int px = m+2*(navW+gap)+110+gap;
+	twpng_LayMove(&dw,hwnd,IDC_AIP_FOLDER,m+2*(navW+gap)+110+gap,bottomY,110,btnH,0);
+	int px = m+2*(navW+gap)+2*(110+gap);
 	twpng_LayMove(&dw,hwnd,IDC_AIP_PLAY,px,bottomY,60,btnH,0);
 	twpng_LayMove(&dw,hwnd,IDC_AIP_SLOWER,px+60+gap,bottomY,btnH,btnH,0);
 	twpng_LayMove(&dw,hwnd,IDC_AIP_SPEED,px+60+gap+btnH,bottomY+(btnH-labelH)/2,44,labelH,0);
@@ -3077,6 +3118,9 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		SetWindowLongPtr(hwnd,DWLP_USER,lParam);
 		SendMessage(hwnd,WM_SETICON,ICON_BIG,(LPARAM)LoadIcon(globals.hInst,_T("ICONMAIN")));
 		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_THUMB), ThumbSubclassProc, 0, 0);
+		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_PROMPT), BufferedEditSubclassProc, 0, 0);
+		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_NEG), BufferedEditSubclassProc, 0, 0);
+		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_SETTINGS), BufferedEditSubclassProc, 0, 0);
 		// Set before CreateDialogParam returns, so twpng_VideoUI (via the fill below) can
 		// already show the video controls.
 		g_hwndAIParams = hwnd;
@@ -3101,7 +3145,7 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		{
 			LPMINMAXINFO mm=(LPMINMAXINFO)lParam;
 			// With the video controls the bottom row needs more room, or they overlap Save JSON.
-			mm->ptMinTrackSize.x=(GetWindowLongPtr(GetDlgItem(hwnd,IDC_AIP_PLAY),GWL_STYLE) & WS_VISIBLE) ? 690 : 360;
+			mm->ptMinTrackSize.x=(GetWindowLongPtr(GetDlgItem(hwnd,IDC_AIP_PLAY),GWL_STYLE) & WS_VISIBLE) ? 810 : 640;
 			mm->ptMinTrackSize.y=300;
 			return 0;
 		}
@@ -3230,6 +3274,7 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		case IDC_AIP_PREV:       twpng_AIParamsNavigate(-1); return 1;
 		case IDC_AIP_NEXT:       twpng_AIParamsNavigate(1); return 1;
 		case IDC_AIP_EXPLORER:   if(c && c->path[0]) twpng_ShowInExplorer(c->path); return 1;
+		case IDC_AIP_FOLDER:     twpng_FolderForViewer(FALSE); return 1;
 		case IDC_AIP_PLAY:       twpng_VideoToggle(); return 1;
 		case IDC_AIP_SLOWER:     twpng_VideoSpeed(-1); return 1;
 		case IDC_AIP_FASTER:     twpng_VideoSpeed(1); return 1;
@@ -3298,6 +3343,7 @@ static int twpng_ShowAIParams(const TCHAR *text, const TCHAR *extra, const TCHAR
 	if(path) StringCchCopy(c->path, MAX_PATH, path);
 	c->isDoc = isDoc;
 	twpng_RequestThumb(c);
+	twpng_FolderFollow(c->path);
 
 	if(g_hwndAIParams) {
 		struct aiparams_ctx *old = g_aiParamsCtx;
@@ -4568,10 +4614,7 @@ static BOOL twpng_AIParamsKey(const MSG *m)
 		if(m->wParam==VK_OEM_MINUS || m->wParam==VK_SUBTRACT) { twpng_VideoSpeed(-1); return TRUE; }
 	}
 	if(ctrl && !alt && m->wParam=='F' && g_aiParamsCtx && g_aiParamsCtx->path[0]) {
-		TCHAR d[MAX_PATH];
-		StringCchCopy(d, MAX_PATH, g_aiParamsCtx->path);
-		TCHAR *sl = _tcsrchr(d, _T('\\'));
-		if(sl) { sl[1] = 0; twpng_ShowFolderOverview(d, TRUE); }
+		twpng_FolderForViewer(TRUE);
 		return TRUE;
 	}
 	if(m->wParam==VK_F11 && !alt && !ctrl) {
@@ -6789,6 +6832,7 @@ struct twpng_folderdlg {
 	LONG watchGen;
 	ULONGLONG lastSort;           // re-sorting while a scan runs is limited to once a second
 	BOOL unsorted;                // rows were added since the last sort
+	TCHAR follow[MAX_PATH];       // file shown in the viewer, selected once its row is there
 };
 
 // Columns of the folder overview list.
@@ -7073,6 +7117,53 @@ static void twpng_FolderStatus(HWND hwnd, struct twpng_folderdlg *f)
 	ShowWindow(GetDlgItem(hwnd, IDC_AF_STOP), f->finished ? SW_HIDE : SW_SHOW);
 }
 
+// Select the row of the file the viewer shows. FALSE while the scan hasn't reached it (or
+// the search hides it); it is tried again as rows come in.
+static BOOL twpng_FolderApplyFollow(HWND hwnd, struct twpng_folderdlg *f)
+{
+	if(!f->follow[0] || !f->scan) return FALSE;
+	for(int i=0; i<f->nrows; i++) {
+		if(lstrcmpi(f->scan->recs[f->rows[i]].name, f->follow)) continue;
+		HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
+		ListView_SetItemState(lv, -1, 0, LVIS_SELECTED|LVIS_FOCUSED);
+		ListView_SetItemState(lv, i, LVIS_SELECTED|LVIS_FOCUSED, LVIS_SELECTED|LVIS_FOCUSED);
+		ListView_SetSelectionMark(lv, i);
+		ListView_EnsureVisible(lv, i, FALSE);
+		f->follow[0] = 0;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+// The viewer moved to `path`: follow it when the overview shows that folder.
+static void twpng_FolderFollow(const TCHAR *path)
+{
+	if(!g_hwndAIFolder || !path || !path[0]) return;
+	struct twpng_folderdlg *f = (struct twpng_folderdlg*)GetWindowLongPtr(g_hwndAIFolder, DWLP_USER);
+	const TCHAR *name = _tcsrchr(path, _T('\\'));
+	if(!f || !name) return;
+	int dl = lstrlen(f->dir);
+	if(dl && f->dir[dl-1]==_T('\\')) dl--;
+	if((int)(name-path)!=dl || _tcsnicmp(path, f->dir, dl)) return;
+	StringCchCopy(f->follow, MAX_PATH, name+1);
+	// Not listed (yet): don't leave the previous file selected.
+	if(!twpng_FolderApplyFollow(g_hwndAIFolder, f))
+		ListView_SetItemState(GetDlgItem(g_hwndAIFolder, IDC_AF_LIST), -1, 0, LVIS_SELECTED);
+}
+
+// Viewer button / Ctrl+F: the overview of the viewer's folder, on the file it shows.
+static void twpng_FolderForViewer(BOOL focusSearch)
+{
+	if(!g_aiParamsCtx || !g_aiParamsCtx->path[0]) return;
+	TCHAR d[MAX_PATH];
+	StringCchCopy(d, MAX_PATH, g_aiParamsCtx->path);
+	TCHAR *sl = _tcsrchr(d, _T('\\'));
+	if(!sl) return;
+	sl[1] = 0;
+	twpng_ShowFolderOverview(d, focusSearch);
+	twpng_FolderFollow(g_aiParamsCtx->path);
+}
+
 // ---- watching the folder: new or changed files show up without a manual rescan ----
 // A worker waits for change notifications (and also checks the folder's time every 10 s,
 // for network or cloud drives that don't send them) and posts WM_APP_FOLDERCHANGED. The
@@ -7196,6 +7287,7 @@ static void twpng_FolderSwapIn(HWND hwnd, struct twpng_folderdlg *f)
 	ListView_SetItemCountEx(lv, f->nrows, LVSICF_NOSCROLL);
 	InvalidateRect(lv, NULL, FALSE);
 	twpng_FolderRestorePos(lv, f, &pos, TRUE);
+	twpng_FolderApplyFollow(hwnd, f);
 	twpng_FolderStatus(hwnd, f);
 	if(f->dirty) twpng_FolderQuietScan(hwnd, f);
 }
@@ -7528,6 +7620,7 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		else if(f && (struct twpng_scan*)lParam==f->scan) {
 			if(wParam==1) { f->finished = TRUE; f->stopped = f->scan->cancel!=0; }
 			twpng_FolderFilterMore(hwnd, f);
+			twpng_FolderApplyFollow(hwnd, f);
 			twpng_FolderStatus(hwnd, f);
 			if(wParam==1 && f->dirty && !f->stopped) twpng_FolderQuietScan(hwnd, f);
 		}
@@ -7589,6 +7682,21 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			}
 			if(nh->code==LVN_COLUMNCLICK) {
 				twpng_FolderSortClick(hwnd, f, ((LPNMLISTVIEW)lParam)->iSubItem);
+				return TRUE;
+			}
+			if(nh->code==NM_CUSTOMDRAW && globals.dark) {
+				// The dark theme draws the selection of an unfocused list almost like the
+				// background, and the row of the file in the viewer should stand out.
+				LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)lParam;
+				LRESULT r = CDRF_DODEFAULT;
+				if(cd->nmcd.dwDrawStage==CDDS_PREPAINT) r = CDRF_NOTIFYITEMDRAW;
+				else if(cd->nmcd.dwDrawStage==CDDS_ITEMPREPAINT && GetFocus()!=nh->hwndFrom &&
+				        ListView_GetItemState(nh->hwndFrom, (int)cd->nmcd.dwItemSpec, LVIS_SELECTED)) {
+					cd->nmcd.uItemState &= ~CDIS_SELECTED;
+					cd->clrTextBk = RGB(0x46,0x46,0x46);
+					cd->clrText = RGB(0xff,0xff,0xff);
+				}
+				SetWindowLongPtr(hwnd, DWLP_MSGRESULT, r);
 				return TRUE;
 			}
 			if(nh->code==LVN_ITEMACTIVATE) {
