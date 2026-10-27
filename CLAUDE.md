@@ -93,7 +93,9 @@ When touching this, the canonical reference is `adzm/win32-custom-menubar-aero-t
 - **Radio buttons** render their label black even when themed, so they're owner-drawn by
   `RadioSubclassProc` (themed dark glyph via `DrawThemeBackground` + light label). Edit
   controls get a flat dark border via `EditBorderSubclassProc` (the sunken client edge is
-  painted over, not removed, to keep single-line text centered).
+  painted over, not removed, to keep single-line text centered). Its `WM_NCPAINT` hands the
+  default a region without that 2-pixel edge, so the light edge never shows first (it blinked
+  on every resize step).
 - **Message boxes**: the OS `MessageBox` can't be fully darkened (it paints a light footer
   in `WM_PAINT`), so `twpng_MessageBox` is a custom dark dialog (`DLG_MSGBOX`) used by
   `mesg()` and every other call site. Supports MB_OK/OKCANCEL/YESNO/YESNOCANCEL + icons.
@@ -170,6 +172,11 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
     registry `aip_split_*`, thumb 0 = from the image aspect); `WM_LBUTTONDBLCLK` on a
     splitter resets it. The dialog's own `WM_PAINT` draws five-dot grips in the gaps
     (`twpng_AIPDrawGrips`, brighter on hover via `TrackMouseEvent` / `WM_MOUSELEAVE`).
+    Against flicker while dragging/resizing: `twpng_LayoutAIParams` moves everything in one
+    `DeferWindowPos` batch (`twpng_LayMove`) and then invalidates only the dialog (which has
+    `WS_CLIPCHILDREN`, swallows `WM_ERASEBKGND` and fills the background in `WM_PAINT`) and
+    the thumbnail (no erase, drawn through a buffer). Don't go back to
+    `RedrawWindow(RDW_ERASE|RDW_ALLCHILDREN)` there: it blinks every edit box on each step.
   - **Full screen** (double-click the thumbnail or F11; `twpng_FullscreenOpen`,
     `FullWndProc`, class `TWPNGFULLVIEW`): a popup covering the viewer's monitor.
     `twpng_DecodeFit` decodes on a worker thread (WIC, scaled to the screen, premultiplied
@@ -187,8 +194,10 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
     child window of class `TWPNGVIDEO` (`g_vid.host`), placed over the thumbnail's image
     area or fitted to the whole full-screen view (`twpng_VideoPlace`). Since the video
     covers the full-screen window's own status line, that line (`twpng_FullStatusText`)
-    then shows in an owned, semi-transparent, click-through popup (`twpng_FullOSD`, class
-    `TWPNGOSD`, `WS_EX_LAYERED|WS_EX_TRANSPARENT`), updated from `twpng_VideoUI`. The dialog and the full-screen window have `WS_CLIPCHILDREN` (and
+    then shows in an owned, click-through popup (`twpng_FullOSD`, class `TWPNGOSD`,
+    `WS_EX_LAYERED|WS_EX_TRANSPARENT`) drawn with `UpdateLayeredWindow` per-pixel alpha:
+    grayscale-antialiased text coverage plus a spread copy as a dark edge, the rest fully
+    transparent. Updated from `twpng_VideoUI`. The dialog and the full-screen window have `WS_CLIPCHILDREN` (and
     the thumbnail `WS_CLIPSIBLINGS`) so GDI painting doesn't overwrite the video. Engine
     events arrive on an MF thread and are posted to the host as `WM_APP_VIDEO`; the host is
     shown at the first frame and forwards clicks (posted, since browsing destroys it).

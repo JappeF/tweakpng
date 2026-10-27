@@ -2735,6 +2735,8 @@ static LRESULT CALLBACK ThumbSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 		return 0;
 	case WM_RBUTTONUP:
 		return 0;
+	case WM_ERASEBKGND:
+		return 1;   // twpng_DrawThumb paints every pixel
 	case WM_NCDESTROY:
 		RemoveWindowSubclass(hwnd, ThumbSubclassProc, uIdSubclass);
 		break;
@@ -2817,26 +2819,37 @@ static void twpng_ThumbDone(struct twpng_thumbjob *j)
 static void twpng_DrawThumb(const DRAWITEMSTRUCT *d, const struct aiparams_ctx *c)
 {
 	RECT r = d->rcItem;
-	FillRect(d->hDC, &r, globals.hUiBgBrush ? globals.hUiBgBrush : GetSysColorBrush(COLOR_BTNFACE));
-	if(!c || !c->thumb || c->thumbW<=0 || c->thumbH<=0) return;
 	int w = r.right-r.left, h = r.bottom-r.top;
-	int dw = w, dh = MulDiv(w, c->thumbH, c->thumbW);
-	if(dh > h) { dh = h; dw = MulDiv(h, c->thumbW, c->thumbH); }
-	int x = r.left + (w-dw)/2, y = r.top;   // centered when the column is wider than the image
-	HDC mdc = CreateCompatibleDC(d->hDC);
-	HGDIOBJ old = SelectObject(mdc, c->thumb);
-	BOOL done = FALSE;
-	if(c->thumbAlpha) {
-		BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-		done = AlphaBlend(d->hDC, x, y, dw, dh, mdc, 0, 0, c->thumbW, c->thumbH, bf);
+	if(w<=0 || h<=0) return;
+	// Drawn in a buffer and copied in one go, so resizing doesn't show the empty background.
+	HDC bdc = CreateCompatibleDC(d->hDC);
+	HBITMAP buf = CreateCompatibleBitmap(d->hDC, w, h);
+	HGDIOBJ oldBuf = SelectObject(bdc, buf);
+	RECT br = { 0, 0, w, h };
+	FillRect(bdc, &br, globals.hUiBgBrush ? globals.hUiBgBrush : GetSysColorBrush(COLOR_BTNFACE));
+	if(c && c->thumb && c->thumbW>0 && c->thumbH>0) {
+		int dw = w, dh = MulDiv(w, c->thumbH, c->thumbW);
+		if(dh > h) { dh = h; dw = MulDiv(h, c->thumbW, c->thumbH); }
+		int x = (w-dw)/2, y = 0;   // centered when the column is wider than the image
+		HDC mdc = CreateCompatibleDC(d->hDC);
+		HGDIOBJ old = SelectObject(mdc, c->thumb);
+		BOOL done = FALSE;
+		if(c->thumbAlpha) {
+			BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+			done = AlphaBlend(bdc, x, y, dw, dh, mdc, 0, 0, c->thumbW, c->thumbH, bf);
+		}
+		if(!done) {
+			SetStretchBltMode(bdc, HALFTONE);
+			SetBrushOrgEx(bdc, 0, 0, NULL);
+			StretchBlt(bdc, x, y, dw, dh, mdc, 0, 0, c->thumbW, c->thumbH, SRCCOPY);
+		}
+		SelectObject(mdc, old);
+		DeleteDC(mdc);
 	}
-	if(!done) {
-		SetStretchBltMode(d->hDC, HALFTONE);
-		SetBrushOrgEx(d->hDC, 0, 0, NULL);
-		StretchBlt(d->hDC, x, y, dw, dh, mdc, 0, 0, c->thumbW, c->thumbH, SRCCOPY);
-	}
-	SelectObject(mdc, old);
-	DeleteDC(mdc);
+	BitBlt(d->hDC, r.left, r.top, w, h, bdc, 0, 0, SRCCOPY);
+	SelectObject(bdc, oldBuf);
+	DeleteObject(buf);
+	DeleteDC(bdc);
 }
 
 static void twpng_FillAIParams(HWND hwnd, struct aiparams_ctx *c)
@@ -2949,6 +2962,15 @@ static void twpng_AIPSplitDrag(HWND hwnd, int x, int y)
 	UpdateWindow(hwnd);
 }
 
+// Queue a control move in a DeferWindowPos batch, so the whole layout lands at once.
+static void twpng_LayMove(HDWP *dw, HWND hwnd, int id, int x, int y, int w, int h, UINT extra)
+{
+	HWND c = GetDlgItem(hwnd, id);
+	UINT f = SWP_NOZORDER|SWP_NOACTIVATE|extra;
+	if(*dw) *dw = DeferWindowPos(*dw, c, NULL, x, y, w, h, f);
+	if(!*dw) SetWindowPos(c, NULL, x, y, w, h, f);
+}
+
 // Lay out the AI params controls to fill the (resizable) client area.
 static void twpng_LayoutAIParams(HWND hwnd)
 {
@@ -2984,17 +3006,18 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	SetRect(&g_aipSplit.rc[1], editX, g_aipSplit.negTop+negH, editX+editW, g_aipSplit.negTop+negH+gap);
 
 	int y=top;
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_LBLPROMPT),NULL,editX,y,editW,labelH,SWP_NOZORDER);
+	HDWP dw = BeginDeferWindowPos(24);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_LBLPROMPT,editX,y,editW,labelH,0);
 	y+=labelH;
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_PROMPT),NULL,editX,y,editW,promptH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYPROMPT),NULL,copyX,y,copyW,copyH,SWP_NOZORDER);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_PROMPT,editX,y,editW,promptH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_COPYPROMPT,copyX,y,copyW,copyH,0);
 	y+=promptH+gap;
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_LBLNEG),NULL,editX,y,editW,labelH,SWP_NOZORDER);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_LBLNEG,editX,y,editW,labelH,0);
 	y+=labelH;
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_NEG),NULL,editX,y,editW,negH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYNEG),NULL,copyX,y,copyW,copyH,SWP_NOZORDER);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_NEG,editX,y,editW,negH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_COPYNEG,copyX,y,copyW,copyH,0);
 	y+=negH+gap;
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_LBLSET),NULL,editX,y,editW,labelH,SWP_NOZORDER);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_LBLSET,editX,y,editW,labelH,0);
 	y+=labelH;
 	// The thumbnail sits right of the settings: as wide as its splitter says, or by default
 	// as tall as the box and at most half as wide.
@@ -3012,27 +3035,29 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	int setW = thumbW ? editW-thumbW-gap : editW;
 	if(thumbW) SetRect(&g_aipSplit.rc[2], editX+setW, y, editX+setW+gap, y+setH);
 	else SetRectEmpty(&g_aipSplit.rc[2]);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SETTINGS),NULL,editX,y,setW,setH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_THUMB),NULL,editX+editW-thumbW,y,thumbW?thumbW:1,setH,SWP_NOZORDER|SWP_NOCOPYBITS);
-	ShowWindow(GetDlgItem(hwnd,IDC_AIP_THUMB), thumbW ? SW_SHOW : SW_HIDE);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYSET),NULL,copyX,y,copyW,copyH,SWP_NOZORDER);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_SETTINGS,editX,y,setW,setH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_THUMB,editX+editW-thumbW,y,thumbW?thumbW:1,setH,
+		SWP_NOCOPYBITS|(thumbW ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+	twpng_LayMove(&dw,hwnd,IDC_AIP_COPYSET,copyX,y,copyW,copyH,0);
 
 	int closeX=W-m-copyW, copyAllX=closeX-gap-58, saveX=copyAllX-gap-84, navW=64;
-	SetWindowPos(GetDlgItem(hwnd,IDOK),NULL,closeX,bottomY,copyW,btnH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_COPYALL),NULL,copyAllX,bottomY,58,btnH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SAVEJSON),NULL,saveX,bottomY,84,btnH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_PREV),NULL,m,bottomY,navW,btnH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_NEXT),NULL,m+navW+gap,bottomY,navW,btnH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_EXPLORER),NULL,m+2*(navW+gap),bottomY,110,btnH,SWP_NOZORDER);
+	twpng_LayMove(&dw,hwnd,IDOK,closeX,bottomY,copyW,btnH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_COPYALL,copyAllX,bottomY,58,btnH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_SAVEJSON,saveX,bottomY,84,btnH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_PREV,m,bottomY,navW,btnH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_NEXT,m+navW+gap,bottomY,navW,btnH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_EXPLORER,m+2*(navW+gap),bottomY,110,btnH,0);
 	int px = m+2*(navW+gap)+110+gap;
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_PLAY),NULL,px,bottomY,60,btnH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SLOWER),NULL,px+60+gap,bottomY,btnH,btnH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_SPEED),NULL,px+60+gap+btnH,bottomY+(btnH-labelH)/2,44,labelH,SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AIP_FASTER),NULL,px+60+gap+btnH+44,bottomY,btnH,btnH,SWP_NOZORDER);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_PLAY,px,bottomY,60,btnH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_SLOWER,px+60+gap,bottomY,btnH,btnH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_SPEED,px+60+gap+btnH,bottomY+(btnH-labelH)/2,44,labelH,0);
+	twpng_LayMove(&dw,hwnd,IDC_AIP_FASTER,px+60+gap+btnH+44,bottomY,btnH,btnH,0);
+	if(dw) EndDeferWindowPos(dw);
 	twpng_VideoPlace();
-	// Moved controls keep stale pixels (the owner-drawn thumbnail only paints what is newly
-	// exposed), so repaint everything after a layout pass.
-	RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
+	// Repaint only the gaps (the dialog clips its children) and the thumbnail. Erasing and
+	// repainting every control on each step of a drag made them all flicker.
+	InvalidateRect(hwnd, NULL, FALSE);
+	InvalidateRect(GetDlgItem(hwnd,IDC_AIP_THUMB), NULL, FALSE);
 }
 
 static void twpng_SaveAIJson(HWND hwnd, struct aiparams_ctx *c);
@@ -3135,10 +3160,17 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		twpng_AIPSetHover(hwnd, -1);
 		break;
 
+	case WM_ERASEBKGND:
+		// WM_PAINT fills the background together with the grips, so a drag doesn't blink.
+		SetWindowLongPtr(hwnd, DWLP_MSGRESULT, 1);
+		return TRUE;
+
 	case WM_PAINT:
 		{
 			PAINTSTRUCT ps;
 			HDC dc = BeginPaint(hwnd, &ps);
+			HBRUSH br = (HBRUSH)SendMessage(hwnd, WM_CTLCOLORDLG, (WPARAM)dc, (LPARAM)hwnd);
+			FillRect(dc, &ps.rcPaint, br ? br : GetSysColorBrush(COLOR_BTNFACE));
 			twpng_AIPDrawGrips(dc);
 			EndPaint(hwnd, &ps);
 			SetWindowLongPtr(hwnd, DWLP_MSGRESULT, 0);
@@ -3730,33 +3762,16 @@ static void twpng_FullscreenOpen()
 #define WM_APP_VIDEO (WM_APP+25)
 
 // Over a video in the full-screen view the status line can't be painted by the window
-// itself (the video window covers it), so it goes into a small owned, semi-transparent
-// popup that lets the mouse through.
+// itself (the video window covers it), so it goes into a small owned popup that lets the
+// mouse through. It is a per-pixel alpha layered window: only the text and a dark edge
+// around it, the rest fully transparent, like the line over an image.
 static HWND g_hwndOSD = NULL;
-static TCHAR g_osdText[MAX_PATH+120];
 
 static LRESULT CALLBACK OSDWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	switch(msg) {
 	case WM_NCHITTEST:
 		return HTTRANSPARENT;
-	case WM_ERASEBKGND:
-		return 1;
-	case WM_PAINT:
-		{
-			PAINTSTRUCT ps;
-			HDC dc = BeginPaint(hwnd, &ps);
-			RECT rc;
-			GetClientRect(hwnd, &rc);
-			FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-			HGDIOBJ old = SelectObject(dc, g_full.font ? g_full.font : globals.hUiFont);
-			SetBkMode(dc, TRANSPARENT);
-			SetTextColor(dc, RGB(215,215,215));
-			DrawText(dc, g_osdText, -1, &rc, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
-			SelectObject(dc, old);
-			EndPaint(hwnd, &ps);
-			return 0;
-		}
 	case WM_DESTROY:
 		if(g_hwndOSD==hwnd) g_hwndOSD = NULL;
 		return 0;
@@ -3786,22 +3801,73 @@ static void twpng_FullOSD()
 		g_hwndOSD = CreateWindowEx(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,
 			_T("TWPNGOSD"), NULL, WS_POPUP, 0, 0, 1, 1, g_hwndFull, NULL, globals.hInst, NULL);
 		if(!g_hwndOSD) return;
-		SetLayeredWindowAttributes(g_hwndOSD, 0, 170, LWA_ALPHA);
 	}
-	twpng_FullStatusText(g_osdText, MAX_PATH+120);
-	HDC dc = GetDC(g_hwndOSD);
-	HGDIOBJ old = SelectObject(dc, g_full.font ? g_full.font : globals.hUiFont);
+	TCHAR text[MAX_PATH+120];
+	twpng_FullStatusText(text, MAX_PATH+120);
+	int len = lstrlen(text);
+
+	// Grayscale-antialiased copy of the full-screen font: its coverage becomes the alpha.
+	LOGFONT lf;
+	ZeroMemory(&lf, sizeof(lf));
+	GetObject(g_full.font ? g_full.font : globals.hUiFont, sizeof(lf), &lf);
+	lf.lfQuality = ANTIALIASED_QUALITY;
+	HFONT font = CreateFontIndirect(&lf);
+	HDC sdc = GetDC(NULL);
+	HDC dc = CreateCompatibleDC(sdc);
+	HGDIOBJ oldFont = SelectObject(dc, font);
 	SIZE sz = { 0, 0 };
-	GetTextExtentPoint32(dc, g_osdText, lstrlen(g_osdText), &sz);
-	SelectObject(dc, old);
-	ReleaseDC(g_hwndOSD, dc);
+	GetTextExtentPoint32(dc, text, len, &sz);
 	RECT fr;
 	GetWindowRect(g_hwndFull, &fr);
-	int w = sz.cx + 28, h = sz.cy + 12;
+	int pad = 3, w = sz.cx + 2*pad, h = sz.cy + 2*pad;
 	if(w > fr.right-fr.left-32) w = fr.right-fr.left-32;
-	SetWindowPos(g_hwndOSD, NULL, fr.left+16, fr.bottom-16-h, w, h,
-		SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW);
-	InvalidateRect(g_hwndOSD, NULL, FALSE);
+
+	BITMAPINFO bi;
+	ZeroMemory(&bi, sizeof(bi));
+	bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+	bi.bmiHeader.biWidth = w;
+	bi.bmiHeader.biHeight = -h;
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	bi.bmiHeader.biCompression = BI_RGB;
+	BYTE *bits = NULL;
+	HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0);
+	BYTE *edge = (BYTE*)malloc((size_t)w*h);
+	if(bmp && edge) {
+		HGDIOBJ oldBmp = SelectObject(dc, bmp);
+		RECT all = { 0, 0, w, h };
+		SetBkMode(dc, TRANSPARENT);
+		SetTextColor(dc, RGB(255,255,255));
+		// Pass 1: the text spread by a pixel, for the dark edge. Pass 2: the text itself.
+		FillRect(dc, &all, (HBRUSH)GetStockObject(BLACK_BRUSH));
+		for(int oy=-1; oy<=2; oy++) for(int ox=-1; ox<=2; ox++)
+			TextOut(dc, pad+ox, pad+oy, text, len);
+		GdiFlush();
+		for(int i=0; i<w*h; i++) edge[i] = bits[i*4+1];
+		FillRect(dc, &all, (HBRUSH)GetStockObject(BLACK_BRUSH));
+		TextOut(dc, pad, pad, text, len);
+		GdiFlush();
+		for(int i=0; i<w*h; i++) {
+			int t = bits[i*4+1];                          // text coverage
+			int e = edge[i] * 160 / 255;                  // edge, a bit see-through
+			int a = t + e*(255-t)/255;
+			BYTE cv = (BYTE)(t*215/255);                  // premultiplied light gray
+			bits[i*4+0] = cv; bits[i*4+1] = cv; bits[i*4+2] = cv; bits[i*4+3] = (BYTE)a;
+		}
+		POINT dst = { fr.left+16-pad, fr.bottom-14-h };
+		POINT src = { 0, 0 };
+		SIZE wsz = { w, h };
+		BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+		UpdateLayeredWindow(g_hwndOSD, sdc, &dst, &wsz, dc, &src, 0, &bf, ULW_ALPHA);
+		ShowWindow(g_hwndOSD, SW_SHOWNA);
+		SelectObject(dc, oldBmp);
+	}
+	free(edge);
+	if(bmp) DeleteObject(bmp);
+	SelectObject(dc, oldFont);
+	DeleteObject(font);
+	DeleteDC(dc);
+	ReleaseDC(NULL, sdc);
 }
 
 class TwpngVideoNotify : public IMFMediaEngineNotify {
@@ -8396,6 +8462,20 @@ static LRESULT CALLBACK EditBorderSubclassProc(HWND hwnd, UINT msg, WPARAM wPara
 {
 	switch(msg) {
 	case WM_NCPAINT:
+		{
+			// Let the default paint only what lies inside the edge (the scroll bars), so the
+			// light sunken edge never shows before ours covers it; it blinked on every
+			// resize step otherwise.
+			RECT wr;
+			GetWindowRect(hwnd, &wr);
+			int e = GetSystemMetrics(SM_CXEDGE);
+			HRGN rgn = CreateRectRgn(wr.left+e, wr.top+e, wr.right-e, wr.bottom-e);
+			if(wParam != 1) CombineRgn(rgn, rgn, (HRGN)wParam, RGN_AND);
+			LRESULT lr = DefSubclassProc(hwnd, msg, (WPARAM)rgn, lParam);
+			DeleteObject(rgn);
+			twpng_PaintFlatBorder(hwnd, (COLORREF)dwRefData);
+			return lr;
+		}
 	case WM_SETFOCUS:
 	case WM_KILLFOCUS:
 		{
