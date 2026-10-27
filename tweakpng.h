@@ -232,6 +232,7 @@ struct globals_struct {
 	// AI viewer splitters, per mille: prompt and negative prompt share of the boxes'
 	// height, thumbnail share of the width (0 = from the image's aspect ratio).
 	int aip_split_prompt, aip_split_neg, aip_split_thumb;
+	int aif_sort;   // folder overview sort: column+1, negative = descending, 0 = by name
 	HANDLE hListRowImageList;
 
 	const TCHAR *twpng_homepage;

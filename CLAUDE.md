@@ -322,7 +322,11 @@ metadata-only path so AI prompts can be inspected.
 Tools > Folder Overview is a submenu built in `WM_INITMENU` (`twpng_FolderMenu`): current
 folder (`ID_AIFOLDER`), Choose Folder (`ID_AIFOLDER_PICK`), up to 20 indexed folders
 (`ID_AIFOLDER_IDX` + n, paths kept in `g_folderMenuDirs`, dispatched before the main
-`WM_COMMAND` switch) and Manage Folder Indexes. Ctrl+F in the viewer opens the modeless,
+`WM_COMMAND` switch) and Manage Folder Indexes. Inside the dialog, Change... pops a similar
+menu under the button (`twpng_FolderChangeMenu`), and `WM_CONTEXTMENU` on the list
+(`twpng_FolderContextMenu`) offers Open in Viewer / Show in Explorer (all selected files in
+one window, `twpng_ShowFilesInExplorer`) / Copy Full Path / Copy Prompt for the selected rows.
+Ctrl+F in the viewer opens the modeless,
 unowned `DLG_AIFOLDER` (`DlgProcAIFolder`, `g_hwndAIFolder`, routed in the message loop
 like the viewer). It lists every supported file of a folder in a virtual list view
 (`LVS_OWNERDATA`, text from `LVN_GETDISPINFO`; `twpng_FindSetting` pulls single values
@@ -340,6 +344,19 @@ fixed columns for the common settings plus "Other settings").
   IDAT skipped by seeking (`twpng_ScanPngAIText`, iTXt/zTXt via `twpng_Inflate`), the
   first 2 MB of a JPEG, WebP chunk headers up to `EXIF`, and the MP4 `moov` readers.
   Results are parsed with `twpng_BuildAICtx` like the viewer does.
+- **Sorting**: `LVN_COLUMNCLICK` -> `twpng_FolderSortClick`; `twpng_FolderSortRows` sorts
+  `f->rows` with precomputed keys (`struct twpng_skey`, columns `AFC_*`; ties in natural
+  name order); File ascending is the records' own order. Done again whenever rows are added.
+  The header gets `HDF_SORTUP/DOWN` (the dark header custom draw in `MainListSubclassProc`
+  paints the arrow itself). Remembered as `globals.aif_sort` (registry `aif_sort`: column+1,
+  negative = descending). Selection, focus and top row are kept by file name
+  (`twpng_FolderSavePos` / `twpng_FolderRestorePos`).
+- **Watching** (`twpng_FolderWatch`, `twpng_WatchThread`): `FindFirstChangeNotification`
+  plus a 10 s check of the folder's time (network/cloud drives) posts
+  `WM_APP_FOLDERCHANGED` (generation-checked); after 1.5 s of quiet `twpng_FolderQuietScan`
+  starts a second scan (`f->pending`, reading only new/changed files thanks to the index)
+  and `twpng_FolderSwapIn` replaces the rows when it is done. A change during a scan sets
+  `f->dirty` and rescans afterwards. The watch thread frees itself after its stop event.
 - **Index** (`twpng_LoadIndex` / `twpng_SaveIndex`): `%LOCALAPPDATA%\TweakPNG\index\<FNV-1a
   of the folder path>.idx`, a binary file (magic `TWAI`, version 1) with per file name,
   size, last-write time and the parsed prompt / negative / settings in UTF-8. A file is

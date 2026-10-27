@@ -1413,6 +1413,7 @@ static int SaveSettings()
 	r=RegSetValueEx(key,_T("aip_split_prompt"),0,REG_DWORD,(LPBYTE)&globals.aip_split_prompt,sizeof(DWORD));
 	r=RegSetValueEx(key,_T("aip_split_neg"),0,REG_DWORD,(LPBYTE)&globals.aip_split_neg,sizeof(DWORD));
 	r=RegSetValueEx(key,_T("aip_split_thumb"),0,REG_DWORD,(LPBYTE)&globals.aip_split_thumb,sizeof(DWORD));
+	r=RegSetValueEx(key,_T("aif_sort"),0,REG_DWORD,(LPBYTE)&globals.aif_sort,sizeof(DWORD));
 
 	if(IsWindow(globals.hwndMainList)) {
 		for(i=0;i<5;i++) {
@@ -1552,6 +1553,9 @@ static void ReadSettings()
 	r=RegQueryValueEx(key,_T("aip_split_neg"),NULL,NULL,(LPBYTE)(&globals.aip_split_neg),&datasize);
 	datasize=sizeof(DWORD);
 	r=RegQueryValueEx(key,_T("aip_split_thumb"),NULL,NULL,(LPBYTE)(&globals.aip_split_thumb),&datasize);
+	datasize=sizeof(DWORD);
+	r=RegQueryValueEx(key,_T("aif_sort"),NULL,NULL,(LPBYTE)(&globals.aif_sort),&datasize);
+	if(globals.aif_sort<-7 || globals.aif_sort>7) globals.aif_sort=0;
 	if(globals.aip_split_prompt<50 || globals.aip_split_prompt>950) globals.aip_split_prompt=500;
 	if(globals.aip_split_neg<50 || globals.aip_split_neg>950) globals.aip_split_neg=220;
 	if(globals.aip_split_thumb<0 || globals.aip_split_thumb>800) globals.aip_split_thumb=0;
@@ -6752,7 +6756,16 @@ struct twpng_folderdlg {
 	int filtered;       // recs[0..filtered) have been checked against the search
 	TCHAR search[512];
 	BOOL finished, stopped;
+	int sortCol;                  // column the rows are sorted on (0 = File: the folder's order)
+	BOOL sortDesc;
+	struct twpng_scan *pending;   // quiet rescan after the folder changed, swapped in when done
+	BOOL dirty;                   // the folder changed while a scan was running
+	struct twpng_watch *watch;
+	LONG watchGen;
 };
+
+// Columns of the folder overview list.
+enum { AFC_FILE, AFC_MODIFIED, AFC_SEED, AFC_MODEL, AFC_MODE, AFC_DURATION, AFC_PROMPT, AFC_COUNT };
 
 // Value of `key` in a settings line ("k: v, k: v"), outer quotes removed.
 static BOOL twpng_FindSetting(const TCHAR *set, const TCHAR *key, TCHAR *out, int cap)
@@ -6796,6 +6809,152 @@ static BOOL twpng_RecMatches(const struct twpng_airec *r, const TCHAR *search)
 	}
 }
 
+// ---- sorting: click a column header, again to reverse ----
+
+struct twpng_skey { int rec; ULONGLONG u; double d; const TCHAR *s; TCHAR *own; const TCHAR *name; };
+static int g_afSortCol;
+static BOOL g_afSortDesc;
+
+static int twpng_CmpSkey(const void *a, const void *b)
+{
+	const struct twpng_skey *x = (const struct twpng_skey*)a, *y = (const struct twpng_skey*)b;
+	int c;
+	switch(g_afSortCol) {
+	case AFC_FILE:     c = StrCmpLogicalW(x->name, y->name); break;
+	case AFC_MODIFIED:
+	case AFC_SEED:     c = x->u < y->u ? -1 : x->u > y->u; break;
+	case AFC_DURATION: c = x->d < y->d ? -1 : x->d > y->d; break;
+	default:           c = lstrcmpi(x->s ? x->s : _T(""), y->s ? y->s : _T("")); break;
+	}
+	if(g_afSortDesc) c = -c;
+	if(!c) c = StrCmpLogicalW(x->name, y->name);   // equal values stay in name order
+	return c;
+}
+
+// Sort f->rows on the chosen column. FALSE if nothing to do (File ascending is the folder's
+// own order).
+static BOOL twpng_FolderSortRows(struct twpng_folderdlg *f)
+{
+	if((f->sortCol==AFC_FILE && !f->sortDesc) || f->nrows<2 || !f->scan) return FALSE;
+	struct twpng_skey *k = (struct twpng_skey*)calloc((size_t)f->nrows, sizeof(*k));
+	if(!k) return FALSE;
+	TCHAR buf[256];
+	for(int i=0; i<f->nrows; i++) {
+		const struct twpng_airec *r = &f->scan->recs[f->rows[i]];
+		k[i].rec = f->rows[i];
+		k[i].name = r->name;
+		switch(f->sortCol) {
+		case AFC_MODIFIED: k[i].u = r->mtime; break;
+		case AFC_SEED:
+			twpng_FindSetting(r->set, _T("Seed"), buf, 256);
+			k[i].u = _tcstoui64(buf, NULL, 10);
+			break;
+		case AFC_MODEL:
+		case AFC_MODE:
+			twpng_FindSetting(r->set, f->sortCol==AFC_MODEL ? _T("Model") : _T("Mode"), buf, 256);
+			k[i].s = k[i].own = _tcsdup(buf);
+			break;
+		case AFC_DURATION:
+			twpng_FindSetting(r->set, _T("Duration"), buf, 256);
+			k[i].d = buf[0] ? _tcstod(buf, NULL) : -1;
+			break;
+		case AFC_PROMPT: k[i].s = r->pos; break;
+		}
+	}
+	g_afSortCol = f->sortCol;
+	g_afSortDesc = f->sortDesc;
+	qsort(k, (size_t)f->nrows, sizeof(*k), twpng_CmpSkey);
+	for(int i=0; i<f->nrows; i++) { f->rows[i] = k[i].rec; free(k[i].own); }
+	free(k);
+	return TRUE;
+}
+
+static void twpng_FolderHeaderArrows(HWND hwnd, struct twpng_folderdlg *f)
+{
+	HWND hdr = ListView_GetHeader(GetDlgItem(hwnd, IDC_AF_LIST));
+	for(int i=0; i<AFC_COUNT; i++) {
+		HDITEM h;
+		ZeroMemory(&h, sizeof(h));
+		h.mask = HDI_FORMAT;
+		Header_GetItem(hdr, i, &h);
+		h.fmt &= ~(HDF_SORTUP|HDF_SORTDOWN);
+		if(i==f->sortCol) h.fmt |= f->sortDesc ? HDF_SORTDOWN : HDF_SORTUP;
+		Header_SetItem(hdr, i, &h);
+	}
+}
+
+// Selection, focus and top row by file name, so they survive a re-sort or a rescan.
+struct twpng_listpos { TCHAR **sel; int nsel; TCHAR *top, *focus; };
+
+static int twpng_CmpInt(const void *a, const void *b)
+{
+	int x = *(const int*)a, y = *(const int*)b;
+	return x < y ? -1 : x > y;
+}
+
+static int twpng_CmpStrPtr(const void *a, const void *b)
+{
+	return lstrcmpi(*(const TCHAR* const*)a, *(const TCHAR* const*)b);
+}
+
+static void twpng_FolderSavePos(HWND lv, struct twpng_folderdlg *f, struct twpng_listpos *p)
+{
+	ZeroMemory(p, sizeof(*p));
+	if(!f->scan || !f->nrows) return;
+	int n = ListView_GetSelectedCount(lv);
+	if(n>0 && (p->sel = (TCHAR**)calloc((size_t)n, sizeof(TCHAR*)))!=NULL) {
+		for(int i=ListView_GetNextItem(lv, -1, LVNI_SELECTED); i>=0 && p->nsel<n; i=ListView_GetNextItem(lv, i, LVNI_SELECTED))
+			if(i<f->nrows) p->sel[p->nsel++] = _tcsdup(f->scan->recs[f->rows[i]].name);
+		qsort(p->sel, (size_t)p->nsel, sizeof(TCHAR*), twpng_CmpStrPtr);
+	}
+	int top = ListView_GetTopIndex(lv), foc = ListView_GetNextItem(lv, -1, LVNI_FOCUSED);
+	if(top>=0 && top<f->nrows) p->top = _tcsdup(f->scan->recs[f->rows[top]].name);
+	if(foc>=0 && foc<f->nrows) p->focus = _tcsdup(f->scan->recs[f->rows[foc]].name);
+}
+
+// keepTop: scroll back to the same top row (rescan); otherwise bring the focused row into view.
+static void twpng_FolderRestorePos(HWND lv, struct twpng_folderdlg *f, struct twpng_listpos *p, BOOL keepTop)
+{
+	int topRow = -1, focRow = -1;
+	ListView_SetItemState(lv, -1, 0, LVIS_SELECTED|LVIS_FOCUSED);
+	for(int i=0; i<f->nrows; i++) {
+		const TCHAR *name = f->scan->recs[f->rows[i]].name;
+		if(p->nsel && bsearch(&name, p->sel, (size_t)p->nsel, sizeof(TCHAR*), twpng_CmpStrPtr))
+			ListView_SetItemState(lv, i, LVIS_SELECTED, LVIS_SELECTED);
+		if(p->focus && !lstrcmpi(name, p->focus)) { focRow = i; ListView_SetItemState(lv, i, LVIS_FOCUSED, LVIS_FOCUSED); }
+		if(p->top && !lstrcmpi(name, p->top)) topRow = i;
+	}
+	if(keepTop && topRow>=0) {
+		RECT r;
+		if(ListView_GetItemRect(lv, 0, &r, LVIR_BOUNDS))
+			ListView_Scroll(lv, 0, (topRow - ListView_GetTopIndex(lv)) * (r.bottom-r.top));
+	}
+	else if(focRow>=0) ListView_EnsureVisible(lv, focRow, FALSE);
+	for(int i=0; i<p->nsel; i++) free(p->sel[i]);
+	free(p->sel);
+	free(p->top);
+	free(p->focus);
+}
+
+static void twpng_FolderSortClick(HWND hwnd, struct twpng_folderdlg *f, int col)
+{
+	HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
+	struct twpng_listpos pos;
+	twpng_FolderSavePos(lv, f, &pos);
+	if(col==f->sortCol) f->sortDesc = !f->sortDesc;
+	else {
+		f->sortCol = col;
+		// Newest first is the useful start for dates.
+		f->sortDesc = (col==AFC_MODIFIED);
+	}
+	globals.aif_sort = (f->sortCol+1) * (f->sortDesc ? -1 : 1);
+	// File ascending is the records' own (folder) order.
+	if(!twpng_FolderSortRows(f) && f->nrows>1) qsort(f->rows, (size_t)f->nrows, sizeof(int), twpng_CmpInt);
+	InvalidateRect(lv, NULL, FALSE);
+	twpng_FolderRestorePos(lv, f, &pos, FALSE);
+	twpng_FolderHeaderArrows(hwnd, f);
+}
+
 static void twpng_FolderFilterMore(HWND hwnd, struct twpng_folderdlg *f)
 {
 	if(!f->scan || f->scan->total<=0) return;
@@ -6811,8 +6970,12 @@ static void twpng_FolderFilterMore(HWND hwnd, struct twpng_folderdlg *f)
 		}
 		f->rows[f->nrows++] = f->filtered;
 	}
-	if(f->nrows!=before)
-		ListView_SetItemCountEx(GetDlgItem(hwnd,IDC_AF_LIST), f->nrows, LVSICF_NOSCROLL|LVSICF_NOINVALIDATEALL);
+	if(f->nrows!=before) {
+		HWND lv = GetDlgItem(hwnd,IDC_AF_LIST);
+		BOOL sorted = twpng_FolderSortRows(f);
+		ListView_SetItemCountEx(lv, f->nrows, LVSICF_NOSCROLL | (sorted ? 0 : LVSICF_NOINVALIDATEALL));
+		if(sorted) InvalidateRect(lv, NULL, FALSE);
+	}
 }
 
 static void twpng_FolderRefilter(HWND hwnd, struct twpng_folderdlg *f)
@@ -6848,8 +7011,10 @@ static void twpng_FolderStatus(HWND hwnd, struct twpng_folderdlg *f)
 		SendMessage(pb, PBM_SETPOS, f->finished ? (total ? total : 1) : done, 0);
 		if(f->finished && f->stopped)
 			StringCchPrintf(buf, 300, _T("Stopped at %d of %d files."), done, total);
-		else if(f->finished)
+		else if(f->finished) {
 			StringCchPrintf(buf, 300, _T("%d files, %d read and %d from the index."), total, s->read, done - s->read);
+			if(f->watch) StringCchCat(buf, 300, _T(" Watching for new files."));
+		}
 		else {
 			StringCchPrintf(buf, 300, _T("Scanning %d of %d files"), done, total);
 			ULONGLONG el = GetTickCount64() - s->start;
@@ -6869,6 +7034,132 @@ static void twpng_FolderStatus(HWND hwnd, struct twpng_folderdlg *f)
 	ShowWindow(GetDlgItem(hwnd, IDC_AF_STOP), f->finished ? SW_HIDE : SW_SHOW);
 }
 
+// ---- watching the folder: new or changed files show up without a manual rescan ----
+// A worker waits for change notifications (and also checks the folder's time every 10 s,
+// for network or cloud drives that don't send them) and posts WM_APP_FOLDERCHANGED. The
+// dialog waits until things are quiet for 1.5 s, then runs a scan in the background (the
+// index makes that read only new or changed files) and swaps the result in, keeping the
+// search, sort, selection and scroll position.
+
+#define WM_APP_FOLDERCHANGED (WM_APP+27)
+#define TWPNG_WATCHTIMER 2
+
+struct twpng_watch { HANDLE stop; HWND notify; LONG gen; TCHAR dir[MAX_PATH]; };
+static volatile LONG g_watchGen = 0;
+
+static DWORD WINAPI twpng_WatchThread(LPVOID p)
+{
+	struct twpng_watch *w = (struct twpng_watch*)p;
+	HANDLE ch = FindFirstChangeNotification(w->dir, FALSE,
+		FILE_NOTIFY_CHANGE_FILE_NAME|FILE_NOTIFY_CHANGE_SIZE|FILE_NOTIFY_CHANGE_LAST_WRITE);
+	FILETIME last;
+	ZeroMemory(&last, sizeof(last));
+	twpng_DirStamp(w->dir, &last);
+	for(;;) {
+		HANDLE hs[2] = { w->stop, ch };
+		DWORD r = WaitForMultipleObjects(ch!=INVALID_HANDLE_VALUE ? 2 : 1, hs, FALSE, 10000);
+		if(r==WAIT_OBJECT_0) break;
+		BOOL changed = FALSE;
+		if(r==WAIT_OBJECT_0+1) {
+			changed = TRUE;
+			if(!FindNextChangeNotification(ch)) { FindCloseChangeNotification(ch); ch = INVALID_HANDLE_VALUE; }
+		} else if(r==WAIT_TIMEOUT) {
+			FILETIME ft;
+			if(twpng_DirStamp(w->dir, &ft) && CompareFileTime(&ft, &last)) { last = ft; changed = TRUE; }
+		} else {
+			WaitForSingleObject(w->stop, INFINITE);   // something broke: just wait to be stopped
+			break;
+		}
+		if(changed && WaitForSingleObject(w->stop, 0)!=WAIT_OBJECT_0)
+			PostMessage(w->notify, WM_APP_FOLDERCHANGED, (WPARAM)w->gen, 0);
+	}
+	if(ch!=INVALID_HANDLE_VALUE) FindCloseChangeNotification(ch);
+	CloseHandle(w->stop);
+	free(w);
+	return 0;
+}
+
+static void twpng_FolderUnwatch(struct twpng_folderdlg *f)
+{
+	if(f->watch) SetEvent(f->watch->stop);   // the thread frees it
+	f->watch = NULL;
+	f->watchGen = 0;
+}
+
+static void twpng_FolderWatch(HWND hwnd, struct twpng_folderdlg *f)
+{
+	twpng_FolderUnwatch(f);
+	struct twpng_watch *w = (struct twpng_watch*)calloc(1, sizeof(struct twpng_watch));
+	if(!w) return;
+	w->stop = CreateEvent(NULL, TRUE, FALSE, NULL);
+	w->notify = hwnd;
+	w->gen = InterlockedIncrement(&g_watchGen);
+	StringCchCopy(w->dir, MAX_PATH, f->dir);
+	HANDLE th = w->stop ? CreateThread(NULL, 0, twpng_WatchThread, w, 0, NULL) : NULL;
+	if(!th) {
+		if(w->stop) CloseHandle(w->stop);
+		free(w);
+		return;
+	}
+	CloseHandle(th);
+	f->watch = w;
+	f->watchGen = w->gen;
+}
+
+static struct twpng_scan *twpng_NewScan(HWND hwnd, const TCHAR *dir)
+{
+	struct twpng_scan *s = (struct twpng_scan*)calloc(1, sizeof(struct twpng_scan));
+	if(!s) return NULL;
+	s->refs = 2;   // dialog + worker
+	s->notify = hwnd;
+	s->total = -1;
+	s->start = GetTickCount64();
+	StringCchCopy(s->dir, MAX_PATH, dir);
+	HANDLE th = CreateThread(NULL, 0, twpng_ScanThread, s, 0, NULL);
+	if(!th) { free(s); return NULL; }
+	CloseHandle(th);
+	return s;
+}
+
+static void twpng_FolderDropPending(struct twpng_folderdlg *f)
+{
+	if(!f->pending) return;
+	InterlockedExchange(&f->pending->cancel, 1);
+	twpng_ScanRelease(f->pending);
+	f->pending = NULL;
+}
+
+// The folder changed: rescan in the background unless a scan is already running.
+static void twpng_FolderQuietScan(HWND hwnd, struct twpng_folderdlg *f)
+{
+	if(!f->scan || !f->finished || f->pending) { f->dirty = TRUE; return; }
+	f->dirty = FALSE;
+	f->pending = twpng_NewScan(hwnd, f->dir);
+}
+
+// The background rescan is done: show its rows in place of the old ones.
+static void twpng_FolderSwapIn(HWND hwnd, struct twpng_folderdlg *f)
+{
+	struct twpng_scan *s = f->pending;
+	f->pending = NULL;
+	if(s->cancel || s->total<0) { twpng_ScanRelease(s); return; }
+	HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
+	struct twpng_listpos pos;
+	twpng_FolderSavePos(lv, f, &pos);
+	if(f->scan) twpng_ScanRelease(f->scan);
+	f->scan = s;
+	f->finished = TRUE;
+	f->stopped = FALSE;
+	f->nrows = 0;
+	f->filtered = 0;
+	twpng_FolderFilterMore(hwnd, f);
+	ListView_SetItemCountEx(lv, f->nrows, LVSICF_NOSCROLL);
+	InvalidateRect(lv, NULL, FALSE);
+	twpng_FolderRestorePos(lv, f, &pos, TRUE);
+	twpng_FolderStatus(hwnd, f);
+	if(f->dirty) twpng_FolderQuietScan(hwnd, f);
+}
+
 static void twpng_FolderStartScan(HWND hwnd, struct twpng_folderdlg *f)
 {
 	if(f->scan) {
@@ -6876,20 +7167,15 @@ static void twpng_FolderStartScan(HWND hwnd, struct twpng_folderdlg *f)
 		twpng_ScanRelease(f->scan);
 		f->scan = NULL;
 	}
+	twpng_FolderDropPending(f);
+	f->dirty = FALSE;
 	f->nrows = 0;
 	f->filtered = 0;
 	f->finished = f->stopped = FALSE;
 	ListView_SetItemCountEx(GetDlgItem(hwnd,IDC_AF_LIST), 0, 0);
-	struct twpng_scan *s = (struct twpng_scan*)calloc(1, sizeof(struct twpng_scan));
+	if(!f->watch || lstrcmpi(f->watch->dir, f->dir)) twpng_FolderWatch(hwnd, f);
+	struct twpng_scan *s = twpng_NewScan(hwnd, f->dir);
 	if(!s) return;
-	s->refs = 2;   // dialog + worker
-	s->notify = hwnd;
-	s->total = -1;
-	s->start = GetTickCount64();
-	StringCchCopy(s->dir, MAX_PATH, f->dir);
-	HANDLE th = CreateThread(NULL, 0, twpng_ScanThread, s, 0, NULL);
-	if(!th) { free(s); return; }
-	CloseHandle(th);
 	f->scan = s;
 	TCHAR title[MAX_PATH+40];
 	StringCchPrintf(title, MAX_PATH+40, _T("Folder Overview - %s"), f->dir);
@@ -6909,13 +7195,17 @@ static void twpng_LayoutFolder(HWND hwnd)
 	SetWindowPos(GetDlgItem(hwnd,IDC_AF_CHANGE), NULL, W-m-70-gap-80, y, 80, btnH, SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AF_PATH), NULL, m+lblW, y+4, W-2*m-lblW-70-80-3*gap, rowH-4, SWP_NOZORDER);
 	y += rowH+gap;
+	// The search box and the progress bar take two thirds of the width and end at the same
+	// point; the file count and the status text follow them.
+	int stopW = 60, progW = (W-2*m)*2/3, statW = W-2*m-progW-stopW-2*gap;
+	if(statW < 260) { statW = 260; progW = W-2*m-statW-stopW-2*gap; }   // narrow window: keep the text readable
+	if(progW < lblW+80) { progW = lblW+80; statW = W-2*m-progW-stopW-2*gap; }
 	SetWindowPos(GetDlgItem(hwnd,IDC_AF_LBLSEARCH), NULL, m, y+4, lblW, rowH-4, SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AF_COUNT), NULL, W-m-130, y+4, 130, rowH-4, SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AF_SEARCH), NULL, m+lblW, y, W-2*m-lblW-130-gap, rowH, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AF_SEARCH), NULL, m+lblW, y, progW-lblW, rowH, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AF_COUNT), NULL, m+progW+gap, y+4, W-2*m-progW-gap, rowH-4, SWP_NOZORDER);
 	y += rowH+gap;
-	int stopW = 60, statW = (W-2*m)/2;
-	SetWindowPos(GetDlgItem(hwnd,IDC_AF_PROGRESS), NULL, m, y+4, W-2*m-statW-stopW-2*gap, 16, SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AF_STATUS), NULL, W-m-stopW-gap-statW, y+4, statW, rowH-4, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AF_PROGRESS), NULL, m, y+4, progW, 16, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AF_STATUS), NULL, m+progW+gap, y+4, statW, rowH-4, SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AF_STOP), NULL, W-m-stopW, y, stopW, btnH, SWP_NOZORDER);
 	y += rowH+gap;
 	int bottomY = H-m-btnH;
@@ -7048,6 +7338,95 @@ static BOOL twpng_PickFolder(HWND owner, TCHAR *dir)
 }
 
 static void twpng_OpenInViewer(const TCHAR *path);
+static BOOL twpng_FolderChangeMenu(HWND owner, HWND btn, const TCHAR *cur, TCHAR *out);
+
+// Explorer on the folder with all `n` files selected (one window, reused if open).
+static void twpng_ShowFilesInExplorer(const TCHAR *dir, const TCHAR **names, int n)
+{
+	PIDLIST_ABSOLUTE folder = ILCreateFromPath(dir);
+	if(!folder) return;
+	PIDLIST_ABSOLUTE *full = (PIDLIST_ABSOLUTE*)calloc((size_t)n, sizeof(PIDLIST_ABSOLUTE));
+	PCUITEMID_CHILD *kids = (PCUITEMID_CHILD*)calloc((size_t)n, sizeof(PCUITEMID_CHILD));
+	int k = 0;
+	if(full && kids) {
+		for(int i=0; i<n; i++) {
+			TCHAR p[MAX_PATH];
+			StringCchPrintf(p, MAX_PATH, _T("%s%s"), dir, names[i]);
+			full[k] = ILCreateFromPath(p);
+			if(full[k]) { kids[k] = ILFindLastID(full[k]); k++; }
+		}
+		SHOpenFolderAndSelectItems(folder, (UINT)k, kids, 0);
+	}
+	for(int i=0; i<k; i++) ILFree(full[i]);
+	free(full);
+	free(kids);
+	ILFree(folder);
+}
+
+// Right-click on the rows: open, show in Explorer and copy, for all selected rows.
+static void twpng_FolderContextMenu(HWND hwnd, struct twpng_folderdlg *f, int x, int y)
+{
+	enum { FM_OPEN = 1, FM_EXPLORER, FM_COPYPATH, FM_COPYPROMPT };
+	HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
+	int nsel = ListView_GetSelectedCount(lv);
+	if(nsel<=0) return;
+	int first = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+	if(x==-1 && y==-1) {   // from the keyboard: under the first selected row
+		RECT r;
+		ListView_GetItemRect(lv, first, &r, LVIR_LABEL);
+		POINT pt = { r.left+8, r.bottom };
+		ClientToScreen(lv, &pt);
+		x = pt.x; y = pt.y;
+	}
+	HMENU m = CreatePopupMenu();
+	if(!m) return;
+	AppendMenu(m, MF_STRING, FM_OPEN, _T("&Open in Viewer"));
+	SetMenuDefaultItem(m, FM_OPEN, FALSE);
+	AppendMenu(m, MF_STRING, FM_EXPLORER, _T("Show in &Explorer"));
+	AppendMenu(m, MF_SEPARATOR, 0, NULL);
+	AppendMenu(m, MF_STRING, FM_COPYPATH, nsel>1 ? _T("Copy Full &Paths") : _T("Copy Full &Path"));
+	AppendMenu(m, MF_STRING, FM_COPYPROMPT, nsel>1 ? _T("Copy P&rompts") : _T("Copy P&rompt"));
+	int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD|TPM_RIGHTBUTTON, x, y, 0, hwnd, NULL);
+	DestroyMenu(m);
+	if(!cmd) return;
+
+	const struct twpng_airec **sel = (const struct twpng_airec**)calloc((size_t)nsel, sizeof(*sel));
+	if(!sel) return;
+	int ns = 0;
+	for(int i=first; i>=0 && ns<nsel; i=ListView_GetNextItem(lv, i, LVNI_SELECTED))
+		if(i<f->nrows) sel[ns++] = &f->scan->recs[f->rows[i]];
+	if(cmd==FM_OPEN && ns) {
+		TCHAR p[MAX_PATH];
+		StringCchPrintf(p, MAX_PATH, _T("%s%s"), f->dir, sel[0]->name);
+		twpng_OpenInViewer(p);
+	}
+	else if(cmd==FM_EXPLORER && ns) {
+		const TCHAR **names = (const TCHAR**)calloc((size_t)ns, sizeof(TCHAR*));
+		if(names) {
+			for(int i=0; i<ns; i++) names[i] = sel[i]->name;
+			twpng_ShowFilesInExplorer(f->dir, names, ns);
+			free(names);
+		}
+	}
+	else if(cmd==FM_COPYPATH || cmd==FM_COPYPROMPT) {
+		// One path per line; prompts separated by a blank line.
+		struct twpng_tbuf b = { NULL, 0, 0 };
+		for(int i=0; i<ns; i++) {
+			if(cmd==FM_COPYPATH) {
+				if(i) tb_add(&b, _T("\r\n"), 2);
+				tb_add(&b, f->dir, -1);
+				tb_add(&b, sel[i]->name, -1);
+			} else {
+				if(i) tb_add(&b, _T("\r\n\r\n"), 4);
+				TCHAR *t = twpng_LfToCrlf(sel[i]->pos);
+				if(t) { tb_add(&b, t, -1); free(t); }
+			}
+		}
+		if(b.s) twpng_SetClipboardText(hwnd, b.s);
+		free(b.s);
+	}
+	free(sel);
+}
 
 static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -7060,9 +7439,9 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			SendMessage(hwnd, WM_SETICON, ICON_BIG, (LPARAM)LoadIcon(globals.hInst,_T("ICONMAIN")));
 			HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
 			ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_HEADERDRAGDROP);
-			static const struct { const TCHAR *name; int w; } cols[] = {
-				{ _T("File"), 220 }, { _T("Seed"), 100 }, { _T("Model"), 220 }, { _T("Mode"), 130 },
-				{ _T("Duration"), 70 }, { _T("Prompt"), 700 }, { NULL, 0 } };
+			static const struct { const TCHAR *name; int w; } cols[] = {   // in AFC_ order
+				{ _T("File"), 220 }, { _T("Modified"), 130 }, { _T("Seed"), 100 }, { _T("Model"), 220 },
+				{ _T("Mode"), 130 }, { _T("Duration"), 70 }, { _T("Prompt"), 700 }, { NULL, 0 } };
 			for(int i=0; cols[i].name; i++) {
 				LVCOLUMN c;
 				ZeroMemory(&c, sizeof(c));
@@ -7072,6 +7451,11 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 				ListView_InsertColumn(lv, i, &c);
 			}
 			SetWindowSubclass(lv, MainListSubclassProc, 1, 0);
+			if(globals.aif_sort) {
+				f->sortCol = (globals.aif_sort<0 ? -globals.aif_sort : globals.aif_sort) - 1;
+				f->sortDesc = globals.aif_sort<0;
+			}
+			twpng_FolderHeaderArrows(hwnd, f);
 			twpng_InitDarkDialog(hwnd);
 			if(globals.window_prefs.aifolder.w>0 && globals.window_prefs.aifolder.h>0)
 				twpng_SetWindowPos(hwnd, &globals.window_prefs.aifolder);
@@ -7091,18 +7475,36 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 	case WM_DESTROY:
 		twpng_StoreWindowPos(hwnd, &globals.window_prefs.aifolder);
 		break;
+	case WM_CONTEXTMENU:
+		if(f && (HWND)wParam==GetDlgItem(hwnd, IDC_AF_LIST)) {
+			twpng_FolderContextMenu(hwnd, f, (short)LOWORD(lParam), (short)HIWORD(lParam));
+			return TRUE;
+		}
+		break;
 	case WM_APP_SCAN:
-		if(f && (struct twpng_scan*)lParam==f->scan) {
+		if(f && f->pending && (struct twpng_scan*)lParam==f->pending) {
+			if(wParam==1) twpng_FolderSwapIn(hwnd, f);
+		}
+		else if(f && (struct twpng_scan*)lParam==f->scan) {
 			if(wParam==1) { f->finished = TRUE; f->stopped = f->scan->cancel!=0; }
 			twpng_FolderFilterMore(hwnd, f);
 			twpng_FolderStatus(hwnd, f);
+			if(wParam==1 && f->dirty && !f->stopped) twpng_FolderQuietScan(hwnd, f);
 		}
+		return TRUE;
+	case WM_APP_FOLDERCHANGED:
+		// Wait until the folder is quiet for a moment (a render is still being written).
+		if(f && (LONG)wParam==f->watchGen) SetTimer(hwnd, TWPNG_WATCHTIMER, 1500, NULL);
 		return TRUE;
 	case WM_TIMER:
 		if(wParam==1 && f) {
 			KillTimer(hwnd, 1);
 			twpng_FolderRefilter(hwnd, f);
 			twpng_FolderStatus(hwnd, f);
+		}
+		if(wParam==TWPNG_WATCHTIMER && f) {
+			KillTimer(hwnd, TWPNG_WATCHTIMER);
+			twpng_FolderQuietScan(hwnd, f);
 		}
 		return TRUE;
 	case WM_NOTIFY:
@@ -7117,12 +7519,22 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 				int cap = di->item.cchTextMax;
 				out[0] = 0;
 				switch(di->item.iSubItem) {
-				case 0: StringCchCopy(out, cap, r->name); break;
-				case 1: twpng_FindSetting(r->set, _T("Seed"), out, cap); break;
-				case 2: twpng_FindSetting(r->set, _T("Model"), out, cap); break;
-				case 3: twpng_FindSetting(r->set, _T("Mode"), out, cap); break;
-				case 4: twpng_FindSetting(r->set, _T("Duration"), out, cap); break;
-				case 5:
+				case AFC_FILE: StringCchCopy(out, cap, r->name); break;
+				case AFC_MODIFIED:
+					{
+						FILETIME ft, lt;
+						SYSTEMTIME st;
+						ft.dwLowDateTime = (DWORD)r->mtime;
+						ft.dwHighDateTime = (DWORD)(r->mtime>>32);
+						if(r->mtime && FileTimeToLocalFileTime(&ft, &lt) && FileTimeToSystemTime(&lt, &st))
+							StringCchPrintf(out, cap, _T("%04d-%02d-%02d %02d:%02d"), st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+					}
+					break;
+				case AFC_SEED: twpng_FindSetting(r->set, _T("Seed"), out, cap); break;
+				case AFC_MODEL: twpng_FindSetting(r->set, _T("Model"), out, cap); break;
+				case AFC_MODE: twpng_FindSetting(r->set, _T("Mode"), out, cap); break;
+				case AFC_DURATION: twpng_FindSetting(r->set, _T("Duration"), out, cap); break;
+				case AFC_PROMPT:
 					if(!r->hasAI) StringCchCopy(out, cap, _T("(no AI parameters)"));
 					else if(r->pos) {
 						// First 300 characters on one line.
@@ -7133,6 +7545,10 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 					}
 					break;
 				}
+				return TRUE;
+			}
+			if(nh->code==LVN_COLUMNCLICK) {
+				twpng_FolderSortClick(hwnd, f, ((LPNMLISTVIEW)lParam)->iSubItem);
 				return TRUE;
 			}
 			if(nh->code==LVN_ITEMACTIVATE) {
@@ -7166,7 +7582,7 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		case IDC_AF_CHANGE:
 			{
 				TCHAR dir[MAX_PATH];
-				if(twpng_PickFolder(hwnd, dir)) {
+				if(twpng_FolderChangeMenu(hwnd, (HWND)lParam, f->dir, dir) && lstrcmpi(dir, f->dir)) {
 					StringCchCopy(f->dir, MAX_PATH, dir);
 					twpng_FolderStartScan(hwnd, f);
 				}
@@ -7182,6 +7598,8 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		break;
 	case WM_NCDESTROY:
 		if(f) {
+			twpng_FolderUnwatch(f);
+			twpng_FolderDropPending(f);
 			if(f->scan) {
 				InterlockedExchange(&f->scan->cancel, 1);
 				twpng_ScanRelease(f->scan);
@@ -7479,6 +7897,47 @@ static void twpng_ManageIndexes(HWND owner)
 	struct twpng_idxdlg x = { NULL, 0 };
 	DialogBoxParam(globals.hInst, _T("DLG_AIINDEX"), owner, DlgProcIndexes, (LPARAM)&x);
 	free(x.list);
+}
+
+// Change... in the folder overview: a menu under the button with Choose Folder..., the
+// current file's folder and every folder that has an index (the shown one checked).
+// Returns TRUE with `out` set when a folder was picked.
+static BOOL twpng_FolderChangeMenu(HWND owner, HWND btn, const TCHAR *cur, TCHAR *out)
+{
+	enum { CM_PICK = 1, CM_DOC, CM_MANAGE, CM_IDX = 100 };
+	HMENU m = CreatePopupMenu();
+	if(!m) return FALSE;
+	TCHAR esc[MAX_PATH*2], item[MAX_PATH*2+40], doc[MAX_PATH];
+	AppendMenu(m, MF_STRING, CM_PICK, _T("C&hoose Folder..."));
+	twpng_DocFolder(doc);
+	if(doc[0] && lstrcmpi(doc, cur)) {
+		twpng_MenuEscape(doc, esc, MAX_PATH*2);
+		StringCchPrintf(item, MAX_PATH*2+40, _T("&Current File's Folder\t%s"), esc);
+		AppendMenu(m, MF_STRING, CM_DOC, item);
+	}
+	struct twpng_idxinfo *list = NULL;
+	int n = twpng_ListIndexes(&list), shown = 0;
+	for(int i=0; i<n && shown<30; i++) {
+		if(!list[i].count || list[i].dir[0]==_T('(')) continue;
+		if(!shown) AppendMenu(m, MF_SEPARATOR, 0, NULL);
+		twpng_MenuEscape(list[i].dir, esc, MAX_PATH*2);
+		StringCchPrintf(item, MAX_PATH*2+40, _T("%s\t%lu files"), esc, (unsigned long)list[i].count);
+		AppendMenu(m, MF_STRING | (lstrcmpi(list[i].dir, cur) ? 0 : MF_CHECKED), CM_IDX+i, item);
+		shown++;
+	}
+	AppendMenu(m, MF_SEPARATOR, 0, NULL);
+	AppendMenu(m, MF_STRING, CM_MANAGE, _T("&Manage Folder Indexes..."));
+	RECT r;
+	GetWindowRect(btn, &r);
+	int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD|TPM_RIGHTALIGN|TPM_TOPALIGN, r.right, r.bottom, 0, owner, NULL);
+	DestroyMenu(m);
+	BOOL ok = FALSE;
+	if(cmd==CM_PICK) ok = twpng_PickFolder(owner, out);
+	else if(cmd==CM_DOC) { StringCchCopy(out, MAX_PATH, doc); ok = TRUE; }
+	else if(cmd==CM_MANAGE) twpng_ManageIndexes(owner);
+	else if(cmd>=CM_IDX && cmd-CM_IDX<n) { StringCchCopy(out, MAX_PATH, list[cmd-CM_IDX].dir); ok = TRUE; }
+	free(list);
+	return ok;
 }
 
 // File-open command: show the parsed viewer for a file without loading it as the document.
@@ -8800,7 +9259,7 @@ static LRESULT CALLBACK MainListSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 
 					TCHAR szHdrText[256] = {};
 					HDITEM hdi = {};
-					hdi.mask = HDI_TEXT;
+					hdi.mask = HDI_TEXT | HDI_FORMAT;
 					hdi.pszText = szHdrText;
 					hdi.cchTextMax = 255;
 					Header_GetItem(hwndHdr, (int)pcd->dwItemSpec, &hdi);
@@ -8810,6 +9269,21 @@ static LRESULT CALLBACK MainListSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 					HGDIOBJ hOldFont = globals.hUiFont ? SelectObject(pcd->hdc, globals.hUiFont) : NULL;
 					RECT rcTxt = pcd->rc;
 					InflateRect(&rcTxt, -6, 0);
+					if(hdi.fmt & (HDF_SORTUP|HDF_SORTDOWN)) {
+						// Sort arrow at the right, like the light header draws it.
+						int cx = pcd->rc.right - 12, cy = (pcd->rc.top + pcd->rc.bottom)/2;
+						POINT tri[3];
+						if(hdi.fmt & HDF_SORTUP) { tri[0].x=cx-4; tri[0].y=cy+2; tri[1].x=cx+4; tri[1].y=cy+2; tri[2].x=cx; tri[2].y=cy-2; }
+						else { tri[0].x=cx-4; tri[0].y=cy-2; tri[1].x=cx+4; tri[1].y=cy-2; tri[2].x=cx; tri[2].y=cy+2; }
+						HBRUSH hArrow = CreateSolidBrush(RGB(170, 170, 170));
+						HGDIOBJ oldBr = SelectObject(pcd->hdc, hArrow);
+						HGDIOBJ oldPn = SelectObject(pcd->hdc, GetStockObject(NULL_PEN));
+						Polygon(pcd->hdc, tri, 3);
+						SelectObject(pcd->hdc, oldPn);
+						SelectObject(pcd->hdc, oldBr);
+						DeleteObject(hArrow);
+						rcTxt.right -= 16;
+					}
 					DrawText(pcd->hdc, szHdrText, -1, &rcTxt, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 					if(hOldFont) SelectObject(pcd->hdc, hOldFont);
 
