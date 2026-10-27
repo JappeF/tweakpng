@@ -8,53 +8,55 @@ This is a fork of [jsummers/tweakpng](https://github.com/jsummers/tweakpng)
 ([project homepage](https://entropymine.com/jason/tweakpng/)) by Jason Summers, with two
 goals:
 
-**Modern Windows 10/11 UI** — a dark-mode title bar, menu bar, chunk list, dialogs,
+**Modern Windows 10/11 UI** - a dark-mode title bar, menu bar, chunk list, dialogs,
 message boxes, and color picker, plus PerMonitorV2 DPI awareness, rounded corners, and a
-Mica backdrop.
+Mica backdrop. Options > Theme switches between System default, Light and Dark.
 
 **Quality-of-life features for AI-generated images** (Automatic1111, ComfyUI, NovelAI,
 Civitai):
 
-- **Auto-open parameters** — opening an image that has AI generation parameters pops
-  up a viewer automatically (toggle in Options → Preferences). Works for PNG
+- **Auto-open parameters** - opening an image that has AI generation parameters pops
+  up a viewer automatically (toggle in Options > Preferences). Works for PNG
   (`parameters`/`prompt` tEXt chunks), JPEG/WebP (EXIF UserComment) and MP4/MOV videos
   (ComfyUI SaveVideo and VideoHelperSuite metadata).
-- **AI Generation Parameters viewer** (Edit → View AI Parameters) — splits the metadata
-  into Prompt, Negative prompt, and Settings, each with a Copy button (plus Copy All).
+- **AI Generation Parameters viewer** (Edit > View AI Parameters) - splits the metadata
+  into Prompt, Negative prompt and Settings, each with a Copy button (plus Copy All),
+  next to a thumbnail. The borders between the boxes can be dragged. Settings include
+  LoRAs, and for videos the real size, frame count and duration. **Show in Explorer**
+  selects the file in Explorer, and **Save JSON** saves the ComfyUI graph so it can be
+  loaded back into ComfyUI.
 - **ComfyUI video workflows** - for MP4/MOV the settings also show the generation mode
   (reference/image/first-last frame/text to video) and the reference or first/last frame
   images that were used.
-- **Browse a folder** - Prev/Next (or the arrow keys) in the viewer step through the
-  images and videos in the same folder, and so does a left or right click on the thumbnail.
-  Double-click the thumbnail for a full-screen view you can browse with the arrow keys or
-  clicks, Esc to go back. Videos play right in the viewer and full screen (Play or Space,
-  speed with - and + in steps of 25%). The borders between the prompt,
-  negative prompt, settings and thumbnail can be dragged. **Show in Explorer** selects the
-  file in Explorer, and **Save JSON** saves the ComfyUI graph so it can be loaded back into
-  ComfyUI. Settings include LoRAs, and for videos the real size, frame count and duration.
+- **Browse a folder** - Prev/Next, the arrow keys, or a left/right click on the thumbnail
+  step through the images and videos in the same folder. Double-click the thumbnail for a
+  full-screen view you browse the same way, Esc to go back.
+- **Video playback** - videos play right in the viewer and full screen (Play or Space,
+  looped). - and + change the speed in steps of 25%, and the sound follows like a tape:
+  faster is higher, slower is lower.
+- **Folder Overview** (Tools menu, or Ctrl+F in the viewer) - all images and videos of a
+  folder in one list with date, seed, model, mode, duration and prompt, a search box,
+  sortable columns, a right-click menu (open, show in Explorer, copy path or prompt) and
+  Export CSV. Scans in the background and keeps an index, so a folder with 22,000 files
+  opens in well under a second the second time. The folder is watched: a render that
+  just finished shows up by itself. Options > Folder Indexes shows the indexes and deletes
+  the ones you no longer need.
 - **Read AI parameters from File** (Tools menu) - one-shot file picker that opens the
   parsed viewer without loading the file as a document.
-- **Folder Overview** (Tools menu, or Ctrl+F in the viewer) - all images and videos of a
-  folder in one list with seed, model, mode, duration and prompt, a search box, and
-  Export CSV. Scans in the background with a progress bar and keeps an index, so a folder
-  with 22,000 files opens in well under a second the second time. The menu lists the
-  folders that already have an index. Options > Folder
-  Indexes shows the indexes and deletes the ones you no longer need.
 - **Compare AI Parameters** (Tools menu) - shows what changed between two files: settings
   side by side and a word-level diff of the prompts.
 - **Strip AI Metadata** (Edit menu) - removes prompt/seed/workflow/EXIF metadata so a file
   can be shared privately. PNG in place; JPEG, WebP and MP4/MOV as a cleaned copy.
 - **Explorer menu** (Options > Preferences) - adds "View AI parameters" to the right-click
   menu of images and videos, which opens just the viewer.
-- **Theme** (Options > Theme) - System default, Light or Dark, remembered between runs.
-- **Generator badge** — the status bar identifies A1111, ComfyUI, or NovelAI images
+- **Generator badge** - the status bar identifies A1111, ComfyUI, or NovelAI images
   (for PNG and for JPEG/WebP/MP4/MOV files).
 
 Download
 --------
 
 Grab the latest prebuilt 64-bit Windows binary from the
-[**Releases**](https://github.com/JappeF/tweakpng/releases/latest) page — no installer,
+[**Releases**](https://github.com/JappeF/tweakpng/releases/latest) page - no installer,
 just run `tweakpng.exe`.
 
 Screenshots
@@ -64,14 +66,28 @@ The main chunk view with the modern dark UI:
 
 ![Main window](docs/main.jpg)
 
-The AI Generation Parameters viewer (prompt / negative prompt / settings, with copy
-buttons):
+The AI Generation Parameters viewer: prompt, negative prompt and settings with copy
+buttons, the thumbnail, and Prev/Next to browse the folder:
 
 ![AI parameters viewer](docs/aiprompt.jpg)
 
-Editing a chunk:
+The Folder Overview, with search, sortable columns and live updates:
+
+![Folder Overview](docs/folder.jpg)
+
+Full-screen view (double-click the thumbnail), browse with the arrow keys or clicks:
+
+![Full-screen view](docs/fullscreen.jpg)
+
+Editing a text chunk:
 
 ![Chunk editor](docs/imgedit.jpg)
+
+The image viewer (F7):
+
+![Image viewer](docs/viewer.jpg)
+
+The images in the screenshots are the files in `samples/`.
 
 Building
 --------
@@ -90,4 +106,3 @@ Documentation
 For usage instructions, see `tweakpng.txt`.
 
 Original project web site: [entropymine.com/jason/tweakpng](https://entropymine.com/jason/tweakpng/)
-
