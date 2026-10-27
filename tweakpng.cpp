@@ -3077,6 +3077,9 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		SetWindowLongPtr(hwnd,DWLP_USER,lParam);
 		SendMessage(hwnd,WM_SETICON,ICON_BIG,(LPARAM)LoadIcon(globals.hInst,_T("ICONMAIN")));
 		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_THUMB), ThumbSubclassProc, 0, 0);
+		// Set before CreateDialogParam returns, so twpng_VideoUI (via the fill below) can
+		// already show the video controls.
+		g_hwndAIParams = hwnd;
 		if(c) twpng_FillAIParams(hwnd,c);
 		twpng_LayoutAIParams(hwnd);
 		twpng_InitDarkDialog(hwnd);
@@ -3097,7 +3100,8 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 	case WM_GETMINMAXINFO:
 		{
 			LPMINMAXINFO mm=(LPMINMAXINFO)lParam;
-			mm->ptMinTrackSize.x=360;
+			// With the video controls the bottom row needs more room, or they overlap Save JSON.
+			mm->ptMinTrackSize.x=(GetWindowLongPtr(GetDlgItem(hwnd,IDC_AIP_PLAY),GWL_STYLE) & WS_VISIBLE) ? 690 : 360;
 			mm->ptMinTrackSize.y=300;
 			return 0;
 		}
@@ -4002,6 +4006,8 @@ struct twpng_pcm {
 
 static struct twpng_pcm *g_pcm;        // decoded sound of g_pcm->path (or failed), or NULL
 static volatile LONG g_pcmGen = 0;
+static HANDLE g_pcmThread = NULL;      // the newest decode thread
+static TCHAR g_pcmPath[MAX_PATH];      // and the file it decodes
 
 #define TWPNG_NBUF 5
 #define TWPNG_BUFMS 25
@@ -4107,6 +4113,8 @@ static BOOL twpng_PcmFor(const TCHAR *path)
 static void twpng_PcmRequest(const TCHAR *path)
 {
 	if(twpng_PcmFor(path)) return;
+	// Already decoding this file (e.g. the video just moved to or from full screen).
+	if(g_pcmThread && WaitForSingleObject(g_pcmThread, 0)==WAIT_TIMEOUT && !lstrcmpi(g_pcmPath, path)) return;
 	struct twpng_pcm *j = (struct twpng_pcm*)calloc(1, sizeof(struct twpng_pcm));
 	if(!j) return;
 	twpng_PcmFree(g_pcm);
@@ -4114,8 +4122,11 @@ static void twpng_PcmRequest(const TCHAR *path)
 	StringCchCopy(j->path, MAX_PATH, path);
 	j->gen = InterlockedIncrement(&g_pcmGen);   // an older decode still running is dropped
 	HANDLE th = CreateThread(NULL, 0, twpng_PcmThread, j, 0, NULL);
-	if(th) CloseHandle(th);
-	else free(j);
+	if(!th) { free(j); return; }
+	// Keep the handle of the newest decode, so shutdown can wait for it.
+	if(g_pcmThread) CloseHandle(g_pcmThread);
+	g_pcmThread = th;
+	StringCchCopy(g_pcmPath, MAX_PATH, path);
 }
 
 // Fill one waveOut buffer from the PCM at the current speed (linear interpolation).
@@ -4167,7 +4178,14 @@ static void twpng_AudioClose()
 	if(!g_aud.wo) return;
 	g_aud.quit = 1;
 	SetEvent(g_aud.ev);
-	WaitForSingleObject(g_aud.th, 2000);
+	if(WaitForSingleObject(g_aud.th, 2000) != WAIT_OBJECT_0) {
+		// The pump thread is stuck in the driver: leave the device and buffers to it
+		// rather than closing them under it.
+		CloseHandle(g_aud.th);
+		g_aud.wo = NULL;
+		g_aud.running = FALSE;
+		return;
+	}
 	CloseHandle(g_aud.th);
 	waveOutReset(g_aud.wo);
 	for(int k=0; k<TWPNG_NBUF; k++) {
@@ -4304,7 +4322,13 @@ static void twpng_VideoStop()
 static void twpng_VideoShutdown()
 {
 	twpng_VideoStop();
-	InterlockedIncrement(&g_pcmGen);
+	InterlockedIncrement(&g_pcmGen);   // a running decode stops after its current sample
+	if(g_pcmThread) {
+		// Media Foundation must not shut down under a decode that is still reading.
+		WaitForSingleObject(g_pcmThread, 3000);
+		CloseHandle(g_pcmThread);
+		g_pcmThread = NULL;
+	}
 	twpng_PcmFree(g_pcm);
 	g_pcm = NULL;
 	if(g_mfStarted) { MFShutdown(); g_mfStarted = FALSE; }
@@ -6733,7 +6757,8 @@ static DWORD WINAPI twpng_ScanThread(LPVOID p)
 			struct twpng_airec *o = (nold && key.name) ? (struct twpng_airec*)bsearch(&key, old, nold, sizeof(*old), twpng_CmpRecName) : NULL;
 			if(o && o->size==ents[i].size && o->mtime==ents[i].mtime && o->name) save[k++] = *o;
 		}
-		if(k || !nold) twpng_SaveIndex(s->dir, save, k);
+		// Skip the write when nothing changed (the folder watcher rescans on any change).
+		if((k || !nold) && (s->read || k != nold)) twpng_SaveIndex(s->dir, save, k);
 		free(save);   // shallow copies only
 	}
 	for(int i=0; i<nold; i++) twpng_FreeRec(&old[i]);
@@ -6762,6 +6787,8 @@ struct twpng_folderdlg {
 	BOOL dirty;                   // the folder changed while a scan was running
 	struct twpng_watch *watch;
 	LONG watchGen;
+	ULONGLONG lastSort;           // re-sorting while a scan runs is limited to once a second
+	BOOL unsorted;                // rows were added since the last sort
 };
 
 // Columns of the folder overview list.
@@ -6970,11 +6997,23 @@ static void twpng_FolderFilterMore(HWND hwnd, struct twpng_folderdlg *f)
 		}
 		f->rows[f->nrows++] = f->filtered;
 	}
-	if(f->nrows!=before) {
+	if(f->nrows!=before || (f->finished && f->unsorted)) {
 		HWND lv = GetDlgItem(hwnd,IDC_AF_LIST);
-		BOOL sorted = twpng_FolderSortRows(f);
-		ListView_SetItemCountEx(lv, f->nrows, LVSICF_NOSCROLL | (sorted ? 0 : LVSICF_NOINVALIDATEALL));
-		if(sorted) InvalidateRect(lv, NULL, FALSE);
+		ULONGLONG now = GetTickCount64();
+		BOOL sortOn = !(f->sortCol==AFC_FILE && !f->sortDesc);
+		f->unsorted = sortOn;
+		if(sortOn && (f->finished || now - f->lastSort >= 1000)) {
+			f->unsorted = FALSE;
+			// The list's selection is by row, so keep it on the same files across the re-sort.
+			struct twpng_listpos pos;
+			twpng_FolderSavePos(lv, f, &pos);
+			twpng_FolderSortRows(f);
+			f->lastSort = now;
+			ListView_SetItemCountEx(lv, f->nrows, LVSICF_NOSCROLL);
+			InvalidateRect(lv, NULL, FALSE);
+			twpng_FolderRestorePos(lv, f, &pos, TRUE);
+		}
+		else ListView_SetItemCountEx(lv, f->nrows, LVSICF_NOSCROLL|LVSICF_NOINVALIDATEALL);
 	}
 }
 
@@ -7132,6 +7171,7 @@ static void twpng_FolderDropPending(struct twpng_folderdlg *f)
 // The folder changed: rescan in the background unless a scan is already running.
 static void twpng_FolderQuietScan(HWND hwnd, struct twpng_folderdlg *f)
 {
+	if(f->stopped) return;   // the user stopped the scan: leave it until Rescan
 	if(!f->scan || !f->finished || f->pending) { f->dirty = TRUE; return; }
 	f->dirty = FALSE;
 	f->pending = twpng_NewScan(hwnd, f->dir);

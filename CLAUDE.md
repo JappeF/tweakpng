@@ -209,7 +209,9 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
   - **Video sound**: the engine time-stretches (pitch kept) with no way to turn that off,
     so it is muted and the sound is played by us with the pitch following the speed.
     `twpng_PcmThread` decodes the first audio track with `IMFSourceReader` to 16-bit PCM
-    (max 10 minutes, cached in `g_pcm` for the last file, posted back as `WM_APP_PCM`);
+    (max 10 minutes, cached in `g_pcm` for the last file, posted back as `WM_APP_PCM`; a
+    decode already running for the same file is not restarted, and `twpng_VideoShutdown`
+    waits for it before `MFShutdown`);
     `twpng_AudioTryOpen` (once PCM and metadata are there) opens `waveOut` at the file's
     rate with a pump thread (`CALLBACK_EVENT`, 5 x 25 ms buffers) that reads the PCM at
     `step` = speed with linear interpolation, wrapping at the video's duration. The video
@@ -356,7 +358,10 @@ fixed columns for the common settings plus "Other settings").
   `WM_APP_FOLDERCHANGED` (generation-checked); after 1.5 s of quiet `twpng_FolderQuietScan`
   starts a second scan (`f->pending`, reading only new/changed files thanks to the index)
   and `twpng_FolderSwapIn` replaces the rows when it is done. A change during a scan sets
-  `f->dirty` and rescans afterwards. The watch thread frees itself after its stop event.
+  `f->dirty` and rescans afterwards; after the user pressed Stop nothing rescans until
+  Rescan. The watch thread frees itself after its stop event. The scan skips rewriting the
+  index when nothing changed. While a first scan runs with a sort active, rows are re-sorted
+  at most once a second (and once at the end), keeping the selection by name.
 - **Index** (`twpng_LoadIndex` / `twpng_SaveIndex`): `%LOCALAPPDATA%\TweakPNG\index\<FNV-1a
   of the folder path>.idx`, a binary file (magic `TWAI`, version 1) with per file name,
   size, last-write time and the parsed prompt / negative / settings in UTF-8. A file is

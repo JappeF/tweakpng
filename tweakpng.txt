@@ -559,7 +559,8 @@ viewer's folder with the search box ready.
   (for example a render ComfyUI just finished) shows up by itself a moment
   later, and deleted files disappear. The search, sort order and selection
   stay as they are. On network or cloud drives that don't report changes
-  the folder is checked every 10 seconds instead.
+  the folder is checked every 10 seconds instead. After Stop this waits
+  until you press Rescan.
 
 The folder is scanned in the background with a progress bar and a Stop
 button, and only the part of each file that holds the metadata is read.
