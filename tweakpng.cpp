@@ -58,12 +58,14 @@
 #include <mfapi.h>
 #include <mfmediaengine.h>
 #include <mfreadwrite.h>
+#include <d3d11.h>
 #include <mmsystem.h>
 #include <math.h>
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -3951,6 +3953,42 @@ public:
 };
 
 static BOOL g_mfStarted = FALSE;
+static ID3D11Device *g_d3d = NULL;
+static IMFDXGIDeviceManager *g_dxgiMgr = NULL;
+
+// One D3D11 device shared by every engine. Left to itself the engine creates a device per
+// video, and in the full-screen view those were never freed (about 36 MB and 16 driver
+// threads each, until playback stopped working).
+static IMFDXGIDeviceManager *twpng_VideoDevice()
+{
+	if(g_d3d && g_d3d->GetDeviceRemovedReason()!=S_OK) {
+		g_dxgiMgr->Release(); g_dxgiMgr = NULL;
+		g_d3d->Release(); g_d3d = NULL;
+	}
+	if(g_dxgiMgr) return g_dxgiMgr;
+	static const D3D_FEATURE_LEVEL lv[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+		D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3 };
+	ID3D11Device *dev = NULL;
+	if(FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+		D3D11_CREATE_DEVICE_VIDEO_SUPPORT|D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+		lv, ARRAYSIZE(lv), D3D11_SDK_VERSION, &dev, NULL, NULL))) return NULL;
+	// The engine uses the device from its own threads.
+	ID3D10Multithread *mt = NULL;
+	if(SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&mt)))) { mt->SetMultithreadProtected(TRUE); mt->Release(); }
+	UINT token = 0;
+	IMFDXGIDeviceManager *m = NULL;
+	if(FAILED(MFCreateDXGIDeviceManager(&token, &m))) { dev->Release(); return NULL; }
+	if(FAILED(m->ResetDevice(dev, token))) { m->Release(); dev->Release(); return NULL; }
+	g_d3d = dev;
+	g_dxgiMgr = m;
+	return m;
+}
+
+static void twpng_VideoDeviceFree()
+{
+	if(g_dxgiMgr) { g_dxgiMgr->Release(); g_dxgiMgr = NULL; }
+	if(g_d3d) { g_d3d->Release(); g_d3d = NULL; }
+}
 
 static BOOL twpng_IsVideoPath(const TCHAR *path)
 {
@@ -4377,6 +4415,7 @@ static void twpng_VideoShutdown()
 	}
 	twpng_PcmFree(g_pcm);
 	g_pcm = NULL;
+	twpng_VideoDeviceFree();
 	if(g_mfStarted) { MFShutdown(); g_mfStarted = FALSE; }
 }
 
@@ -4486,8 +4525,10 @@ static void twpng_VideoStart(HWND parent, const TCHAR *path, double at, BOOL pla
 	IMFAttributes *attr = NULL;
 	IMFMediaEngine *eng = NULL;
 	HRESULT hr = CoCreateInstance(CLSID_MFMediaEngineClassFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&cf));
-	if(SUCCEEDED(hr)) hr = MFCreateAttributes(&attr, 3);
+	if(SUCCEEDED(hr)) hr = MFCreateAttributes(&attr, 4);
 	if(SUCCEEDED(hr)) hr = attr->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, nt);
+	IMFDXGIDeviceManager *dm = twpng_VideoDevice();
+	if(SUCCEEDED(hr) && dm) hr = attr->SetUnknown(MF_MEDIA_ENGINE_DXGI_MANAGER, dm);
 	if(SUCCEEDED(hr)) hr = attr->SetUINT64(MF_MEDIA_ENGINE_PLAYBACK_HWND, (UINT64)(UINT_PTR)host);
 	if(SUCCEEDED(hr)) hr = attr->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, 87);   // DXGI_FORMAT_B8G8R8A8_UNORM
 	if(SUCCEEDED(hr)) hr = cf->CreateInstance(0, attr, &eng);

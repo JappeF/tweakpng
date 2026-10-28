@@ -38,7 +38,7 @@ The default build links `libpng` and `zlib`, expected as **sibling directories**
 repo root (`..\..\..\libpng`, `..\..\..\zlib`) with prebuilt `.lib`s under
 `Debug32`/`Release32`/`Debug64`/`Release64`. Also links `comctl32.lib` and `uxtheme.lib`, plus
 (via `#pragma comment` in `tweakpng.cpp`) WIC, msimg32, shlwapi and Media Foundation
-(`mfplat.lib`, `mfuuid.lib`, `mfreadwrite.lib`) and `winmm.lib` for video playback.
+(`mfplat.lib`, `mfuuid.lib`, `mfreadwrite.lib`), `d3d11.lib` and `winmm.lib` for video playback.
 
 Feature flags live in `twpng-config.h`:
 - `TWPNG_SUPPORT_VIEWER` — image viewer (needs libpng + zlib)
@@ -209,7 +209,11 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
     There is one engine at a time: moving between viewer and full screen recreates it at
     the same position (`twpng_VideoMoveTo`, seek applied at `LOADEDMETADATA`), and
     `twpng_VideoFileChanged` (from `twpng_ShowAIParams`) stops it or, if it was playing,
-    starts the next file. Speed is `g_vidRate` percent (25..400, steps of 25) through
+    starts the next file. Every engine gets the same D3D11 device through a DXGI device
+    manager (`twpng_VideoDevice`, `MF_MEDIA_ENGINE_DXGI_MANAGER`, freed in
+    `twpng_VideoShutdown`): left to itself the engine creates a device per video, and in
+    the full-screen window those were never freed (about 36 MB and 16 driver threads per
+    video, until playback stopped at around 2.3 GB). Speed is `g_vidRate` percent (25..400, steps of 25) through
     `SetPlaybackRate`. Space toggles unless the focus is an Edit; -/+ always.
   - **Video sound**: the engine time-stretches (pitch kept) with no way to turn that off,
     so it is muted and the sound is played by us with the pitch following the speed.
