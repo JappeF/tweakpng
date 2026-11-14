@@ -492,21 +492,48 @@ settings and the thumbnail, can be dragged to resize the boxes (the small
 dots mark them); double-click a border to put it back. The sizes are
 remembered.
 
-Click the thumbnail to browse: left click shows the previous file, right
-click the next one. The left click waits for the double-click time first,
-because a double-click on the thumbnail (or F11) shows the image full
-screen, sharp at the size of your screen (for videos: a large frame).
-Left/Right, the mouse wheel, left/right click and Space browse through the
-folder there too; Esc, F11 or a middle click brings you back to the viewer.
+The picture (the thumbnail, or the playing video):
+
+- Click: play or pause a video.
+- Double-click (or F11): full screen, sharp at the size of your screen (for
+  videos: the video, or a large frame). Left/Right and the mouse wheel
+  browse there too; Esc, F11, a double-click or a middle click brings you
+  back to the viewer. The line at the bottom shows the file, its position,
+  whether it is marked and, for a video, the time.
+- Drag it to another app (a browser, a chat, a video editor, an Explorer
+  window) to hand it the file; it is copied, never moved.
+- Right-click (or the menu key) for a menu with everything below, plus
+  Open, Open With..., Show in Explorer, Folder Overview, Copy File, Copy
+  Image (Copy Frame for a video), Copy Path, Copy Prompt and Properties.
+- Drop an image or video from Explorer on the viewer (or the full-screen
+  view) to show it; drop a folder to show its first file.
+
+Keys, in the viewer and full screen:
+
+- S: mark or unmark the file for the Folder Overview (see below). A marked
+  file shows "Marked" above the picture and in the title.
+- Delete: move the file to the Recycle Bin and go on to the next one, handy
+  for sorting out renders. On a drive without a Recycle Bin, Windows asks
+  first.
+- Ctrl+C: copy the file (paste it in Explorer or another app).
+- Hold Left/Right, or keep Prev/Next pressed, to race through the folder:
+  only the thumbnails go by, and the file is read where you let go.
 
 For a video the viewer has Play, - and + buttons. Play (or Space, when the
 focus is not in one of the text boxes) plays the video in place of the
 thumbnail, over and over, with its sound; press it again to pause. - and +
-(also the keys) change the speed in steps of 25%, from 25% to 400%; like
-a tape, the sound goes up or down in pitch with the speed. Double-click
-the percentage to go back to 100%. While a video plays, Next
-and Prev start the next one playing too, and the full-screen view takes
-the video along (Space, - and + work there as well).
+(also the keys) step through the speeds set in Options > Preferences
+(25% to 400% by default); like a tape, the sound goes up or down in pitch
+with the speed. Double-click the percentage to go back to 100%, or
+right-click it to pick a speed. M mutes the sound. While paused, , and .
+step one frame back or forward; Home goes back to the start. The speed is
+remembered. While a video plays, Next and Prev start the next one playing
+too, the full-screen view takes the video along (Space, - and + work there
+as well), and minimizing the viewer pauses it until you bring it back.
+
+Save Frame as PNG (in the right-click menu of a video) saves the frame you
+see as a PNG file, with the video's generation parameters in it, so the
+picture keeps its prompt.
 
 Buttons at the bottom:
 
@@ -556,6 +583,18 @@ the viewer stays selected while you browse there.
   setting, and the remaining settings in "Other settings".
 - Click a column header to sort on it (Modified starts with the newest
   file), click it again to reverse. The sort order is remembered.
+- Marks: tick the checkbox in front of a row (or select rows and press
+  Space) to mark files, for example the renders you want to keep or throw
+  away. The checkbox in the header marks every row that is shown, or none.
+  S in the viewer marks the file you look at. Marks are kept per folder,
+  also after closing TweakPNG. "Marked only" shows just the marked files.
+- Delete, Copy to... and Move to... work on the marked files that are
+  shown, or on the selected rows when none are marked. Delete moves them to
+  the Recycle Bin (also the Delete key); Windows does the copying and
+  moving, with its own progress and name-clash questions.
+- Ctrl+C copies the files, to paste in Explorer. Drag rows to another app
+  or an Explorer window to hand it the files; dragging a marked row takes
+  all marked files along.
 - Change... opens a menu: Choose Folder..., the current file's folder, the
   folders that already have an index, and Manage Folder Indexes. Rescan
   reads the folder again.
@@ -575,9 +614,9 @@ scan takes longer, as every file is fetched over the network.
 
 The indexes can grow with big folders. Options > Folder Indexes (also at
 the bottom of the Folder Overview submenu) lists
-them with their folder, number of files, size and date; select one or
-more and click Delete, or use Delete all. A deleted folder is simply
-scanned again the next time.
+them with their folder, number of files, size and date (click a column
+header to sort); select one or more and click Delete, or use Delete all.
+A deleted folder is simply scanned again the next time; its marks stay.
 
 
 Tools > Compare AI Parameters

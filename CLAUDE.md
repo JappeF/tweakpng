@@ -161,10 +161,36 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
   - **Thumbnail**: `twpng_RequestThumb` asks the shell (`IShellItemImageFactory`,
     `SIIGBF_THUMBNAILONLY`) for Explorer's thumbnail on a background thread and posts it
     back (`WM_APP_THUMB`); a generation counter drops results for files no longer shown.
-    It is owner-drawn (`IDC_AIP_THUMB`, `SS_NOTIFY`) right of the settings box, and
-    subclassed (`ThumbSubclassProc` -> `twpng_ThumbMouse`): right click = next, left click =
-    previous after a `TWPNG_CLICKTIMER` of the double-click time (so a double-click can still
-    open the full-screen view without browsing first).
+    It is owner-drawn (`IDC_AIP_THUMB`, `SS_NOTIFY`) right of the settings box.
+  - **Mouse on the picture** (thumbnail, full-screen view and the video window over either,
+    all through `twpng_PicMouseMsg` -> `twpng_PicMouse`; the video window posts
+    `WM_APP_PICMOUSE` to its parent since playing/browsing destroys it): click = play/pause
+    a video, double-click = full screen on/off (the first click's toggle is undone), a press
+    that `DragDetect` turns into a drag = `twpng_DragCurrent` (the file to other apps), right
+    click = `twpng_PicMenu` (also the menu key). Clicks no longer browse.
+  - **Picture menu and keys** (`twpng_PicMenu` / `twpng_PicCommand`, `twpng_PicKey` from
+    `twpng_AIParamsKey` and `FullWndProc`): play/pause, speed submenu, mute (M), prev/next,
+    mark (S), full screen, open / open with / Explorer / folder overview, copy file (Ctrl+C,
+    `twpng_CopyFiles`), copy image or frame (`twpng_CopyPicture`: CF_DIB plus a "PNG"
+    clipboard format, a PNG file's own bytes), copy path / prompt, Save Frame as PNG,
+    Recycle Bin (Delete, `twpng_ViewerDelete`), Properties. In the viewer Home and Ctrl+C
+    stay with a focused text box.
+  - **Frames**: `,` / `.` step a frame (`IMFMediaEngineEx::FrameStep`, pauses), Home goes to
+    the start. `twpng_GrabFrame` reads a frame with its own `IMFSourceReader` (RGB32 through
+    the video processor, seek to the key frame and read on to the time, cropped to the
+    display aperture), so it doesn't depend on the engine. Save Frame (`twpng_SaveFrame`)
+    encodes it with WIC (`twpng_EncodePng`) and adds the viewer's full text as a `prompt`
+    (ComfyUI JSON) or `parameters` chunk (`twpng_PngAddText`: tEXt, or iTXt beyond Latin-1).
+  - **Racing** (`g_race`, `twpng_RaceStep` / `twpng_RaceEnd`): a long press on Prev/Next
+    (`NavButtonSubclassProc`, `TWPNG_RACETIMER` 400 ms then faster) or a held arrow key
+    (repeat bit; key up ends it, also in full screen) shows files without reading them
+    (`twpng_ShowAIParams(NULL...)`, the full-screen view keeps the thumbnail,
+    `twpng_FullLoad` skips the decode). Where it stops the file is read (`twpng_ViewerGoTo`,
+    as the document if it was) and a video that played plays on. The button's click after a
+    long press is swallowed.
+  - **Drop** a file (or a folder: its first supported file) on the viewer or the full-screen
+    view: `twpng_ViewerDrop` opens it as the document. Minimizing the viewer pauses a video
+    and restoring plays on (`g_vidMinPaused`).
   - **Splitters**: the gaps between Prompt / Negative prompt / Settings and between
     Settings and the thumbnail are draggable (`g_aipSplit`, hit-tested in the dialog's
     own `WM_SETCURSOR` / `WM_LBUTTONDOWN`, since the gaps and the static labels belong to
@@ -187,9 +213,10 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
     `twpng_DecodeFit` decodes on a worker thread (WIC, scaled to the screen, premultiplied
     BGRA; videos and anything WIC can't read fall back to a large shell thumbnail) and
     posts `WM_APP_FULLIMG`; the small thumbnail is drawn meanwhile. Left/Right, PageUp/Down,
-    Space (images), left/right click and the mouse wheel browse (through
-    `twpng_AIParamsNavigate`, so the viewer follows), Esc / F11 / middle click close. The
-    class has no `CS_DBLCLKS`, so fast clicks stay clicks. Its messages (and its children's)
+    Space (images) and the mouse wheel browse (through `twpng_AIParamsNavigate`, so the
+    viewer follows), Esc / F11 / middle click / double-click close. The status line shows
+    the mark, mute and a video's time (refreshed by `TWPNG_TIMETIMER` on the video window).
+    Its messages (and its children's)
     bypass the main window's accelerators in the message loop (Delete would otherwise
     delete a chunk), and `twpng_ShowAIParams` doesn't pull the viewer to the front while it
     is open.
@@ -213,8 +240,11 @@ keyed off the EXIF UserComment tag; for MP4/MOV, keyed off QuickTime metadata (s
     manager (`twpng_VideoDevice`, `MF_MEDIA_ENGINE_DXGI_MANAGER`, freed in
     `twpng_VideoShutdown`): left to itself the engine creates a device per video, and in
     the full-screen window those were never freed (about 36 MB and 16 driver threads per
-    video, until playback stopped at around 2.3 GB). Speed is `g_vidRate` percent (25..400, steps of 25) through
-    `SetPlaybackRate`. Space toggles unless the focus is an Edit; -/+ always.
+    video, until playback stopped at around 2.3 GB). Speed is `g_vidRate` (a macro for
+    `globals.vid_rate`, saved as `vid_rate`) percent through `SetPlaybackRate`; -/+ walk the
+    list in `globals.vid_steps` (Preferences, registry `vid_steps`, parsed by
+    `twpng_SpeedSteps`, 10..800). Space toggles unless the focus is an Edit; -/+ always.
+    Mute (`globals.vid_muted`, M) zeroes our PCM buffers and mutes the engine's own sound.
   - **Video sound**: the engine time-stretches (pitch kept) with no way to turn that off,
     so it is muted and the sound is played by us with the pitch following the speed.
     `twpng_PcmThread` decodes the first audio track with `IMFSourceReader` to 16-bit PCM
@@ -378,14 +408,35 @@ fixed columns for the common settings plus "Other settings").
   Rescan. The watch thread frees itself after its stop event. The scan skips rewriting the
   index when nothing changed. While a first scan runs with a sort active, rows are re-sorted
   at most once a second (and once at the end), keeping the selection by name.
+- **Marks** (checkboxes, `twpng_MarksFor` / `twpng_SetMarks`, S in the viewer): per
+  folder in `<index hash>.marks` next to the index (UTF-8 text: a header line, the folder,
+  one name per line; deleted when empty, kept when the index is deleted), a few folders
+  cached in `g_marks` with sorted names. `twpng_MarksChanged` updates the overview, the
+  viewer's title and "Marked" line (painted by the dialog above the picture, the Settings
+  label stops at the picture) and the full-screen line. The list has `LVS_EX_CHECKBOXES`
+  with `LVIS_STATEIMAGEMASK` as callback mask (state from `LVN_GETDISPINFO`) and themed
+  glyphs of our own (`twpng_FolderCheckImages`, redrawn after a theme switch); a click on
+  the state icon or Space toggles. The header's checkbox (`HDS_CHECKBOXES` + `HDF_CHECKBOX`,
+  drawn by the dark header custom draw) arrives as `HDN_ITEMSTATEICONCLICK` at the list,
+  which `MainListSubclassProc` posts on as `WM_APP_HDRCHECK`: mark all shown rows or none.
+  "Marked only" filters in `twpng_FolderFilterMore`.
+- **File actions** (`twpng_FolderTargets`: the marked shown rows, else the selection):
+  Delete (Recycle Bin after a confirm, also the Delete key), Copy to / Move to (folder
+  picker), all through `twpng_FileOp` (`IFileOperation` with `FOF_ALLOWUNDO`, so the shell
+  handles progress, name clashes and drives without a Recycle Bin; a playing video of one
+  of the files is stopped first). `twpng_FilesGone` then drops gone files from the marks and
+  `g_sib`, rescans the overview and moves the viewer on. Ctrl+C puts the files on the
+  clipboard and `LVN_BEGINDRAG` drags them (`twpng_FilesDataObject`: a shell data object
+  from `SHCreateShellItemArrayFromIDLists`, `SHDoDragDrop` with copy/link only). Both need
+  `OleInitialize` (WinMain).
 - **Index** (`twpng_LoadIndex` / `twpng_SaveIndex`): `%LOCALAPPDATA%\TweakPNG\index\<FNV-1a
   of the folder path>.idx`, a binary file (magic `TWAI`, version 1) with per file name,
   size, last-write time and the parsed prompt / negative / settings in UTF-8. A file is
   only read again when its size or time changed. A stopped scan still saves what it has,
   plus the old records of files it didn't reach.
 - **Options > Folder Indexes** (`ID_AIINDEX`, `DLG_AIINDEX`, `DlgProcIndexes`): lists the
-  index files with the folder and file count from their headers, size and date, and
-  deletes the selected ones or all after a confirm.
+  index files with the folder and file count from their headers, size and date (columns
+  sortable, `twpng_CmpIdx`), and deletes the selected ones or all after a confirm.
 - Measured: 22,000 local files take about 3.4 s the first time and 0.2 s from the index;
   on RaiDrive (cloud WebDAV) a first read costs about 50 ms per video.
 

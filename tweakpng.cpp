@@ -153,8 +153,21 @@ static void twpng_VideoPlace();
 static void twpng_VideoUI();
 static BOOL twpng_VideoAspect(int *w, int *h);
 static BOOL twpng_VideoPlaying();
-static void twpng_ThumbMouse(UINT msg);
 static void twpng_AIParamsNavigate(int dir);
+static void twpng_ViewerGoTo(const TCHAR *path);
+static int  twpng_SpeedSteps(int *out, int cap);
+static BOOL twpng_PicKey(HWND owner, WPARAM vk, BOOL ctrl);
+static void twpng_PicMenu(HWND owner, POINT scr);
+static void twpng_SpeedMenu(HWND owner, POINT scr);
+static void twpng_ViewerDrop(HDROP hd);
+static int  twpng_SlurpFile(const TCHAR *fn, DWORD cap, unsigned char **outBuf, DWORD *outSize);
+static BOOL twpng_WriteWholeFile(const TCHAR *fn, const unsigned char *data, DWORD len);
+static BOOL twpng_IsMarkedPath(const TCHAR *path);
+static void twpng_ToggleMarkPath(const TCHAR *path);
+static void twpng_MarksChanged(const TCHAR *dir);
+static int  twpng_CmpStrPtr(const void *a, const void *b);
+struct twpng_folderdlg;
+static void twpng_FolderMarkUI(HWND hwnd, struct twpng_folderdlg *f);
 struct twpng_pcm;
 static void twpng_PcmDone(struct twpng_pcm *j);
 #define WM_APP_PCM      (WM_APP+26)
@@ -1418,6 +1431,9 @@ static int SaveSettings()
 	r=RegSetValueEx(key,_T("aip_split_neg"),0,REG_DWORD,(LPBYTE)&globals.aip_split_neg,sizeof(DWORD));
 	r=RegSetValueEx(key,_T("aip_split_thumb"),0,REG_DWORD,(LPBYTE)&globals.aip_split_thumb,sizeof(DWORD));
 	r=RegSetValueEx(key,_T("aif_sort"),0,REG_DWORD,(LPBYTE)&globals.aif_sort,sizeof(DWORD));
+	r=RegSetValueEx(key,_T("vid_rate"),0,REG_DWORD,(LPBYTE)&globals.vid_rate,sizeof(DWORD));
+	r=RegSetValueEx(key,_T("vid_muted"),0,REG_DWORD,(LPBYTE)&globals.vid_muted,sizeof(DWORD));
+	r=RegSetValueEx(key,_T("vid_steps"),0,REG_SZ,(LPBYTE)globals.vid_steps,(DWORD)sizeof(TCHAR)*(1+lstrlen(globals.vid_steps)));
 
 	if(IsWindow(globals.hwndMainList)) {
 		for(i=0;i<5;i++) {
@@ -1459,6 +1475,9 @@ static void ReadSettings()
 	globals.aip_split_prompt=500;
 	globals.aip_split_neg=220;
 	globals.aip_split_thumb=0;   // 0 => size the thumbnail from the image's aspect ratio
+	globals.vid_rate=100;
+	globals.vid_muted=0;
+	StringCchCopy(globals.vid_steps,100,TWPNG_DEFAULT_STEPS);
 
 	for(i=0;i<TWPNG_NUMTOOLS;i++) {
 		StringCchCopy(globals.tools[i].name,MAX_TOOL_NAME,_T(""));
@@ -1563,6 +1582,14 @@ static void ReadSettings()
 	if(globals.aip_split_prompt<50 || globals.aip_split_prompt>950) globals.aip_split_prompt=500;
 	if(globals.aip_split_neg<50 || globals.aip_split_neg>950) globals.aip_split_neg=220;
 	if(globals.aip_split_thumb<0 || globals.aip_split_thumb>800) globals.aip_split_thumb=0;
+	datasize=sizeof(DWORD);
+	r=RegQueryValueEx(key,_T("vid_rate"),NULL,NULL,(LPBYTE)(&globals.vid_rate),&datasize);
+	if(globals.vid_rate<10 || globals.vid_rate>800) globals.vid_rate=100;
+	datasize=sizeof(DWORD);
+	r=RegQueryValueEx(key,_T("vid_muted"),NULL,NULL,(LPBYTE)(&globals.vid_muted),&datasize);
+	datasize=sizeof(TCHAR)*99;
+	r=RegQueryValueEx(key,_T("vid_steps"),NULL,NULL,(LPBYTE)globals.vid_steps,&datasize);
+	globals.vid_steps[99]=0;
 
 	datasize=sizeof(DWORD);
 	tmpd = 0;
@@ -1660,7 +1687,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 
 	if(!RegisterClasses()) return 0;
 	BufferedPaintInit();
-	CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+	OleInitialize(NULL);   // COM plus what drag and drop and the file clipboard need
 #ifdef TWPNG_SUPPORT_VIEWER
 	Viewer::GlobalInit();
 #endif
@@ -1727,7 +1754,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 #endif
 	twpng_VideoShutdown();
 	BufferedPaintUnInit();
-	CoUninitialize();
+	OleUninitialize();
 	return (int)msg.wParam;
 }
 
@@ -2671,6 +2698,18 @@ static int twpng_GetSiblings(const TCHAR *fn, TCHAR ***outList, int *outIdx, BOO
 	return g_sib.n;
 }
 
+// A file was deleted or moved away: drop it from the cached listing.
+static void twpng_SibForget(const TCHAR *path)
+{
+	for(int i=0; i<g_sib.n; i++) {
+		if(lstrcmpi(g_sib.list[i], path)) continue;
+		free(g_sib.list[i]);
+		memmove(&g_sib.list[i], &g_sib.list[i+1], (size_t)(g_sib.n-i-1)*sizeof(TCHAR*));
+		g_sib.n--;
+		return;
+	}
+}
+
 // Title shows the file and its position in the folder; Prev/Next enable at the ends.
 static void twpng_UpdateAINav(HWND hwnd, struct aiparams_ctx *c)
 {
@@ -2688,6 +2727,7 @@ static void twpng_UpdateAINav(HWND hwnd, struct aiparams_ctx *c)
 		StringCchPrintf(title, MAX_PATH+80, _T("AI Generation Parameters - %s"), base);
 	else
 		StringCchCopy(title, MAX_PATH+80, _T("AI Generation Parameters"));
+	if(base[0] && twpng_IsMarkedPath(c->path)) StringCchCat(title, MAX_PATH+80, _T(" - Marked"));
 	SetWindowText(hwnd, title);
 	EnableWindow(GetDlgItem(hwnd,IDC_AIP_PREV), idx>0);
 	EnableWindow(GetDlgItem(hwnd,IDC_AIP_NEXT), idx>=0 && idx<n-1);
@@ -2704,44 +2744,36 @@ static struct {
 	double seek;          // start position to apply once the metadata is loaded
 	BOOL shown;
 } g_vid;
-static int g_vidRate = 100;   // playback speed in percent, kept while browsing
+#define g_vidRate globals.vid_rate   // playback speed in percent, kept while browsing and between runs
 
-#define TWPNG_CLICKTIMER 7
+#define WM_APP_PICMOUSE (WM_APP+29)   // a click on the video window, posted to its parent
 
-// Left click on the thumbnail: previous file (after the double-click time, since a
-// double-click opens the full-screen view), right click: next file.
-static void twpng_ThumbMouse(UINT msg)
+static void twpng_PicMouse(HWND owner, UINT msg, POINT scr, BOOL drag);
+
+// Mouse on a picture window (thumbnail, full-screen view, video): see twpng_PicMouse. A
+// press that turns into a drag is noticed here, while the button is still down.
+static BOOL twpng_PicMouseMsg(HWND hwnd, UINT msg, LPARAM lParam, POINT *scr, BOOL *drag)
 {
-	HWND h = g_hwndAIParams;
-	if(!h) return;
-	HWND play = GetDlgItem(h, IDC_AIP_PLAY);
-	if(GetWindowLongPtr(play, GWL_STYLE) & WS_VISIBLE) SendMessage(h, WM_NEXTDLGCTL, (WPARAM)play, TRUE);
-	switch(msg) {
-	case WM_LBUTTONDOWN:
-		SetTimer(h, TWPNG_CLICKTIMER, GetDoubleClickTime(), NULL);
-		break;
-	case WM_LBUTTONDBLCLK:
-		KillTimer(h, TWPNG_CLICKTIMER);
-		twpng_FullscreenOpen();
-		break;
-	case WM_RBUTTONDOWN:
-	case WM_RBUTTONDBLCLK:
-		KillTimer(h, TWPNG_CLICKTIMER);
-		twpng_AIParamsNavigate(1);
-		break;
-	}
+	if(msg!=WM_LBUTTONDOWN && msg!=WM_LBUTTONDBLCLK && msg!=WM_RBUTTONUP) return FALSE;
+	scr->x = (short)LOWORD(lParam);
+	scr->y = (short)HIWORD(lParam);
+	ClientToScreen(hwnd, scr);
+	*drag = msg==WM_LBUTTONDOWN && DragDetect(hwnd, *scr);
+	return TRUE;
 }
 
 static LRESULT CALLBACK ThumbSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
 	(void)dwRefData;
-	switch(msg) {
-	case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
-	case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK:
-		twpng_ThumbMouse(msg);
+	POINT scr;
+	BOOL drag;
+	if(twpng_PicMouseMsg(hwnd, msg, lParam, &scr, &drag)) {
+		twpng_PicMouse(GetParent(hwnd), msg, scr, drag);
 		return 0;
-	case WM_RBUTTONUP:
+	}
+	switch(msg) {
+	case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK:
 		return 0;
 	case WM_ERASEBKGND:
 		return 1;   // twpng_DrawThumb paints every pixel
@@ -2855,6 +2887,7 @@ static void twpng_ThumbDone(struct twpng_thumbjob *j)
 			}
 			twpng_LayoutAIParams(g_hwndAIParams);
 			InvalidateRect(GetDlgItem(g_hwndAIParams, IDC_AIP_THUMB), NULL, TRUE);
+			if(g_hwndFull) InvalidateRect(g_hwndFull, NULL, FALSE);   // stands in until the full image is there
 		}
 	}
 	if(j->bmp) DeleteObject(j->bmp);
@@ -2897,13 +2930,102 @@ static void twpng_DrawThumb(const DRAWITEMSTRUCT *d, const struct aiparams_ctx *
 	DeleteDC(bdc);
 }
 
+// ---- Long press on Prev/Next, or a held arrow key: race through the folder -------------
+// While racing only the name, position and thumbnail change; the file itself is read when
+// it stops (reading every file on the way is slow on network drives).
+
+#define TWPNG_RACETIMER 7
+static struct {
+	BOOL active;          // files are shown without being read
+	BOOL wasDoc, wasPlaying;
+	int dir, steps;       // long press on a button: its direction, steps taken so far
+	BOOL swallowClick;    // the button's click when the long press ends
+	BOOL inUp;
+} g_race;
+static BOOL g_vidMinPaused = FALSE;   // paused because the viewer was minimized
+
+static void twpng_RaceStep(int dir)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c || !c->path[0]) return;
+	TCHAR **list;
+	int idx, n = twpng_GetSiblings(c->path, &list, &idx, FALSE);
+	if(idx<0 || idx+dir<0 || idx+dir>=n) return;
+	if(!g_race.active) {
+		g_race.active = TRUE;
+		g_race.wasDoc = c->isDoc;
+		g_race.wasPlaying = twpng_VideoPlaying();
+		twpng_VideoStop();
+	}
+	TCHAR p[MAX_PATH];
+	StringCchCopy(p, MAX_PATH, list[idx+dir]);
+	twpng_ShowAIParams(NULL, NULL, p, FALSE);
+}
+
+static void twpng_RaceEnd()
+{
+	if(!g_race.active) return;
+	g_race.active = FALSE;
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c || !c->path[0]) return;
+	TCHAR p[MAX_PATH];
+	StringCchCopy(p, MAX_PATH, c->path);
+	c->isDoc = g_race.wasDoc;
+	twpng_ViewerGoTo(p);
+	if(g_race.wasPlaying && twpng_IsVideoPath(p) && !twpng_VideoPlaying()) twpng_VideoToggle();
+}
+
+static void twpng_RaceTimer(HWND hwnd)
+{
+	HWND btn = GetDlgItem(hwnd, g_race.dir<0 ? IDC_AIP_PREV : IDC_AIP_NEXT);
+	if(GetCapture()!=btn || GetKeyState(VK_LBUTTON)>=0) { KillTimer(hwnd, TWPNG_RACETIMER); return; }
+	twpng_RaceStep(g_race.dir);
+	g_race.steps++;
+	SetTimer(hwnd, TWPNG_RACETIMER, g_race.steps<5 ? 160 : g_race.steps<20 ? 80 : 40, NULL);   // faster the longer it is held
+}
+
+static LRESULT CALLBACK NavButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+	switch(msg) {
+	case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
+		g_race.dir = (int)(INT_PTR)dwRefData;
+		g_race.steps = 0;
+		SetTimer(GetParent(hwnd), TWPNG_RACETIMER, 400, NULL);
+		break;
+	case WM_LBUTTONUP:
+		{
+			KillTimer(GetParent(hwnd), TWPNG_RACETIMER);
+			BOOL raced = g_race.steps>0;
+			g_race.steps = 0;
+			g_race.swallowClick = raced;
+			g_race.inUp = TRUE;
+			LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);   // sends the click
+			g_race.inUp = FALSE;
+			g_race.swallowClick = FALSE;
+			if(raced) twpng_RaceEnd();
+			return lr;
+		}
+	case WM_CAPTURECHANGED:
+		if(!g_race.inUp) {
+			KillTimer(GetParent(hwnd), TWPNG_RACETIMER);
+			if(g_race.steps) { g_race.steps = 0; twpng_RaceEnd(); }
+		}
+		break;
+	case WM_NCDESTROY:
+		RemoveWindowSubclass(hwnd, NavButtonSubclassProc, uIdSubclass);
+		break;
+	}
+	return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
 static void twpng_FillAIParams(HWND hwnd, struct aiparams_ctx *c)
 {
 	TCHAR *t;
 	SetDlgItemText(hwnd,IDC_AIP_PROMPT,_T(""));
 	SetDlgItemText(hwnd,IDC_AIP_NEG,_T(""));
 	SetDlgItemText(hwnd,IDC_AIP_SETTINGS,_T(""));
-	if(!c->full) SetDlgItemText(hwnd,IDC_AIP_PROMPT,_T("(No AI parameters found in this file.)"));
+	if(!c->full && !g_race.active) SetDlgItemText(hwnd,IDC_AIP_PROMPT,_T("(No AI parameters found in this file.)"));
 	t=twpng_LfToCrlf(c->pos);            if(t){ SetDlgItemText(hwnd,IDC_AIP_PROMPT,t);   free(t); }
 	t=twpng_LfToCrlf(c->neg);            if(t){ SetDlgItemText(hwnd,IDC_AIP_NEG,t);      free(t); }
 	t=twpng_SettingsToLines(c->setRaw);  if(t){ SetDlgItemText(hwnd,IDC_AIP_SETTINGS,t); free(t); }
@@ -3063,7 +3185,7 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	twpng_LayMove(&dw,hwnd,IDC_AIP_NEG,editX,y,editW,negH,0);
 	twpng_LayMove(&dw,hwnd,IDC_AIP_COPYNEG,copyX,y,copyW,copyH,0);
 	y+=negH+gap;
-	twpng_LayMove(&dw,hwnd,IDC_AIP_LBLSET,editX,y,editW,labelH,0);
+	int lblSetY=y;
 	y+=labelH;
 	// The thumbnail sits right of the settings: as wide as its splitter says, or by default
 	// as tall as the box and at most half as wide.
@@ -3081,6 +3203,8 @@ static void twpng_LayoutAIParams(HWND hwnd)
 	int setW = thumbW ? editW-thumbW-gap : editW;
 	if(thumbW) SetRect(&g_aipSplit.rc[2], editX+setW, y, editX+setW+gap, y+setH);
 	else SetRectEmpty(&g_aipSplit.rc[2]);
+	// The label stops at the picture, so the "Marked" line above it can show.
+	twpng_LayMove(&dw,hwnd,IDC_AIP_LBLSET,editX,lblSetY,setW,labelH,0);
 	twpng_LayMove(&dw,hwnd,IDC_AIP_SETTINGS,editX,y,setW,setH,0);
 	twpng_LayMove(&dw,hwnd,IDC_AIP_THUMB,editX+editW-thumbW,y,thumbW?thumbW:1,setH,
 		SWP_NOCOPYBITS|(thumbW ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
@@ -3120,6 +3244,9 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		SetWindowLongPtr(hwnd,DWLP_USER,lParam);
 		SendMessage(hwnd,WM_SETICON,ICON_BIG,(LPARAM)LoadIcon(globals.hInst,_T("ICONMAIN")));
 		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_THUMB), ThumbSubclassProc, 0, 0);
+		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_PREV), NavButtonSubclassProc, 0, (DWORD_PTR)-1);
+		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_NEXT), NavButtonSubclassProc, 0, 1);
+		DragAcceptFiles(hwnd, TRUE);
 		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_PROMPT), BufferedEditSubclassProc, 0, 0);
 		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_NEG), BufferedEditSubclassProc, 0, 0);
 		SetWindowSubclass(GetDlgItem(hwnd,IDC_AIP_SETTINGS), BufferedEditSubclassProc, 0, 0);
@@ -3141,7 +3268,34 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 	switch(msg){
 	case WM_SIZE:
 		twpng_LayoutAIParams(hwnd);
+		// Minimized: pause the video, and play on when the window comes back.
+		if(wParam==SIZE_MINIMIZED) {
+			if(twpng_VideoPlaying() && GetParent(g_vid.host)==hwnd) { twpng_VideoToggle(); g_vidMinPaused = TRUE; }
+		}
+		else if(g_vidMinPaused) {
+			g_vidMinPaused = FALSE;
+			if(g_vid.eng && !twpng_VideoPlaying()) twpng_VideoToggle();
+		}
 		return 0;
+
+	case WM_APP_PICMOUSE:
+		{
+			POINT scr = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+			twpng_PicMouse(hwnd, LOWORD(wParam), scr, HIWORD(wParam));
+			return 1;
+		}
+
+	case WM_DROPFILES:
+		twpng_ViewerDrop((HDROP)wParam);
+		return 1;
+
+	case WM_CONTEXTMENU:
+		if((HWND)wParam==GetDlgItem(hwnd,IDC_AIP_SPEED)) {
+			POINT scr = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+			twpng_SpeedMenu(hwnd, scr);
+			return 1;
+		}
+		break;
 
 	case WM_GETMINMAXINFO:
 		{
@@ -3226,16 +3380,27 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			HBRUSH br = (HBRUSH)SendMessage(hwnd, WM_CTLCOLORDLG, (WPARAM)dc, (LPARAM)hwnd);
 			FillRect(dc, &ps.rcPaint, br ? br : GetSysColorBrush(COLOR_BTNFACE));
 			twpng_AIPDrawGrips(dc);
+			// "Marked" above the picture (S marks the file for the folder overview).
+			HWND th = GetDlgItem(hwnd, IDC_AIP_THUMB);
+			if(c && c->path[0] && (GetWindowLongPtr(th, GWL_STYLE) & WS_VISIBLE) && twpng_IsMarkedPath(c->path)) {
+				RECT tr;
+				GetWindowRect(th, &tr);
+				MapWindowPoints(NULL, hwnd, (POINT*)&tr, 2);
+				RECT lr = { tr.left, tr.top-18, tr.right, tr.top-2 };
+				HGDIOBJ of = SelectObject(dc, globals.hUiFont ? globals.hUiFont : GetStockObject(DEFAULT_GUI_FONT));
+				SetBkMode(dc, TRANSPARENT);
+				SetTextColor(dc, globals.dark ? RGB(0x60,0xcd,0xff) : RGB(0x00,0x5f,0xb8));
+				DrawText(dc, _T("\x2713 Marked"), -1, &lr, DT_RIGHT|DT_BOTTOM|DT_SINGLELINE|DT_NOPREFIX);
+				SelectObject(dc, of);
+			}
 			EndPaint(hwnd, &ps);
 			SetWindowLongPtr(hwnd, DWLP_MSGRESULT, 0);
 			return TRUE;
 		}
 
 	case WM_TIMER:
-		if(wParam==TWPNG_CLICKTIMER) {
-			// A single click on the thumbnail (no double-click followed): previous file.
-			KillTimer(hwnd, TWPNG_CLICKTIMER);
-			twpng_AIParamsNavigate(-1);
+		if(wParam==TWPNG_RACETIMER) {
+			twpng_RaceTimer(hwnd);
 			return TRUE;
 		}
 		break;
@@ -3258,7 +3423,9 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		break;
 
 	case WM_DESTROY:
-		KillTimer(hwnd, TWPNG_CLICKTIMER);
+		KillTimer(hwnd, TWPNG_RACETIMER);
+		g_race.active = FALSE;
+		g_vidMinPaused = FALSE;
 		if(g_vid.host && GetParent(g_vid.host)==hwnd) twpng_VideoStop();
 		// fall through
 	case WM_EXITSIZEMOVE:
@@ -3273,8 +3440,12 @@ static INT_PTR CALLBACK DlgProcAIParams(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 		case IDC_AIP_COPYSET:    if(c) twpng_SetClipboardText(hwnd,c->setRaw); return 1;
 		case IDC_AIP_COPYALL:    if(c){TCHAR*t=twpng_LfToCrlf(c->full);twpng_SetClipboardText(hwnd,t);free(t);} return 1;
 		case IDC_AIP_SAVEJSON:   twpng_SaveAIJson(hwnd,c); return 1;
-		case IDC_AIP_PREV:       twpng_AIParamsNavigate(-1); return 1;
-		case IDC_AIP_NEXT:       twpng_AIParamsNavigate(1); return 1;
+		case IDC_AIP_PREV:
+		case IDC_AIP_NEXT:
+			// After a long press the release ends the racing instead of stepping once more.
+			if(g_race.swallowClick) g_race.swallowClick = FALSE;
+			else twpng_AIParamsNavigate(id==IDC_AIP_PREV ? -1 : 1);
+			return 1;
 		case IDC_AIP_EXPLORER:   if(c && c->path[0]) twpng_ShowInExplorer(c->path); return 1;
 		case IDC_AIP_FOLDER:     twpng_FolderForViewer(FALSE); return 1;
 		case IDC_AIP_PLAY:       twpng_VideoToggle(); return 1;
@@ -3354,8 +3525,11 @@ static int twpng_ShowAIParams(const TCHAR *text, const TCHAR *extra, const TCHAR
 		twpng_VideoFileChanged();
 		twpng_FillAIParams(g_hwndAIParams, c);
 		twpng_FreeAIParamsCtx(old);
-		if(IsIconic(g_hwndAIParams)) ShowWindow(g_hwndAIParams, SW_RESTORE);
-		if(!g_hwndFull) SetForegroundWindow(g_hwndAIParams);
+		if(g_hwndFull) twpng_FullLoad();   // racing: only the thumbnail, see twpng_FullLoad
+		else {
+			if(IsIconic(g_hwndAIParams)) ShowWindow(g_hwndAIParams, SW_RESTORE);
+			SetForegroundWindow(g_hwndAIParams);
+		}
 		return 1;
 	}
 
@@ -3471,14 +3645,23 @@ static void twpng_AIParamsNavigate(int dir)
 	if(idx<0 || idx+dir<0 || idx+dir>=n) return;
 	TCHAR next[MAX_PATH];
 	StringCchCopy(next, MAX_PATH, list[idx+dir]);
+	twpng_ViewerGoTo(next);
+}
 
+// Show `path` in the viewer, as the document when the viewer shows the document.
+static void twpng_ViewerGoTo(const TCHAR *path)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c) return;
+	TCHAR p[MAX_PATH];
+	StringCchCopy(p, MAX_PATH, path);
 	if(c->isDoc) {
-		twpng_OpenInViewer(next);
+		twpng_OpenInViewer(p);
 		return;
 	}
 	TCHAR *text = NULL, extra[200] = _T("");
-	twpng_ReadAnyAIParams(next, &text, extra, 200);
-	twpng_ShowAIParams(text, extra, next, FALSE);
+	twpng_ReadAnyAIParams(p, &text, extra, 200);
+	twpng_ShowAIParams(text, extra, p, FALSE);
 	free(text);
 }
 
@@ -3589,8 +3772,14 @@ static void twpng_FullLoad()
 	if(!lstrcmpi(g_full.path, g_aiParamsCtx->path) && (g_full.bmp || g_full.loading)) return;
 	if(g_full.bmp) { DeleteObject(g_full.bmp); g_full.bmp = NULL; }
 	StringCchCopy(g_full.path, MAX_PATH, g_aiParamsCtx->path);
-	g_full.loading = TRUE;
 	g_full.gen++;
+	if(g_race.active) {
+		// Racing: the thumbnail stands in, the image is decoded where it stops.
+		g_full.loading = FALSE;
+		InvalidateRect(g_hwndFull, NULL, FALSE);
+		return;
+	}
+	g_full.loading = TRUE;
 	struct twpng_fulljob *j = (struct twpng_fulljob*)calloc(1, sizeof(struct twpng_fulljob));
 	if(j) {
 		RECT rc;
@@ -3638,16 +3827,24 @@ static void twpng_FullStatusText(TCHAR *line, int cap)
 	int idx = -1, n = g_full.path[0] ? twpng_GetSiblings(g_full.path, &list, &idx, FALSE) : 0;
 	if(idx>=0) StringCchPrintf(line, cap, _T("%s  (%d/%d)"), base, idx+1, n);
 	else StringCchCopy(line, cap, base);
+	if(g_full.path[0] && twpng_IsMarkedPath(g_full.path)) StringCchCat(line, cap, _T("   \x2713 marked"));
 	BOOL vid = twpng_IsVideoPath(g_full.path);
 	if(vid) {
-		TCHAR st[60];
-		StringCchPrintf(st, 60, _T("   %s %d%%"), twpng_VideoPlaying() ? _T("playing at") : _T("paused,"), g_vidRate);
+		TCHAR st[100];
+		StringCchPrintf(st, 100, _T("   %s %d%%%s"), twpng_VideoPlaying() ? _T("playing at") : _T("paused,"), g_vidRate,
+			globals.vid_muted ? _T(", muted") : _T(""));
 		StringCchCat(line, cap, st);
+		if(g_vid.eng && !lstrcmpi(g_vid.path, g_full.path)) {
+			double t = g_vid.eng->GetCurrentTime(), d = g_vid.eng->GetDuration();
+			if(d > 0 && d < 1e7) StringCchPrintf(st, 100, _T("   %.2f / %.2f s"), t, d);
+			else StringCchPrintf(st, 100, _T("   %.2f s"), t);
+			StringCchCat(line, cap, st);
+		}
 	}
 	else if(g_full.loading) StringCchCat(line, cap, _T("   loading..."));
 	else if(!g_full.bmp) StringCchCat(line, cap, _T("   no preview"));
-	StringCchCat(line, cap, vid ? _T("      Left/Right or click: browse   Space: play/pause   -/+: speed   Esc: close")
-	                            : _T("      Left/Right or click: browse   Esc: close"));
+	StringCchCat(line, cap, vid ? _T("      Left/Right: browse   Space: play/pause   , .: frame   S: mark   right click: menu   Esc: close")
+	                            : _T("      Left/Right: browse   S: mark   right click: menu   Esc: close"));
 }
 
 static void twpng_FullPaint(HWND hwnd, HDC hdc)
@@ -3717,32 +3914,64 @@ static LRESULT CALLBACK FullWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			return 0;
 		}
 	case WM_KEYDOWN:
-		switch(wParam) {
-		case VK_ESCAPE: case VK_F11: DestroyWindow(hwnd); return 0;
-		case VK_LEFT: case VK_PRIOR: case VK_UP: twpng_FullBrowse(hwnd, -1); return 0;
-		case VK_RIGHT: case VK_NEXT: case VK_DOWN: twpng_FullBrowse(hwnd, 1); return 0;
-		case VK_SPACE:
-			if(twpng_IsVideoPath(g_full.path)) twpng_VideoToggle();
-			else twpng_FullBrowse(hwnd, 1);
-			return 0;
-		case VK_OEM_PLUS: case VK_ADD: twpng_VideoSpeed(1); return 0;
-		case VK_OEM_MINUS: case VK_SUBTRACT: twpng_VideoSpeed(-1); return 0;
+		{
+			// A held arrow key repeats: race through the folder until it is let go.
+			BOOL rep = (lParam & 0x40000000)!=0;
+			switch(wParam) {
+			case VK_ESCAPE: case VK_F11: DestroyWindow(hwnd); return 0;
+			case VK_LEFT: case VK_PRIOR: case VK_UP:
+				if(rep) twpng_RaceStep(-1); else twpng_FullBrowse(hwnd, -1);
+				return 0;
+			case VK_RIGHT: case VK_NEXT: case VK_DOWN:
+				if(rep) twpng_RaceStep(1); else twpng_FullBrowse(hwnd, 1);
+				return 0;
+			case VK_SPACE:
+				if(twpng_IsVideoPath(g_full.path)) twpng_VideoToggle();
+				else twpng_FullBrowse(hwnd, 1);
+				return 0;
+			case VK_OEM_PLUS: case VK_ADD: twpng_VideoSpeed(1); return 0;
+			case VK_OEM_MINUS: case VK_SUBTRACT: twpng_VideoSpeed(-1); return 0;
+			}
+			if(twpng_PicKey(hwnd, wParam, GetKeyState(VK_CONTROL)<0)) return 0;
 		}
+		break;
+	case WM_KEYUP:
+		if(wParam==VK_LEFT || wParam==VK_PRIOR || wParam==VK_UP || wParam==VK_RIGHT || wParam==VK_NEXT || wParam==VK_DOWN)
+			twpng_RaceEnd();
 		break;
 	case WM_MOUSEWHEEL:
 		twpng_FullBrowse(hwnd, GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -1 : 1);
 		return 0;
-	// No CS_DBLCLKS, so quick clicks browse quickly instead of becoming double-clicks.
-	case WM_LBUTTONDOWN:
-		twpng_FullBrowse(hwnd, -1);
-		return 0;
+	case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: case WM_RBUTTONUP:
+		{
+			POINT scr;
+			BOOL drag;
+			if(twpng_PicMouseMsg(hwnd, msg, lParam, &scr, &drag)) twpng_PicMouse(hwnd, msg, scr, drag);
+			return 0;
+		}
+	case WM_APP_PICMOUSE:
+		{
+			POINT scr = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+			twpng_PicMouse(hwnd, LOWORD(wParam), scr, HIWORD(wParam));
+			return 0;
+		}
 	case WM_RBUTTONDOWN:
-		twpng_FullBrowse(hwnd, 1);
 		return 0;
-	case WM_RBUTTONUP:
-		return 0;
+	case WM_CONTEXTMENU:
+		{
+			// The menu key: at the middle of the screen.
+			RECT r;
+			GetWindowRect(hwnd, &r);
+			POINT scr = { (r.left+r.right)/2, (r.top+r.bottom)/2 };
+			if(lParam!=-1) { scr.x = (short)LOWORD(lParam); scr.y = (short)HIWORD(lParam); }
+			twpng_PicMenu(hwnd, scr);
+			return 0;
+		}
 	case WM_MBUTTONDOWN:
 		DestroyWindow(hwnd);
+		return 0;
+	case WM_DROPFILES:
+		twpng_ViewerDrop((HDROP)wParam);
 		return 0;
 	case WM_APP_FULLIMG:
 		{
@@ -3785,6 +4014,7 @@ static void twpng_FullscreenOpen()
 	if(!registered) {
 		WNDCLASS wc;
 		ZeroMemory(&wc, sizeof(wc));
+		wc.style = CS_DBLCLKS;   // a double-click goes back to the viewer
 		wc.lpfnWndProc = FullWndProc;
 		wc.hInstance = globals.hInst;
 		wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -3803,6 +4033,7 @@ static void twpng_FullscreenOpen()
 	g_full.font = CreateFont(-MulDiv(11, dpi ? dpi : 96, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
 		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, _T("Segoe UI"));
 	SendMessage(g_hwndFull, WM_SETICON, ICON_BIG, (LPARAM)LoadIcon(globals.hInst,_T("ICONMAIN")));
+	DragAcceptFiles(g_hwndFull, TRUE);
 	g_full.path[0] = 0;
 	ShowWindow(g_hwndFull, SW_SHOW);
 	twpng_FullLoad();
@@ -4063,8 +4294,9 @@ static void twpng_VideoUI()
 		TCHAR s[16];
 		StringCchPrintf(s, 16, _T("%d%%"), g_vidRate);
 		SetDlgItemText(h, IDC_AIP_SPEED, s);
-		EnableWindow(GetDlgItem(h, IDC_AIP_SLOWER), g_vidRate>25);
-		EnableWindow(GetDlgItem(h, IDC_AIP_FASTER), g_vidRate<400);
+		int st[32], n = twpng_SpeedSteps(st, 32);
+		EnableWindow(GetDlgItem(h, IDC_AIP_SLOWER), n && g_vidRate>st[0]);
+		EnableWindow(GetDlgItem(h, IDC_AIP_FASTER), n && g_vidRate<st[n-1]);
 	}
 	if(g_hwndFull) {
 		InvalidateRect(g_hwndFull, NULL, FALSE);
@@ -4096,6 +4328,7 @@ static TCHAR g_pcmPath[MAX_PATH];      // and the file it decodes
 #define TWPNG_NBUF 5
 #define TWPNG_BUFMS 25
 #define TWPNG_AUDIOTIMER 1
+#define TWPNG_TIMETIMER 2
 
 static struct {
 	HWAVEOUT wo;
@@ -4233,6 +4466,7 @@ static void twpng_AudioFill(WAVEHDR *h)
 		g_aud.pos += g_aud.step;
 		if(g_aud.pos >= g_aud.loopLen) g_aud.pos -= g_aud.loopLen;
 	}
+	if(globals.vid_muted) ZeroMemory(o, h->dwBufferLength);   // keeps running, so unmuting is in sync
 }
 
 // Queue every buffer the device has finished with. Call with g_aud.cs held.
@@ -4337,7 +4571,7 @@ static void twpng_AudioSync()
 static void twpng_AudioTryOpen()
 {
 	if(g_aud.wo || !g_vid.eng || !g_vid.vw || !twpng_PcmFor(g_vid.path)) return;
-	if(g_pcm->failed) { g_vid.eng->SetMuted(FALSE); return; }
+	if(g_pcm->failed) { g_vid.eng->SetMuted(globals.vid_muted); return; }
 	if(!g_aud.csInit) { InitializeCriticalSection(&g_aud.cs); g_aud.csInit = TRUE; }
 	WAVEFORMATEX wf;
 	ZeroMemory(&wf, sizeof(wf));
@@ -4352,7 +4586,7 @@ static void twpng_AudioTryOpen()
 	if(waveOutOpen(&g_aud.wo, WAVE_MAPPER, &wf, (DWORD_PTR)g_aud.ev, 0, CALLBACK_EVENT) != MMSYSERR_NOERROR) {
 		g_aud.wo = NULL;
 		CloseHandle(g_aud.ev);
-		g_vid.eng->SetMuted(FALSE);
+		g_vid.eng->SetMuted(globals.vid_muted);
 		return;
 	}
 	waveOutPause(g_aud.wo);
@@ -4470,27 +4704,27 @@ static LRESULT CALLBACK VideoHostProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 			EndPaint(hwnd, &ps);
 			return 0;
 		}
-	case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
-	case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK:
-	case WM_MBUTTONDOWN:
+	case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: case WM_RBUTTONUP:
 		{
-			// Clicks act like clicks on the picture underneath. Posted, because browsing
-			// destroys this window.
-			HWND p = GetParent(hwnd);
-			if(p==g_hwndFull) {
-				UINT m = msg==WM_LBUTTONDBLCLK ? WM_LBUTTONDOWN : msg==WM_RBUTTONDBLCLK ? WM_RBUTTONDOWN : msg;
-				PostMessage(p, m, 0, 0);
-			}
-			else if(msg!=WM_MBUTTONDOWN) PostMessage(GetDlgItem(p, IDC_AIP_THUMB), msg, 0, 0);
+			// Clicks act like clicks on the picture underneath. Posted, because playing,
+			// browsing or full screen destroy this window.
+			POINT scr;
+			BOOL drag;
+			if(twpng_PicMouseMsg(hwnd, msg, lParam, &scr, &drag))
+				PostMessage(GetParent(hwnd), WM_APP_PICMOUSE, MAKEWPARAM(msg, drag), MAKELPARAM(scr.x, scr.y));
 			return 0;
 		}
-	case WM_RBUTTONUP:
+	case WM_MBUTTONDOWN:
+		if(GetParent(hwnd)==g_hwndFull) PostMessage(g_hwndFull, WM_MBUTTONDOWN, 0, 0);
+		return 0;
+	case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK:
 		return 0;
 	case WM_APP_VIDEO:
 		if(hwnd==g_vid.host) twpng_VideoEvent((DWORD)wParam);
 		return 0;
 	case WM_TIMER:
 		if(wParam==TWPNG_AUDIOTIMER && hwnd==g_vid.host) twpng_AudioSync();
+		if(wParam==TWPNG_TIMETIMER && hwnd==g_vid.host && GetParent(hwnd)==g_hwndFull && g_vid.shown) twpng_FullOSD();   // the time
 		return 0;
 	}
 	return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -4538,7 +4772,7 @@ static void twpng_VideoStart(HWND parent, const TCHAR *path, double at, BOOL pla
 		eng->SetLoop(TRUE);
 		eng->SetDefaultPlaybackRate(g_vidRate/100.0);
 		// Our own sound takes over once decoded; until then the engine's plays at 100%.
-		eng->SetMuted(g_vidRate!=100 || (twpng_PcmFor(path) && !g_pcm->failed));
+		eng->SetMuted(globals.vid_muted || g_vidRate!=100 || (twpng_PcmFor(path) && !g_pcm->failed));
 		BSTR url = SysAllocString(path);
 		hr = url ? eng->SetSource(url) : E_OUTOFMEMORY;
 		SysFreeString(url);
@@ -4553,6 +4787,7 @@ static void twpng_VideoStart(HWND parent, const TCHAR *path, double at, BOOL pla
 	g_vid.eng = eng;
 	g_vid.nt = nt;
 	g_vid.host = host;
+	SetTimer(host, TWPNG_TIMETIMER, 250, NULL);
 	StringCchCopy(g_vid.path, MAX_PATH, path);
 	g_vid.vw = g_vid.vh = 0;
 	g_vid.seek = at;
@@ -4596,24 +4831,79 @@ static void twpng_VideoToggle()
 	twpng_VideoUI();
 }
 
-// -/+ change the speed in steps of 25%, 0 resets it.
-static void twpng_VideoSpeed(int dir)
+// The speeds -/+ step through (Preferences), in percent, ascending without doubles.
+static int twpng_SpeedSteps(int *out, int cap)
 {
-	int r = dir ? g_vidRate + dir*25 : 100;
-	if(r < 25) r = 25;
-	if(r > 400) r = 400;
+	int n = 0;
+	for(int pass=0; pass<2 && !n; pass++) {
+		const TCHAR *p = pass ? TWPNG_DEFAULT_STEPS : globals.vid_steps;
+		while(*p && n<cap) {
+			while(*p && !_istdigit(*p)) p++;
+			if(!*p) break;
+			int v = _ttoi(p);
+			while(_istdigit(*p)) p++;
+			if(v<10 || v>800) continue;
+			int i = n;
+			while(i>0 && out[i-1]>v) i--;
+			if(i>0 && out[i-1]==v) continue;
+			memmove(&out[i+1], &out[i], (size_t)(n-i)*sizeof(int));
+			out[i] = v;
+			n++;
+		}
+	}
+	return n;
+}
+
+static void twpng_SetSpeed(int r)
+{
+	if(r < 10) r = 10;
+	if(r > 800) r = 800;
 	g_vidRate = r;
 	if(g_vid.eng) {
 		g_vid.eng->SetDefaultPlaybackRate(r/100.0);
 		g_vid.eng->SetPlaybackRate(r/100.0);
 		// Not decoded (yet): rather silence than the engine's time-stretched sound.
-		if(!g_aud.wo) g_vid.eng->SetMuted(r!=100 && !(twpng_PcmFor(g_vid.path) && g_pcm->failed));
+		if(!g_aud.wo) g_vid.eng->SetMuted(globals.vid_muted || (r!=100 && !(twpng_PcmFor(g_vid.path) && g_pcm->failed)));
 	}
 	twpng_AudioSync();
 	twpng_VideoUI();
 }
 
-// The viewer moved to another file: a playing video keeps playing with the next one.
+// -/+ go to the next lower or higher speed of the list, 0 back to 100%.
+static void twpng_VideoSpeed(int dir)
+{
+	int st[32], n = twpng_SpeedSteps(st, 32), r = 100;
+	if(dir>0) { r = g_vidRate; for(int i=0; i<n; i++) if(st[i]>g_vidRate) { r = st[i]; break; } }
+	if(dir<0) { r = g_vidRate; for(int i=n-1; i>=0; i--) if(st[i]<g_vidRate) { r = st[i]; break; } }
+	twpng_SetSpeed(r);
+}
+
+static void twpng_VideoMute()
+{
+	globals.vid_muted = !globals.vid_muted;
+	if(g_vid.eng && !g_aud.wo)
+		g_vid.eng->SetMuted(globals.vid_muted || (g_vidRate!=100 && !(twpng_PcmFor(g_vid.path) && g_pcm->failed)));
+	twpng_VideoUI();
+}
+
+// , and . step one frame back or forward (pausing the video), Home goes to the start.
+static void twpng_VideoFrameStep(int dir)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c || !twpng_IsVideoPath(c->path)) return;
+	if(!g_vid.eng || lstrcmpi(g_vid.path, c->path)) {
+		twpng_VideoStart(twpng_VideoParent(), c->path, 0, FALSE);   // paused on the first frame
+		return;
+	}
+	if(dir==0) g_vid.eng->SetCurrentTime(0);
+	else {
+		if(!g_vid.eng->IsPaused()) g_vid.eng->Pause();
+		IMFMediaEngineEx *ex = NULL;
+		if(SUCCEEDED(g_vid.eng->QueryInterface(IID_PPV_ARGS(&ex)))) { ex->FrameStep(dir>0); ex->Release(); }
+	}
+	twpng_AudioSync();
+	twpng_VideoUI();
+}
 static void twpng_VideoFileChanged()
 {
 	struct aiparams_ctx *c = g_aiParamsCtx;
@@ -4631,13 +4921,564 @@ static void twpng_ShowInExplorer(const TCHAR *path)
 	ILFree(pidl);
 }
 
+// ---- The picture in the viewer and the full-screen view: mouse, keys, menu -------------
+
+static void twpng_DragFiles(HWND hwnd, const TCHAR *dir, const TCHAR *const *names, int n);
+static void twpng_CopyFiles(const TCHAR *dir, const TCHAR *const *names, int n);
+static BOOL twpng_FileOp(HWND owner, UINT op, const TCHAR *dir, const TCHAR *const *names, int n, const TCHAR *dest);
+static void twpng_FilesGone(const TCHAR *dir, const TCHAR *const *names, int n);
+static BOOL twpng_SplitPath(const TCHAR *path, TCHAR *dir, const TCHAR **name);
+
+// Drop a file (or a folder: its first image or video) on the viewer to show it.
+static void twpng_ViewerDrop(HDROP hd)
+{
+	TCHAR p[MAX_PATH];
+	UINT got = DragQueryFile(hd, 0, p, MAX_PATH);
+	DragFinish(hd);
+	if(!got) return;
+	DWORD at = GetFileAttributes(p);
+	if(at!=INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY)) {
+		TCHAR dir[MAX_PATH], **list;
+		StringCchCopy(dir, MAX_PATH, p);
+		int l = lstrlen(dir);
+		if(l && dir[l-1]!=_T('\\')) StringCchCat(dir, MAX_PATH, _T("\\"));
+		int n = twpng_ListDir(dir, &list);
+		if(n) StringCchCopy(p, MAX_PATH, list[0]);
+		twpng_FreeList(list, n);
+		if(!n) { MessageBeep(MB_ICONWARNING); return; }
+	}
+	else if(!twpng_IsBrowsableFile(p)) { MessageBeep(MB_ICONWARNING); return; }
+	twpng_OpenInViewer(p);
+	if(g_hwndFull) SetForegroundWindow(g_hwndFull);
+}
+
+// Delete: the file to the Recycle Bin and on to the next one (for culling renders).
+static void twpng_ViewerDelete(HWND owner)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	TCHAR dir[MAX_PATH], path[MAX_PATH];
+	const TCHAR *name;
+	if(!c || !c->path[0]) return;
+	StringCchCopy(path, MAX_PATH, c->path);
+	if(!twpng_SplitPath(path, dir, &name)) return;
+	twpng_FileOp(owner, FO_DELETE, dir, &name, 1, NULL);
+	twpng_FilesGone(dir, &name, 1);
+	if(g_hwndFull) SetForegroundWindow(g_hwndFull);
+}
+
+static void twpng_CopyCurrentFile()
+{
+	TCHAR dir[MAX_PATH];
+	const TCHAR *name;
+	if(g_aiParamsCtx && twpng_SplitPath(g_aiParamsCtx->path, dir, &name)) twpng_CopyFiles(dir, &name, 1);
+}
+
+static void twpng_DragCurrent(HWND hwnd)
+{
+	TCHAR dir[MAX_PATH], path[MAX_PATH];
+	const TCHAR *name;
+	if(!g_aiParamsCtx) return;
+	StringCchCopy(path, MAX_PATH, g_aiParamsCtx->path);   // the drag runs a message loop
+	if(twpng_SplitPath(path, dir, &name)) twpng_DragFiles(hwnd, dir, &name, 1);
+}
+
+// A whole image file as top-down 32-bit BGRA (straight alpha). Caller frees.
+static BYTE *twpng_LoadBGRA(const TCHAR *path, UINT *w, UINT *h)
+{
+	*w = *h = 0;
+	BYTE *out = NULL;
+	IWICImagingFactory *f = NULL;
+	IWICBitmapDecoder *dec = NULL;
+	IWICBitmapFrameDecode *fr = NULL;
+	IWICFormatConverter *cv = NULL;
+	HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f));
+	if(SUCCEEDED(hr)) hr = f->CreateDecoderFromFilename(path, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec);
+	if(SUCCEEDED(hr)) hr = dec->GetFrame(0, &fr);
+	if(SUCCEEDED(hr)) hr = f->CreateFormatConverter(&cv);
+	if(SUCCEEDED(hr)) hr = cv->Initialize(fr, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0, WICBitmapPaletteTypeCustom);
+	if(SUCCEEDED(hr)) hr = cv->GetSize(w, h);
+	if(SUCCEEDED(hr) && *w && *h && (ULONGLONG)*w * *h < 0x10000000ULL) {
+		out = (BYTE*)malloc((size_t)*w * *h * 4);
+		if(out && FAILED(cv->CopyPixels(NULL, *w*4, *w * *h * 4, out))) { free(out); out = NULL; }
+	}
+	if(cv) cv->Release();
+	if(fr) fr->Release();
+	if(dec) dec->Release();
+	if(f) f->Release();
+	return out;
+}
+
+// PNG bytes of a top-down 32-bit image, with or without its alpha channel. Caller frees.
+static BYTE *twpng_EncodePng(const BYTE *px, UINT w, UINT h, BOOL alpha, DWORD *outLen)
+{
+	*outLen = 0;
+	BYTE *out = NULL;
+	IWICImagingFactory *f = NULL;
+	IWICBitmap *bm = NULL;
+	IStream *st = NULL;
+	IWICBitmapEncoder *en = NULL;
+	IWICBitmapFrameEncode *fe = NULL;
+	HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f));
+	if(SUCCEEDED(hr)) hr = f->CreateBitmapFromMemory(w, h, alpha ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat32bppBGR,
+		w*4, w*h*4, (BYTE*)px, &bm);
+	if(SUCCEEDED(hr)) hr = CreateStreamOnHGlobal(NULL, TRUE, &st);
+	if(SUCCEEDED(hr)) hr = f->CreateEncoder(GUID_ContainerFormatPng, NULL, &en);
+	if(SUCCEEDED(hr)) hr = en->Initialize(st, WICBitmapEncoderNoCache);
+	if(SUCCEEDED(hr)) hr = en->CreateNewFrame(&fe, NULL);
+	if(SUCCEEDED(hr)) hr = fe->Initialize(NULL);
+	if(SUCCEEDED(hr)) hr = fe->SetSize(w, h);
+	WICPixelFormatGUID pf = alpha ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat24bppBGR;
+	if(SUCCEEDED(hr)) hr = fe->SetPixelFormat(&pf);
+	if(SUCCEEDED(hr)) hr = fe->WriteSource(bm, NULL);
+	if(SUCCEEDED(hr)) hr = fe->Commit();
+	if(SUCCEEDED(hr)) hr = en->Commit();
+	HGLOBAL g = NULL;
+	STATSTG ss;
+	if(SUCCEEDED(hr)) hr = GetHGlobalFromStream(st, &g);
+	if(SUCCEEDED(hr)) hr = st->Stat(&ss, STATFLAG_NONAME);
+	if(SUCCEEDED(hr) && ss.cbSize.QuadPart < 0x7fffffff) {
+		DWORD n = (DWORD)ss.cbSize.QuadPart;
+		const void *src = GlobalLock(g);
+		if(src && (out = (BYTE*)malloc(n))!=NULL) { memcpy(out, src, n); *outLen = n; }
+		if(src) GlobalUnlock(g);
+	}
+	if(fe) fe->Release();
+	if(en) en->Release();
+	if(st) st->Release();
+	if(bm) bm->Release();
+	if(f) f->Release();
+	return out;
+}
+
+static DWORD twpng_Crc32(const BYTE *p, size_t n, DWORD c)
+{
+	for(size_t i=0; i<n; i++) {
+		c ^= p[i];
+		for(int k=0; k<8; k++) c = (c>>1) ^ (0xEDB88320 & (0-(c&1)));
+	}
+	return c;
+}
+
+// `png` with a text chunk added after IHDR: tEXt, or iTXt (UTF-8) when the text has
+// characters outside Latin-1. Caller frees.
+static BYTE *twpng_PngAddText(const BYTE *png, DWORD len, const char *keyword, const TCHAR *text, DWORD *outLen)
+{
+	*outLen = 0;
+	if(len < 33 || memcmp(png+12, "IHDR", 4)) return NULL;
+	BOOL latin = TRUE;
+	for(const TCHAR *t=text; *t && latin; t++) if((unsigned)*t > 0xFF) latin = FALSE;
+	int tl = lstrlen(text);
+	size_t kl = strlen(keyword);
+	size_t cap = kl + 5 + (size_t)tl*4 + 16;
+	BYTE *data = (BYTE*)malloc(cap);
+	if(!data) return NULL;
+	size_t dn = 0;
+	memcpy(data, keyword, kl+1);
+	dn = kl+1;
+	if(latin) for(int i=0; i<tl; i++) data[dn++] = (BYTE)text[i];
+	else {
+		data[dn++] = 0; data[dn++] = 0;   // not compressed
+		data[dn++] = 0; data[dn++] = 0;   // no language, no translated keyword
+#ifdef UNICODE
+		dn += (size_t)WideCharToMultiByte(CP_UTF8, 0, text, tl, (char*)data+dn, (int)(cap-dn), NULL, NULL);
+#endif
+	}
+	BYTE *out = (BYTE*)malloc((size_t)len + dn + 12);
+	if(out) {
+		memcpy(out, png, 33);
+		BYTE *ch = out+33;
+		DWORD n = (DWORD)dn;
+		ch[0] = (BYTE)(n>>24); ch[1] = (BYTE)(n>>16); ch[2] = (BYTE)(n>>8); ch[3] = (BYTE)n;
+		memcpy(ch+4, latin ? "tEXt" : "iTXt", 4);
+		memcpy(ch+8, data, dn);
+		DWORD crc = ~twpng_Crc32(ch+4, dn+4, 0xFFFFFFFF);
+		ch[8+dn] = (BYTE)(crc>>24); ch[9+dn] = (BYTE)(crc>>16); ch[10+dn] = (BYTE)(crc>>8); ch[11+dn] = (BYTE)crc;
+		memcpy(ch+12+dn, png+33, len-33);
+		*outLen = len + (DWORD)dn + 12;
+	}
+	free(data);
+	return out;
+}
+
+// The frame of a video at `t` seconds, top-down 32-bit (alpha 255). Caller frees. Read with
+// a source reader of its own, so it works whether or not the video plays.
+static BYTE *twpng_GrabFrame(const TCHAR *path, double t, UINT *outW, UINT *outH)
+{
+	*outW = *outH = 0;
+	if(!g_mfStarted) {
+		if(FAILED(MFStartup(MF_VERSION))) return NULL;
+		g_mfStarted = TRUE;
+	}
+	IMFAttributes *a = NULL;
+	IMFSourceReader *rd = NULL;
+	IMFMediaType *mt = NULL, *cur = NULL;
+	BYTE *out = NULL;
+	HRESULT hr = MFCreateAttributes(&a, 1);
+	if(SUCCEEDED(hr)) hr = a->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+	if(SUCCEEDED(hr)) hr = MFCreateSourceReaderFromURL(path, a, &rd);
+	if(SUCCEEDED(hr)) {
+		rd->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+		hr = rd->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+	}
+	if(SUCCEEDED(hr)) hr = MFCreateMediaType(&mt);
+	if(SUCCEEDED(hr)) {
+		mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+		mt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+		hr = rd->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, mt);
+	}
+	if(SUCCEEDED(hr)) hr = rd->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur);
+	UINT32 w = 0, h = 0, num = 0, den = 0, asz = 0;
+	LONG stride = 0;
+	double fps = 25;
+	MFVideoArea area;
+	BOOL hasArea = FALSE;
+	if(SUCCEEDED(hr)) {
+		MFGetAttributeSize(cur, MF_MT_FRAME_SIZE, &w, &h);
+		stride = (LONG)(INT32)MFGetAttributeUINT32(cur, MF_MT_DEFAULT_STRIDE, w*4);
+		if(SUCCEEDED(MFGetAttributeRatio(cur, MF_MT_FRAME_RATE, &num, &den)) && num && den) fps = (double)num/den;
+		hasArea = SUCCEEDED(cur->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, (UINT8*)&area, sizeof(area), &asz)) && asz==sizeof(area);
+	}
+	if(SUCCEEDED(hr) && t > 0) {
+		PROPVARIANT pv;
+		PropVariantInit(&pv);
+		pv.vt = VT_I8;
+		pv.hVal.QuadPart = (LONGLONG)(t*1e7);
+		rd->SetCurrentPosition(GUID_NULL, pv);   // lands on the key frame before it
+	}
+	IMFSample *best = NULL;
+	LONGLONG target = (LONGLONG)(t*1e7) - (LONGLONG)(0.5e7/fps);
+	for(int i=0; SUCCEEDED(hr) && i<3000; i++) {
+		DWORD flags = 0;
+		LONGLONG ts = 0;
+		IMFSample *s = NULL;
+		if(FAILED(rd->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, NULL, &flags, &ts, &s))) break;
+		if(s) { if(best) best->Release(); best = s; }
+		if((flags & (MF_SOURCE_READERF_ENDOFSTREAM|MF_SOURCE_READERF_ERROR)) || (s && ts >= target)) break;
+	}
+	if(best && w && h && stride) {
+		UINT x0 = 0, y0 = 0, cw = w, chh = h;
+		if(hasArea && area.Area.cx>0 && area.Area.cy>0 && area.OffsetX.value>=0 && area.OffsetY.value>=0 &&
+		   (UINT)(area.OffsetX.value+area.Area.cx)<=w && (UINT)(area.OffsetY.value+area.Area.cy)<=h) {
+			x0 = (UINT)area.OffsetX.value; y0 = (UINT)area.OffsetY.value; cw = (UINT)area.Area.cx; chh = (UINT)area.Area.cy;
+		}
+		IMFMediaBuffer *b = NULL;
+		if(SUCCEEDED(best->ConvertToContiguousBuffer(&b))) {
+			BYTE *d = NULL;
+			DWORD len = 0;
+			LONG ap = stride<0 ? -stride : stride;
+			if(SUCCEEDED(b->Lock(&d, NULL, &len))) {
+				if((ULONGLONG)ap*h <= len && (out = (BYTE*)malloc((size_t)cw*chh*4))!=NULL) {
+					const BYTE *row0 = stride<0 ? d + (size_t)(h-1)*ap : d;
+					for(UINT y=0; y<chh; y++) {
+						BYTE *o = out + (size_t)y*cw*4;
+						memcpy(o, row0 + (LONG_PTR)(y+y0)*stride + (size_t)x0*4, (size_t)cw*4);
+						for(UINT x=0; x<cw; x++) o[x*4+3] = 255;
+					}
+					*outW = cw;
+					*outH = chh;
+				}
+				b->Unlock();
+			}
+			b->Release();
+		}
+	}
+	if(best) best->Release();
+	if(cur) cur->Release();
+	if(mt) mt->Release();
+	if(rd) rd->Release();
+	if(a) a->Release();
+	return out;
+}
+
+// The video's current position, or its start when it isn't loaded.
+static double twpng_VideoPos(const TCHAR *path)
+{
+	return (g_vid.eng && !lstrcmpi(g_vid.path, path)) ? g_vid.eng->GetCurrentTime() : 0;
+}
+
+// Picture on the clipboard: CF_DIB for every app, plus PNG (alpha, or a PNG file's own bytes).
+static void twpng_ClipboardImage(HWND owner, const BYTE *px, UINT w, UINT h, const BYTE *png, DWORD pngLen)
+{
+	if(!OpenClipboard(owner)) return;
+	EmptyClipboard();
+	size_t sz = sizeof(BITMAPINFOHEADER) + (size_t)w*h*4;
+	HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, sz);
+	BYTE *d = g ? (BYTE*)GlobalLock(g) : NULL;
+	if(d) {
+		BITMAPINFOHEADER *bh = (BITMAPINFOHEADER*)d;
+		ZeroMemory(bh, sizeof(*bh));
+		bh->biSize = sizeof(*bh);
+		bh->biWidth = (LONG)w;
+		bh->biHeight = (LONG)h;   // bottom-up
+		bh->biPlanes = 1;
+		bh->biBitCount = 32;
+		bh->biCompression = BI_RGB;
+		bh->biSizeImage = w*h*4;
+		for(UINT y=0; y<h; y++) memcpy(d + sizeof(*bh) + (size_t)(h-1-y)*w*4, px + (size_t)y*w*4, (size_t)w*4);
+		GlobalUnlock(g);
+		if(!SetClipboardData(CF_DIB, g)) GlobalFree(g);
+	} else if(g) GlobalFree(g);
+	if(png && pngLen) {
+		HGLOBAL gp = GlobalAlloc(GMEM_MOVEABLE, pngLen);
+		void *dp = gp ? GlobalLock(gp) : NULL;
+		if(dp) {
+			memcpy(dp, png, pngLen);
+			GlobalUnlock(gp);
+			if(!SetClipboardData(RegisterClipboardFormat(_T("PNG")), gp)) GlobalFree(gp);
+		} else if(gp) GlobalFree(gp);
+	}
+	CloseClipboard();
+}
+
+// Copy Image / Copy Frame: the picture itself (a video's current frame).
+static void twpng_CopyPicture(HWND owner)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c || !c->path[0]) return;
+	HCURSOR oc = SetCursor(LoadCursor(NULL, IDC_WAIT));
+	UINT w, h;
+	BOOL vid = twpng_IsVideoPath(c->path);
+	BYTE *px = vid ? twpng_GrabFrame(c->path, twpng_VideoPos(c->path), &w, &h) : twpng_LoadBGRA(c->path, &w, &h);
+	if(px) {
+		DWORD pl = 0;
+		BYTE *png = NULL;
+		const TCHAR *ext = PathFindExtension(c->path);
+		if(!lstrcmpi(ext, _T(".png"))) {
+			unsigned char *buf;
+			DWORD size;
+			if(twpng_SlurpFile(c->path, 256UL*1024*1024, &buf, &size)) { png = buf; pl = size; }
+		}
+		else png = twpng_EncodePng(px, w, h, !vid, &pl);
+		twpng_ClipboardImage(owner, px, w, h, png, pl);
+		free(png);
+		free(px);
+	}
+	SetCursor(oc);
+	if(!px) mesg(MSG_E, vid ? _T("Could not read this frame of the video.") : _T("Could not read this image."));
+}
+
+// Save Frame as PNG: the current frame, with the video's generation parameters in a text
+// chunk ("prompt" for a ComfyUI graph, else "parameters"), so it carries its prompt along.
+static void twpng_SaveFrame(HWND owner)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c || !twpng_IsVideoPath(c->path)) return;
+	double t = twpng_VideoPos(c->path);
+	TCHAR fn[MAX_PATH];
+	StringCchCopy(fn, MAX_PATH, c->path);
+	PathRemoveExtension(fn);
+	TCHAR suffix[40], dir[MAX_PATH];
+	StringCchPrintf(suffix, 40, _T("_frame_%.2fs.png"), t);
+	StringCchCat(fn, MAX_PATH, suffix);
+	const TCHAR *name;
+	if(!twpng_SplitPath(c->path, dir, &name)) dir[0] = 0;
+	OPENFILENAME ofn;
+	ZeroMemory(&ofn, sizeof(ofn));
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = owner;
+	ofn.lpstrFilter = _T("PNG images (*.png)\0*.png\0\0");
+	ofn.lpstrFile = fn;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrInitialDir = dir[0] ? dir : NULL;   // else the dialog opens in the folder it used last
+	ofn.lpstrDefExt = _T("png");
+	ofn.lpstrTitle = _T("Save frame as PNG");
+	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+	if(!GetSaveFileName(&ofn)) return;
+	HCURSOR oc = SetCursor(LoadCursor(NULL, IDC_WAIT));
+	UINT w, h;
+	BYTE *px = twpng_GrabFrame(c->path, t, &w, &h);
+	DWORD n = 0;
+	BYTE *png = px ? twpng_EncodePng(px, w, h, FALSE, &n) : NULL;
+	if(png && c->full) {
+		int len = lstrlen(c->full), i = cf_skip_ws(c->full, 0, len);
+		DWORD n2;
+		BYTE *p2 = twpng_PngAddText(png, n, (i<len && c->full[i]==_T('{')) ? "prompt" : "parameters", c->full, &n2);
+		if(p2) { free(png); png = p2; n = n2; }
+	}
+	BOOL ok = png && twpng_WriteWholeFile(fn, png, n);
+	free(png);
+	free(px);
+	SetCursor(oc);
+	if(!ok) mesg(MSG_E, _T("Could not save the frame."));
+}
+
+enum { PM_PLAY = 1, PM_MUTE, PM_SPEED100, PM_PREV, PM_NEXT, PM_MARK, PM_FULL, PM_OPEN, PM_OPENWITH,
+	PM_EXPLORER, PM_FOLDER, PM_COPYFILE, PM_COPYIMAGE, PM_COPYPATH, PM_COPYPROMPT, PM_SAVEFRAME,
+	PM_DELETE, PM_PROPS, PM_SPEED0 = 100 };
+
+static HMENU twpng_SpeedSubmenu(const int *steps, int n)
+{
+	HMENU m = CreatePopupMenu();
+	for(int i=0; i<n; i++) {
+		TCHAR t[20];
+		StringCchPrintf(t, 20, _T("%d%%"), steps[i]);
+		AppendMenu(m, MF_STRING|(steps[i]==g_vidRate ? MF_CHECKED : 0), PM_SPEED0+i, t);
+	}
+	AppendMenu(m, MF_SEPARATOR, 0, NULL);
+	AppendMenu(m, MF_STRING, PM_SPEED100, _T("&Normal Speed"));
+	return m;
+}
+
+static void twpng_FullBrowse(HWND hwnd, int dir);
+
+static void twpng_PicCommand(HWND owner, int cmd, const int *steps, int ns)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!cmd || !c) return;
+	TCHAR path[MAX_PATH];
+	StringCchCopy(path, MAX_PATH, c->path);
+	if(cmd>=PM_SPEED0 && cmd<PM_SPEED0+ns) { twpng_SetSpeed(steps[cmd-PM_SPEED0]); return; }
+	switch(cmd) {
+	case PM_SPEED100: twpng_SetSpeed(100); break;
+	case PM_PLAY: twpng_VideoToggle(); break;
+	case PM_MUTE: twpng_VideoMute(); break;
+	case PM_PREV: case PM_NEXT:
+		if(g_hwndFull) twpng_FullBrowse(g_hwndFull, cmd==PM_PREV ? -1 : 1);
+		else twpng_AIParamsNavigate(cmd==PM_PREV ? -1 : 1);
+		break;
+	case PM_MARK: twpng_ToggleMarkPath(path); break;
+	case PM_FULL: if(g_hwndFull) DestroyWindow(g_hwndFull); else twpng_FullscreenOpen(); break;
+	case PM_OPEN: ShellExecute(owner, NULL, path, NULL, NULL, SW_SHOWNORMAL); break;
+	case PM_OPENWITH:
+		{
+			OPENASINFO oi;
+			ZeroMemory(&oi, sizeof(oi));
+			oi.pcszFile = path;
+			oi.oaifInFlags = OAIF_EXEC;
+			SHOpenWithDialog(owner, &oi);
+		}
+		break;
+	case PM_EXPLORER: twpng_ShowInExplorer(path); break;
+	case PM_FOLDER: twpng_FolderForViewer(FALSE); break;
+	case PM_COPYFILE: twpng_CopyCurrentFile(); break;
+	case PM_COPYIMAGE: twpng_CopyPicture(owner); break;
+	case PM_COPYPATH: twpng_SetClipboardText(owner, path); break;
+	case PM_COPYPROMPT:
+		{
+			TCHAR *t = twpng_LfToCrlf(c->pos);
+			if(t) { twpng_SetClipboardText(owner, t); free(t); }
+		}
+		break;
+	case PM_SAVEFRAME: twpng_SaveFrame(owner); break;
+	case PM_DELETE: twpng_ViewerDelete(owner); break;
+	case PM_PROPS: SHObjectProperties(owner, SHOP_FILEPATH, path, NULL); break;
+	}
+}
+
+// Right click on the picture (or the menu key): everything for the file in one menu.
+static void twpng_PicMenu(HWND owner, POINT scr)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c || !c->path[0]) return;
+	BOOL vid = twpng_IsVideoPath(c->path);
+	TCHAR **list;
+	int idx = -1, n = twpng_GetSiblings(c->path, &list, &idx, FALSE);
+	int steps[32], ns = twpng_SpeedSteps(steps, 32);
+	HMENU m = CreatePopupMenu();
+	if(!m) return;
+	if(vid) {
+		AppendMenu(m, MF_STRING, PM_PLAY, twpng_VideoPlaying() ? _T("&Pause\tSpace") : _T("&Play\tSpace"));
+		AppendMenu(m, MF_POPUP, (UINT_PTR)twpng_SpeedSubmenu(steps, ns), _T("&Speed\t- / +"));
+		AppendMenu(m, MF_STRING|(globals.vid_muted ? MF_CHECKED : 0), PM_MUTE, _T("M&ute\tM"));
+		AppendMenu(m, MF_SEPARATOR, 0, NULL);
+	}
+	AppendMenu(m, MF_STRING|(idx>0 ? 0 : MF_GRAYED), PM_PREV, _T("Pre&vious\tLeft"));
+	AppendMenu(m, MF_STRING|(idx>=0 && idx<n-1 ? 0 : MF_GRAYED), PM_NEXT, _T("&Next\tRight"));
+	AppendMenu(m, MF_STRING|(twpng_IsMarkedPath(c->path) ? MF_CHECKED : 0), PM_MARK, _T("&Mark\tS"));
+	AppendMenu(m, MF_SEPARATOR, 0, NULL);
+	AppendMenu(m, MF_STRING, PM_FULL, g_hwndFull ? _T("Exit &Full Screen\tEsc") : _T("&Full Screen\tF11"));
+	AppendMenu(m, MF_STRING, PM_OPEN, _T("&Open"));
+	AppendMenu(m, MF_STRING, PM_OPENWITH, _T("Open &With..."));
+	AppendMenu(m, MF_STRING, PM_EXPLORER, _T("Show in E&xplorer"));
+	AppendMenu(m, MF_STRING, PM_FOLDER, _T("Fol&der Overview\tCtrl+F"));
+	AppendMenu(m, MF_SEPARATOR, 0, NULL);
+	AppendMenu(m, MF_STRING, PM_COPYFILE, _T("&Copy File\tCtrl+C"));
+	AppendMenu(m, MF_STRING, PM_COPYIMAGE, vid ? _T("Copy Fr&ame") : _T("Copy &Image"));
+	AppendMenu(m, MF_STRING, PM_COPYPATH, _T("Copy Pa&th"));
+	AppendMenu(m, MF_STRING|(c->pos ? 0 : MF_GRAYED), PM_COPYPROMPT, _T("Copy P&rompt"));
+	if(vid) AppendMenu(m, MF_STRING, PM_SAVEFRAME, _T("Save Frame as PN&G..."));
+	AppendMenu(m, MF_SEPARATOR, 0, NULL);
+	AppendMenu(m, MF_STRING, PM_DELETE, _T("Move to Recycle &Bin\tDel"));
+	AppendMenu(m, MF_STRING, PM_PROPS, _T("Propert&ies"));
+	int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD|TPM_RIGHTBUTTON, scr.x, scr.y, 0, owner, NULL);
+	DestroyMenu(m);
+	twpng_PicCommand(owner, cmd, steps, ns);
+}
+
+// Right click on the speed: the list of speeds.
+static void twpng_SpeedMenu(HWND owner, POINT scr)
+{
+	int steps[32], ns = twpng_SpeedSteps(steps, 32);
+	HMENU m = twpng_SpeedSubmenu(steps, ns);
+	if(!m) return;
+	int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD|TPM_RIGHTBUTTON, scr.x, scr.y, 0, owner, NULL);
+	DestroyMenu(m);
+	twpng_PicCommand(owner, cmd, steps, ns);
+}
+
+// Mouse on the picture (thumbnail, full-screen view, or the video window over either): a
+// click plays or pauses a video, a double-click switches full screen on or off, a drag hands
+// the file to another app, right click opens the menu.
+static void twpng_PicMouse(HWND owner, UINT msg, POINT scr, BOOL drag)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c || !c->path[0]) return;
+	BOOL vid = twpng_IsVideoPath(c->path);
+	if(owner==g_hwndAIParams) {
+		// Focus off the text boxes, so Space and the other keys work on the picture.
+		HWND play = GetDlgItem(owner, IDC_AIP_PLAY);
+		if(GetWindowLongPtr(play, GWL_STYLE) & WS_VISIBLE) SendMessage(owner, WM_NEXTDLGCTL, (WPARAM)play, TRUE);
+	}
+	switch(msg) {
+	case WM_LBUTTONDOWN:
+		if(drag) twpng_DragCurrent(owner);
+		else if(vid) twpng_VideoToggle();
+		break;
+	case WM_LBUTTONDBLCLK:
+		if(vid) twpng_VideoToggle();   // the double-click's first click toggled it
+		if(g_hwndFull) DestroyWindow(g_hwndFull);
+		else twpng_FullscreenOpen();
+		break;
+	case WM_RBUTTONUP:
+		twpng_PicMenu(owner, scr);
+		break;
+	}
+}
+
+// Keys for the picture in the viewer and the full-screen view: S marks, Delete recycles,
+// M mutes, , and . step frames, Home goes to the start, Ctrl+C copies the file.
+static BOOL twpng_PicKey(HWND owner, WPARAM vk, BOOL ctrl)
+{
+	struct aiparams_ctx *c = g_aiParamsCtx;
+	if(!c || !c->path[0]) return FALSE;
+	BOOL vid = twpng_IsVideoPath(c->path);
+	if(ctrl) {
+		if(vk=='C') { twpng_CopyCurrentFile(); return TRUE; }
+		return FALSE;
+	}
+	switch(vk) {
+	case 'S': twpng_ToggleMarkPath(c->path); return TRUE;
+	case VK_DELETE: twpng_ViewerDelete(owner); return TRUE;
+	case 'M': if(vid) { twpng_VideoMute(); return TRUE; } break;
+	case VK_OEM_COMMA: if(vid) { twpng_VideoFrameStep(-1); return TRUE; } break;
+	case VK_OEM_PERIOD: if(vid) { twpng_VideoFrameStep(1); return TRUE; } break;
+	case VK_HOME: if(vid) { twpng_VideoFrameStep(0); return TRUE; } break;
+	}
+	return FALSE;
+}
+
 // Viewer shortcuts: Left/Right (also with Alt) and Ctrl+PageUp/PageDown browse, F11 shows
 // the image full screen, F5 re-reads the folder, Ctrl+F opens the folder overview.
 // Shift+Left/Right is left to the edit boxes for selecting text.
 static BOOL twpng_AIParamsKey(const MSG *m)
 {
-	if(m->message!=WM_KEYDOWN && m->message!=WM_SYSKEYDOWN) return FALSE;
 	if(m->hwnd!=g_hwndAIParams && !IsChild(g_hwndAIParams, m->hwnd)) return FALSE;
+	if(m->message==WM_KEYUP || m->message==WM_SYSKEYUP) {
+		// A held arrow key raced through the folder: show where it stopped.
+		if(m->wParam==VK_LEFT || m->wParam==VK_RIGHT || m->wParam==VK_PRIOR || m->wParam==VK_NEXT) twpng_RaceEnd();
+		return FALSE;
+	}
+	if(m->message!=WM_KEYDOWN && m->message!=WM_SYSKEYDOWN) return FALSE;
 	BOOL alt = (GetKeyState(VK_MENU) & 0x8000)!=0, ctrl = (GetKeyState(VK_CONTROL) & 0x8000)!=0;
 	BOOL shift = (GetKeyState(VK_SHIFT) & 0x8000)!=0;
 	int dir = 0;
@@ -4645,14 +5486,31 @@ static BOOL twpng_AIParamsKey(const MSG *m)
 	else if(!ctrl && !shift && m->wParam==VK_RIGHT) dir = 1;
 	else if(ctrl && !alt && m->wParam==VK_PRIOR) dir = -1;
 	else if(ctrl && !alt && m->wParam==VK_NEXT) dir = 1;
-	if(dir) { twpng_AIParamsNavigate(dir); return TRUE; }
+	if(dir) {
+		if(m->lParam & 0x40000000) twpng_RaceStep(dir);   // held down: auto-repeat
+		else twpng_AIParamsNavigate(dir);
+		return TRUE;
+	}
+	TCHAR cls[16] = _T("");
+	GetClassName(m->hwnd, cls, 16);
+	BOOL inEdit = !lstrcmpi(cls, _T("Edit"));
 	if(!ctrl && !alt && g_aiParamsCtx && twpng_IsVideoPath(g_aiParamsCtx->path)) {
 		// Space plays/pauses unless a text box has the focus; -/+ change the speed.
-		TCHAR cls[16] = _T("");
-		GetClassName(m->hwnd, cls, 16);
-		if(m->wParam==VK_SPACE && !shift && lstrcmpi(cls, _T("Edit"))) { twpng_VideoToggle(); return TRUE; }
+		if(m->wParam==VK_SPACE && !shift && !inEdit) { twpng_VideoToggle(); return TRUE; }
 		if(m->wParam==VK_OEM_PLUS || m->wParam==VK_ADD) { twpng_VideoSpeed(1); return TRUE; }
 		if(m->wParam==VK_OEM_MINUS || m->wParam==VK_SUBTRACT) { twpng_VideoSpeed(-1); return TRUE; }
+	}
+	// The text boxes are read-only; only Home and Ctrl+C mean something there.
+	if(!alt && !(inEdit && (m->wParam==VK_HOME || (ctrl && m->wParam=='C'))) &&
+	   twpng_PicKey(g_hwndAIParams, m->wParam, ctrl)) return TRUE;
+	if(m->wParam==VK_APPS || (shift && m->wParam==VK_F10)) {
+		if(inEdit) return FALSE;
+		// The menu key: the picture's menu, at the picture.
+		RECT r;
+		GetWindowRect(GetDlgItem(g_hwndAIParams, IDC_AIP_THUMB), &r);
+		POINT scr = { (r.left+r.right)/2, (r.top+r.bottom)/2 };
+		twpng_PicMenu(g_hwndAIParams, scr);
+		return TRUE;
 	}
 	if(ctrl && !alt && m->wParam=='F' && g_aiParamsCtx && g_aiParamsCtx->path[0]) {
 		twpng_FolderForViewer(TRUE);
@@ -6720,6 +7578,205 @@ static void twpng_SaveIndex(const TCHAR *dir, const struct twpng_airec *recs, in
 	free(b.p);
 }
 
+// ---- marks: files checked in the folder overview (S in the viewer) ----------------------
+// Kept per folder next to the index, as <hash>.marks: a UTF-8 text file with a header line,
+// the folder and one file name per line. A few folders stay loaded, names sorted for lookup.
+
+struct twpng_marks { TCHAR dir[MAX_PATH]; TCHAR **names; int n, cap; };
+#define TWPNG_MARKCACHE 8
+static struct twpng_marks *g_marks[TWPNG_MARKCACHE];   // [0] is the most recently used
+
+static BOOL twpng_MarksPath(const TCHAR *dir, TCHAR *out, int cap, BOOL create)
+{
+	if(!twpng_IndexPath(dir, out, cap, create)) return FALSE;
+	TCHAR *dot = _tcsrchr(out, _T('.'));
+	if(dot) *dot = 0;
+	return SUCCEEDED(StringCchCat(out, cap, _T(".marks")));
+}
+
+static int twpng_FindMark(const struct twpng_marks *m, const TCHAR *name, BOOL *found)
+{
+	int lo = 0, hi = m->n;
+	while(lo < hi) {
+		int mid = (lo+hi)/2, c = lstrcmpi(m->names[mid], name);
+		if(!c) { *found = TRUE; return mid; }
+		if(c < 0) lo = mid+1; else hi = mid;
+	}
+	*found = FALSE;
+	return lo;
+}
+
+static void twpng_FreeMarks(struct twpng_marks *m)
+{
+	if(!m) return;
+	for(int i=0; i<m->n; i++) free(m->names[i]);
+	free(m->names);
+	free(m);
+}
+
+// The marks of `dir` (ending in a backslash), loaded from disk the first time.
+static struct twpng_marks *twpng_MarksFor(const TCHAR *dir)
+{
+	for(int i=0; i<TWPNG_MARKCACHE && g_marks[i]; i++) {
+		if(lstrcmpi(g_marks[i]->dir, dir)) continue;
+		struct twpng_marks *m = g_marks[i];
+		memmove(&g_marks[1], &g_marks[0], (size_t)i*sizeof(g_marks[0]));
+		g_marks[0] = m;
+		return m;
+	}
+	struct twpng_marks *m = (struct twpng_marks*)calloc(1, sizeof(struct twpng_marks));
+	if(!m) return NULL;
+	StringCchCopy(m->dir, MAX_PATH, dir);
+	TCHAR fn[MAX_PATH];
+	unsigned char *buf = NULL;
+	DWORD size = 0;
+	if(twpng_MarksPath(dir, fn, MAX_PATH, FALSE) && twpng_SlurpFile(fn, 64UL*1024*1024, &buf, &size)) {
+		TCHAR *text = twpng_BytesToTchar((const char*)buf, (int)size, CP_UTF8);
+		free(buf);
+		int line = 0;
+		BOOL ok = TRUE;
+		for(TCHAR *p = text, *next; ok && p && *p; p = next, line++) {
+			next = _tcschr(p, _T('\n'));
+			if(next) *next++ = 0;
+			int l = lstrlen(p);
+			if(l && p[l-1]==_T('\r')) p[--l] = 0;
+			if(line==0) ok = !lstrcmp(p, _T("TweakPNG marks 1"));
+			else if(line==1) ok = !lstrcmpi(p, dir);   // guards against a hash collision
+			else if(l) {
+				if(m->n==m->cap) {
+					int nc = m->cap ? m->cap*2 : 64;
+					TCHAR **nn = (TCHAR**)realloc(m->names, (size_t)nc*sizeof(TCHAR*));
+					if(!nn) break;
+					m->names = nn; m->cap = nc;
+				}
+				if((m->names[m->n] = _tcsdup(p))!=NULL) m->n++;
+			}
+		}
+		free(text);
+		if(!ok) { for(int i=0; i<m->n; i++) free(m->names[i]); m->n = 0; }
+		if(m->n > 1) qsort(m->names, (size_t)m->n, sizeof(TCHAR*), twpng_CmpStrPtr);
+	}
+	twpng_FreeMarks(g_marks[TWPNG_MARKCACHE-1]);
+	memmove(&g_marks[1], &g_marks[0], (TWPNG_MARKCACHE-1)*sizeof(g_marks[0]));
+	g_marks[0] = m;
+	return m;
+}
+
+static void twpng_SaveMarks(const struct twpng_marks *m)
+{
+	TCHAR fn[MAX_PATH], tmp[MAX_PATH];
+	if(!twpng_MarksPath(m->dir, fn, MAX_PATH, TRUE)) return;
+	if(!m->n) { DeleteFile(fn); return; }
+	struct twpng_tbuf b = { NULL, 0, 0 };
+	tb_add(&b, _T("TweakPNG marks 1\r\n"), -1);
+	tb_add(&b, m->dir, -1);
+	for(int i=0; i<m->n; i++) { tb_add(&b, _T("\r\n"), 2); tb_add(&b, m->names[i], -1); }
+	tb_add(&b, _T("\r\n"), 2);
+	if(!b.s) return;
+#ifdef UNICODE
+	int n = WideCharToMultiByte(CP_UTF8, 0, b.s, -1, NULL, 0, NULL, NULL);
+	char *u = n>0 ? (char*)malloc(n) : NULL;
+	if(u) {
+		WideCharToMultiByte(CP_UTF8, 0, b.s, -1, u, n, NULL, NULL);
+		StringCchPrintf(tmp, MAX_PATH, _T("%s.tmp"), fn);
+		if(twpng_WriteWholeFile(tmp, (const unsigned char*)u, (DWORD)n-1) && !MoveFileEx(tmp, fn, MOVEFILE_REPLACE_EXISTING))
+			DeleteFile(tmp);
+		free(u);
+	}
+#else
+	StringCchPrintf(tmp, MAX_PATH, _T("%s.tmp"), fn);
+	if(twpng_WriteWholeFile(tmp, (const unsigned char*)b.s, (DWORD)lstrlen(b.s)) && !MoveFileEx(tmp, fn, MOVEFILE_REPLACE_EXISTING))
+		DeleteFile(tmp);
+#endif
+	free(b.s);
+}
+
+static BOOL twpng_IsMarked(const TCHAR *dir, const TCHAR *name)
+{
+	struct twpng_marks *m = twpng_MarksFor(dir);
+	BOOL found = FALSE;
+	if(m && m->n) twpng_FindMark(m, name, &found);
+	return found;
+}
+
+static int twpng_MarkCount(const TCHAR *dir)
+{
+	struct twpng_marks *m = twpng_MarksFor(dir);
+	return m ? m->n : 0;
+}
+
+// Mark or unmark `n` files of `dir`, then save once.
+static void twpng_SetMarks(const TCHAR *dir, const TCHAR *const *names, int n, BOOL on)
+{
+	struct twpng_marks *m = twpng_MarksFor(dir);
+	if(!m || n<=0) return;
+	BOOL changed = FALSE;
+	if(on) {
+		int old = m->n;
+		for(int i=0; i<n; i++) {
+			BOOL found = FALSE;
+			if(old) twpng_FindMark(m, names[i], &found);   // only the sorted part
+			if(found) continue;
+			if(m->n==m->cap) {
+				int nc = m->cap ? m->cap*2 : 64;
+				while(nc < m->n + (n-i)) nc *= 2;
+				TCHAR **nn = (TCHAR**)realloc(m->names, (size_t)nc*sizeof(TCHAR*));
+				if(!nn) break;
+				m->names = nn; m->cap = nc;
+			}
+			if((m->names[m->n] = _tcsdup(names[i]))!=NULL) { m->n++; changed = TRUE; }
+		}
+		if(changed) {
+			qsort(m->names, (size_t)m->n, sizeof(TCHAR*), twpng_CmpStrPtr);
+			// The same name passed twice in one call: keep one.
+			int k = 0;
+			for(int i=0; i<m->n; i++) {
+				if(k && !lstrcmpi(m->names[k-1], m->names[i])) { free(m->names[i]); continue; }
+				m->names[k++] = m->names[i];
+			}
+			m->n = k;
+		}
+	} else {
+		for(int i=0; i<n; i++) {
+			BOOL found = FALSE;
+			int at = m->n ? twpng_FindMark(m, names[i], &found) : 0;
+			if(!found) continue;
+			free(m->names[at]);
+			memmove(&m->names[at], &m->names[at+1], (size_t)(m->n-at-1)*sizeof(TCHAR*));
+			m->n--;
+			changed = TRUE;
+		}
+	}
+	if(!changed) return;
+	twpng_SaveMarks(m);
+	twpng_MarksChanged(dir);
+}
+
+// Folder (with backslash) and name of a full path. FALSE without a folder.
+static BOOL twpng_SplitPath(const TCHAR *path, TCHAR *dir, const TCHAR **name)
+{
+	const TCHAR *sl = path ? _tcsrchr(path, _T('\\')) : NULL;
+	if(!sl || !sl[1]) return FALSE;
+	StringCchCopyN(dir, MAX_PATH, path, (size_t)(sl-path+1));
+	*name = sl+1;
+	return TRUE;
+}
+
+static BOOL twpng_IsMarkedPath(const TCHAR *path)
+{
+	TCHAR dir[MAX_PATH];
+	const TCHAR *name;
+	return twpng_SplitPath(path, dir, &name) && twpng_IsMarked(dir, name);
+}
+
+static void twpng_ToggleMarkPath(const TCHAR *path)
+{
+	TCHAR dir[MAX_PATH];
+	const TCHAR *name;
+	if(!twpng_SplitPath(path, dir, &name)) return;
+	twpng_SetMarks(dir, &name, 1, !twpng_IsMarked(dir, name));
+}
+
 // ---- scan worker ----
 
 #define WM_APP_SCAN (WM_APP+23)   // wParam 0: progress, 1: finished
@@ -6874,6 +7931,9 @@ struct twpng_folderdlg {
 	ULONGLONG lastSort;           // re-sorting while a scan runs is limited to once a second
 	BOOL unsorted;                // rows were added since the last sort
 	TCHAR follow[MAX_PATH];       // file shown in the viewer, selected once its row is there
+	BOOL markedOnly;              // "Marked only": rows of marked files only
+	HIMAGELIST checks;            // checkbox glyphs for the rows, drawn for the theme
+	int checksDark;               // theme the glyphs were drawn for, -1 = none yet
 };
 
 // Columns of the folder overview list.
@@ -7074,6 +8134,7 @@ static void twpng_FolderFilterMore(HWND hwnd, struct twpng_folderdlg *f)
 	int before = f->nrows;
 	for(; f->filtered<done; f->filtered++) {
 		if(!twpng_RecMatches(&f->scan->recs[f->filtered], f->search)) continue;
+		if(f->markedOnly && !twpng_IsMarked(f->dir, f->scan->recs[f->filtered].name)) continue;
 		if(f->nrows==f->caprows) {
 			int nc = f->caprows ? f->caprows*2 : 1024;
 			int *nr = (int*)realloc(f->rows, (size_t)nc*sizeof(int));
@@ -7153,8 +8214,7 @@ static void twpng_FolderStatus(HWND hwnd, struct twpng_folderdlg *f)
 		}
 	}
 	SetDlgItemText(hwnd, IDC_AF_STATUS, buf);
-	StringCchPrintf(buf, 300, f->search[0] ? _T("%d matches") : _T("%d files"), f->nrows);
-	SetDlgItemText(hwnd, IDC_AF_COUNT, buf);
+	twpng_FolderMarkUI(hwnd, f);
 	ShowWindow(GetDlgItem(hwnd, IDC_AF_STOP), f->finished ? SW_HIDE : SW_SHOW);
 }
 
@@ -7203,6 +8263,320 @@ static void twpng_FolderForViewer(BOOL focusSearch)
 	sl[1] = 0;
 	twpng_ShowFolderOverview(d, focusSearch);
 	twpng_FolderFollow(g_aiParamsCtx->path);
+}
+
+// ---- marks in the overview: checkboxes, "Marked only", and the file actions -----------
+
+#define WM_APP_HDRCHECK (WM_APP+28)   // the header's mark-all checkbox was clicked
+
+// Checkbox glyphs for the rows in the dialog's theme (the list's own are always light).
+static void twpng_FolderCheckImages(HWND hwnd, struct twpng_folderdlg *f)
+{
+	int dark = globals.dark ? 1 : 0;
+	if(f->checks && f->checksDark==dark) return;
+	HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
+	UINT dpi = GetDpiForWindow(lv);
+	int sz = MulDiv(16, dpi ? dpi : 96, 96);
+	HIMAGELIST il = ImageList_Create(sz, sz, ILC_COLOR32, 2, 0);
+	if(!il) return;
+	HTHEME th = OpenThemeData(NULL, dark ? L"DarkMode_Explorer::Button" : L"Button");
+	for(int i=0; i<2; i++) {
+		BITMAPINFO bi;
+		ZeroMemory(&bi, sizeof(bi));
+		bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+		bi.bmiHeader.biWidth = sz;
+		bi.bmiHeader.biHeight = -sz;
+		bi.bmiHeader.biPlanes = 1;
+		bi.bmiHeader.biBitCount = 32;
+		void *bits = NULL;
+		HBITMAP bmp = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+		if(!bmp) continue;
+		HDC dc = CreateCompatibleDC(NULL);
+		HGDIOBJ old = SelectObject(dc, bmp);
+		int st = i ? CBS_CHECKEDNORMAL : CBS_UNCHECKEDNORMAL;
+		SIZE gs = { MulDiv(13, dpi ? dpi : 96, 96), MulDiv(13, dpi ? dpi : 96, 96) };
+		if(th) GetThemePartSize(th, dc, BP_CHECKBOX, st, NULL, TS_DRAW, &gs);
+		RECT r = { (sz-gs.cx)/2, (sz-gs.cy)/2, (sz-gs.cx)/2+gs.cx, (sz-gs.cy)/2+gs.cy };
+		if(th) DrawThemeBackground(th, dc, BP_CHECKBOX, st, &r, NULL);
+		else {
+			DrawFrameControl(dc, &r, DFC_BUTTON, DFCS_BUTTONCHECK|DFCS_FLAT|(i ? DFCS_CHECKED : 0));
+			GdiFlush();
+			for(int y=r.top; y<r.bottom; y++) for(int x=r.left; x<r.right; x++) ((BYTE*)bits)[(y*sz+x)*4+3] = 255;
+		}
+		GdiFlush();
+		SelectObject(dc, old);
+		DeleteDC(dc);
+		ImageList_Add(il, bmp, NULL);
+		DeleteObject(bmp);
+	}
+	if(th) CloseThemeData(th);
+	HIMAGELIST prev = ListView_SetImageList(lv, il, LVSIL_STATE);
+	if(prev && prev!=il) ImageList_Destroy(prev);   // the list's default one, or ours from before
+	f->checks = il;
+	f->checksDark = dark;
+}
+
+// Count line, the header's mark-all checkbox and the action buttons.
+static void twpng_FolderMarkUI(HWND hwnd, struct twpng_folderdlg *f)
+{
+	int marked = 0, shownMarked = 0;
+	if(f->scan && f->scan->total > 0) {
+		LONG done = f->scan->done;
+		for(LONG i=0; i<done; i++) if(twpng_IsMarked(f->dir, f->scan->recs[i].name)) marked++;
+		if(marked) for(int i=0; i<f->nrows; i++) if(twpng_IsMarked(f->dir, f->scan->recs[f->rows[i]].name)) shownMarked++;
+	}
+	TCHAR buf[100];
+	if(f->search[0]) StringCchPrintf(buf, 100, f->nrows==1 ? _T("%d match") : _T("%d matches"), f->nrows);
+	else StringCchPrintf(buf, 100, f->nrows==1 ? _T("%d file") : _T("%d files"), f->nrows);
+	if(marked) {
+		TCHAR t[40];
+		StringCchPrintf(t, 40, _T(", %d marked"), marked);
+		StringCchCat(buf, 100, t);
+	}
+	SetDlgItemText(hwnd, IDC_AF_COUNT, buf);
+	HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
+	HWND hdr = ListView_GetHeader(lv);
+	HDITEM h;
+	ZeroMemory(&h, sizeof(h));
+	h.mask = HDI_FORMAT;
+	Header_GetItem(hdr, 0, &h);
+	int fmt = (h.fmt & ~HDF_CHECKED) | HDF_CHECKBOX | (f->nrows && shownMarked==f->nrows ? HDF_CHECKED : 0);
+	if(fmt != h.fmt) { h.fmt = fmt; Header_SetItem(hdr, 0, &h); }
+	BOOL any = shownMarked>0 || ListView_GetSelectedCount(lv)>0;
+	EnableWindow(GetDlgItem(hwnd, IDC_AF_DELETE), any);
+	EnableWindow(GetDlgItem(hwnd, IDC_AF_COPYTO), any);
+	EnableWindow(GetDlgItem(hwnd, IDC_AF_MOVETO), any);
+}
+
+// Filter again (search, "Marked only") keeping the selection and scroll position.
+static void twpng_FolderRefilterKeep(HWND hwnd, struct twpng_folderdlg *f)
+{
+	HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
+	struct twpng_listpos pos;
+	twpng_FolderSavePos(lv, f, &pos);
+	f->nrows = 0;
+	f->filtered = 0;
+	twpng_FolderFilterMore(hwnd, f);
+	ListView_SetItemCountEx(lv, f->nrows, LVSICF_NOSCROLL);
+	InvalidateRect(lv, NULL, FALSE);
+	twpng_FolderRestorePos(lv, f, &pos, TRUE);
+}
+
+// Marks of `dir` changed (in the overview or with S in the viewer): show it everywhere.
+static void twpng_MarksChanged(const TCHAR *dir)
+{
+	struct twpng_folderdlg *f = g_hwndAIFolder ? (struct twpng_folderdlg*)GetWindowLongPtr(g_hwndAIFolder, DWLP_USER) : NULL;
+	if(f && !lstrcmpi(f->dir, dir)) {
+		if(f->markedOnly) twpng_FolderRefilterKeep(g_hwndAIFolder, f);
+		else InvalidateRect(GetDlgItem(g_hwndAIFolder, IDC_AF_LIST), NULL, FALSE);
+		twpng_FolderMarkUI(g_hwndAIFolder, f);
+	}
+	if(g_hwndAIParams && g_aiParamsCtx) {
+		twpng_UpdateAINav(g_hwndAIParams, g_aiParamsCtx);
+		InvalidateRect(g_hwndAIParams, NULL, FALSE);   // the "Marked" line above the picture
+	}
+	if(g_hwndFull) twpng_VideoUI();   // status line and overlay
+}
+
+// Copies of the names the buttons and keys act on: the marked rows that are shown (when
+// `preferMarked` and there are any), else the selected rows. Free with twpng_FreeList.
+static TCHAR **twpng_FolderTargets(HWND hwnd, struct twpng_folderdlg *f, BOOL preferMarked, int *outN, BOOL *marked)
+{
+	*outN = 0;
+	*marked = FALSE;
+	if(!f->scan || f->nrows<=0) return NULL;
+	TCHAR **list = (TCHAR**)calloc((size_t)f->nrows, sizeof(TCHAR*));
+	if(!list) return NULL;
+	int n = 0;
+	if(preferMarked)
+		for(int i=0; i<f->nrows; i++) {
+			const TCHAR *name = f->scan->recs[f->rows[i]].name;
+			if(twpng_IsMarked(f->dir, name) && (list[n] = _tcsdup(name))!=NULL) n++;
+		}
+	if(n) *marked = TRUE;
+	else {
+		HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
+		for(int i=ListView_GetNextItem(lv, -1, LVNI_SELECTED); i>=0 && i<f->nrows; i=ListView_GetNextItem(lv, i, LVNI_SELECTED))
+			if((list[n] = _tcsdup(f->scan->recs[f->rows[i]].name))!=NULL) n++;
+	}
+	if(!n) { free(list); return NULL; }
+	*outN = n;
+	return list;
+}
+
+// Mark or unmark the selected rows (Space), or just `row`: all get the opposite of the first.
+static void twpng_FolderToggleRows(HWND hwnd, struct twpng_folderdlg *f, int row)
+{
+	if(!f->scan) return;
+	HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
+	int cnt = row>=0 ? 1 : ListView_GetSelectedCount(lv);
+	if(cnt<=0) return;
+	const TCHAR **names = (const TCHAR**)calloc((size_t)cnt, sizeof(TCHAR*));
+	if(!names) return;
+	int n = 0;
+	if(row>=0) { if(row<f->nrows) names[n++] = f->scan->recs[f->rows[row]].name; }
+	else
+		for(int i=ListView_GetNextItem(lv, -1, LVNI_SELECTED); i>=0 && i<f->nrows && n<cnt; i=ListView_GetNextItem(lv, i, LVNI_SELECTED))
+			names[n++] = f->scan->recs[f->rows[i]].name;
+	if(n) twpng_SetMarks(f->dir, names, n, !twpng_IsMarked(f->dir, names[0]));
+	free(names);
+}
+
+// The header checkbox: mark every shown row, or unmark them all when they all are.
+static void twpng_FolderMarkAll(HWND hwnd, struct twpng_folderdlg *f)
+{
+	if(!f->scan || f->nrows<=0) return;
+	const TCHAR **names = (const TCHAR**)calloc((size_t)f->nrows, sizeof(TCHAR*));
+	if(!names) return;
+	BOOL all = TRUE;
+	for(int i=0; i<f->nrows; i++) {
+		names[i] = f->scan->recs[f->rows[i]].name;
+		if(all && !twpng_IsMarked(f->dir, names[i])) all = FALSE;
+	}
+	twpng_SetMarks(f->dir, names, f->nrows, !all);
+	free(names);
+	(void)hwnd;
+}
+
+// A shell data object for files of one folder: what Explorer hands to drag and drop and
+// the clipboard, so any app that takes files accepts it.
+static IDataObject *twpng_FilesDataObject(const TCHAR *dir, const TCHAR *const *names, int n)
+{
+	PIDLIST_ABSOLUTE *ids = (PIDLIST_ABSOLUTE*)calloc((size_t)(n ? n : 1), sizeof(PIDLIST_ABSOLUTE));
+	if(!ids) return NULL;
+	int k = 0;
+	for(int i=0; i<n; i++) {
+		TCHAR p[MAX_PATH];
+		StringCchPrintf(p, MAX_PATH, _T("%s%s"), dir, names[i]);
+		if((ids[k] = ILCreateFromPath(p))!=NULL) k++;
+	}
+	IDataObject *d = NULL;
+	IShellItemArray *arr = NULL;
+	if(k && SUCCEEDED(SHCreateShellItemArrayFromIDLists((UINT)k, (PCIDLIST_ABSOLUTE_ARRAY)ids, &arr))) {
+		arr->BindToHandler(NULL, BHID_DataObject, IID_PPV_ARGS(&d));
+		arr->Release();
+	}
+	for(int i=0; i<k; i++) ILFree(ids[i]);
+	free(ids);
+	return d;
+}
+
+// Drag the files out to other apps (copy or link, never move: the folder stays as it is).
+static void twpng_DragFiles(HWND hwnd, const TCHAR *dir, const TCHAR *const *names, int n)
+{
+	IDataObject *d = twpng_FilesDataObject(dir, names, n);
+	if(!d) return;
+	DWORD eff = 0;
+	SHDoDragDrop(hwnd, d, NULL, DROPEFFECT_COPY|DROPEFFECT_LINK, &eff);
+	d->Release();
+}
+
+// Put the files on the clipboard, for pasting in Explorer or another app.
+static void twpng_CopyFiles(const TCHAR *dir, const TCHAR *const *names, int n)
+{
+	IDataObject *d = twpng_FilesDataObject(dir, names, n);
+	if(!d) return;
+	if(SUCCEEDED(OleSetClipboard(d))) OleFlushClipboard();
+	d->Release();
+}
+
+// Delete (to the Recycle Bin), copy or move files of `dir`, with the shell's own progress,
+// name-clash and undo handling. A video showing one of them is stopped first (it holds the
+// file open).
+static BOOL twpng_FileOp(HWND owner, UINT op, const TCHAR *dir, const TCHAR *const *names, int n, const TCHAR *dest)
+{
+	IFileOperation *fo = NULL;
+	if(FAILED(CoCreateInstance(CLSID_FileOperation, NULL, CLSCTX_ALL, IID_PPV_ARGS(&fo)))) return FALSE;
+	fo->SetOwnerWindow(owner);
+	fo->SetOperationFlags(FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR | (op==FO_DELETE ? FOFX_RECYCLEONDELETE : 0));
+	IShellItem *to = NULL;
+	BOOL ok = !dest || SUCCEEDED(SHCreateItemFromParsingName(dest, NULL, IID_PPV_ARGS(&to)));
+	int queued = 0;
+	for(int i=0; ok && i<n; i++) {
+		TCHAR p[MAX_PATH];
+		StringCchPrintf(p, MAX_PATH, _T("%s%s"), dir, names[i]);
+		if(op!=FO_COPY && g_vid.eng && !lstrcmpi(g_vid.path, p)) twpng_VideoStop();
+		IShellItem *it = NULL;
+		if(FAILED(SHCreateItemFromParsingName(p, NULL, IID_PPV_ARGS(&it)))) continue;
+		HRESULT hr = op==FO_DELETE ? fo->DeleteItem(it, NULL) :
+		             op==FO_COPY ? fo->CopyItem(it, to, NULL, NULL) : fo->MoveItem(it, to, NULL, NULL);
+		if(SUCCEEDED(hr)) queued++;
+		it->Release();
+	}
+	ok = ok && queued && SUCCEEDED(fo->PerformOperations());
+	if(to) to->Release();
+	fo->Release();
+	return ok;
+}
+
+static void twpng_ViewerGoTo(const TCHAR *path);
+static void twpng_SibForget(const TCHAR *path);
+static void twpng_FolderQuietScan(HWND hwnd, struct twpng_folderdlg *f);
+
+// After a delete or move: files of `dir` that are gone lose their mark and their place in
+// Prev/Next, and the viewer moves on to the nearest file that is still there.
+static void twpng_FilesGone(const TCHAR *dir, const TCHAR *const *names, int n)
+{
+	const TCHAR **gone = (const TCHAR**)calloc((size_t)(n ? n : 1), sizeof(TCHAR*));
+	if(!gone) return;
+	int ng = 0;
+	BOOL viewerGone = FALSE;
+	for(int i=0; i<n; i++) {
+		TCHAR p[MAX_PATH];
+		StringCchPrintf(p, MAX_PATH, _T("%s%s"), dir, names[i]);
+		if(GetFileAttributes(p)!=INVALID_FILE_ATTRIBUTES) continue;
+		gone[ng++] = names[i];
+		if(g_aiParamsCtx && !lstrcmpi(g_aiParamsCtx->path, p)) viewerGone = TRUE;
+	}
+	TCHAR next[MAX_PATH] = _T("");
+	if(viewerGone) {
+		TCHAR **list;
+		int idx = -1, cnt = twpng_GetSiblings(g_aiParamsCtx->path, &list, &idx, FALSE);
+		for(int pass=0; pass<2 && !next[0] && idx>=0; pass++)
+			for(int i = pass ? idx-1 : idx+1; i>=0 && i<cnt; i += pass ? -1 : 1)
+				if(GetFileAttributes(list[i])!=INVALID_FILE_ATTRIBUTES) { StringCchCopy(next, MAX_PATH, list[i]); break; }
+	}
+	for(int i=0; i<ng; i++) {
+		TCHAR p[MAX_PATH];
+		StringCchPrintf(p, MAX_PATH, _T("%s%s"), dir, gone[i]);
+		twpng_SibForget(p);
+	}
+	if(ng) twpng_SetMarks(dir, gone, ng, FALSE);
+	free(gone);
+	struct twpng_folderdlg *f = g_hwndAIFolder ? (struct twpng_folderdlg*)GetWindowLongPtr(g_hwndAIFolder, DWLP_USER) : NULL;
+	if(ng && f && !lstrcmpi(f->dir, dir)) twpng_FolderQuietScan(g_hwndAIFolder, f);   // the watcher would too, a moment later
+	if(next[0]) twpng_ViewerGoTo(next);
+	else if(g_hwndAIParams && g_aiParamsCtx) twpng_UpdateAINav(g_hwndAIParams, g_aiParamsCtx);
+}
+
+static BOOL twpng_PickFolder(HWND owner, TCHAR *dir, const WCHAR *title = L"Choose a folder");
+
+// Delete / Copy to / Move to for the marked (or selected) rows.
+static void twpng_FolderFileAction(HWND hwnd, struct twpng_folderdlg *f, int id)
+{
+	int n;
+	BOOL marked;
+	TCHAR **names = twpng_FolderTargets(hwnd, f, TRUE, &n, &marked);
+	if(!names) return;
+	TCHAR what[80];
+	StringCchPrintf(what, 80, n==1 ? _T("%d %s file") : _T("%d %s files"), n, marked ? _T("marked") : _T("selected"));
+	TCHAR dest[MAX_PATH] = _T("");
+	BOOL go = FALSE;
+	if(id==IDC_AF_DELETE) {
+		TCHAR q[200];
+		StringCchPrintf(q, 200, _T("Move %s to the Recycle Bin?"), what);
+		go = twpng_MessageBox(hwnd, q, _T("Folder Overview"), MB_OKCANCEL|MB_ICONQUESTION)==IDOK;
+	} else {
+		WCHAR title[120];
+		StringCchPrintfW(title, 120, L"%s %s to", id==IDC_AF_COPYTO ? L"Copy" : L"Move", what);
+		go = twpng_PickFolder(hwnd, dest, title);
+	}
+	if(go) {
+		UINT op = id==IDC_AF_DELETE ? FO_DELETE : id==IDC_AF_COPYTO ? FO_COPY : FO_MOVE;
+		twpng_FileOp(hwnd, op, f->dir, names, n, dest[0] ? dest : NULL);
+		if(op!=FO_COPY) twpng_FilesGone(f->dir, names, n);
+	}
+	twpng_FreeList(names, n);
 }
 
 // ---- watching the folder: new or changed files show up without a manual rescan ----
@@ -7373,9 +8747,11 @@ static void twpng_LayoutFolder(HWND hwnd)
 	int stopW = 60, progW = (W-2*m)*2/3, statW = W-2*m-progW-stopW-2*gap;
 	if(statW < 260) { statW = 260; progW = W-2*m-statW-stopW-2*gap; }   // narrow window: keep the text readable
 	if(progW < lblW+80) { progW = lblW+80; statW = W-2*m-progW-stopW-2*gap; }
+	int moW = 100;
 	SetWindowPos(GetDlgItem(hwnd,IDC_AF_LBLSEARCH), NULL, m, y+4, lblW, rowH-4, SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AF_SEARCH), NULL, m+lblW, y, progW-lblW, rowH, SWP_NOZORDER);
-	SetWindowPos(GetDlgItem(hwnd,IDC_AF_COUNT), NULL, m+progW+gap, y+4, W-2*m-progW-gap, rowH-4, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AF_COUNT), NULL, m+progW+gap, y+4, W-2*m-progW-2*gap-moW, rowH-4, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AF_MARKEDONLY), NULL, W-m-moW, y+2, moW, rowH-4, SWP_NOZORDER);
 	y += rowH+gap;
 	SetWindowPos(GetDlgItem(hwnd,IDC_AF_PROGRESS), NULL, m, y+4, progW, 16, SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AF_STATUS), NULL, m+progW+gap, y+4, statW, rowH-4, SWP_NOZORDER);
@@ -7384,6 +8760,9 @@ static void twpng_LayoutFolder(HWND hwnd)
 	int bottomY = H-m-btnH;
 	SetWindowPos(GetDlgItem(hwnd,IDC_AF_LIST), NULL, m, y, W-2*m, bottomY-gap-y, SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDC_AF_EXPORT), NULL, m, bottomY, 100, btnH, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AF_DELETE), NULL, m+100+gap, bottomY, 70, btnH, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AF_COPYTO), NULL, m+170+2*gap, bottomY, 90, btnH, SWP_NOZORDER);
+	SetWindowPos(GetDlgItem(hwnd,IDC_AF_MOVETO), NULL, m+260+3*gap, bottomY, 90, btnH, SWP_NOZORDER);
 	SetWindowPos(GetDlgItem(hwnd,IDCANCEL), NULL, W-m-70, bottomY, 70, btnH, SWP_NOZORDER);
 }
 
@@ -7483,7 +8862,7 @@ static void twpng_FolderExportCsv(HWND hwnd, struct twpng_folderdlg *f)
 	else mesg(MSG_I, _T("Exported %d rows to\r\n%s"), f->nrows, fn);
 }
 
-static BOOL twpng_PickFolder(HWND owner, TCHAR *dir)
+static BOOL twpng_PickFolder(HWND owner, TCHAR *dir, const WCHAR *title)
 {
 	IFileOpenDialog *d = NULL;
 	BOOL ok = FALSE;
@@ -7491,7 +8870,7 @@ static BOOL twpng_PickFolder(HWND owner, TCHAR *dir)
 	DWORD opt = 0;
 	d->GetOptions(&opt);
 	d->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-	d->SetTitle(L"Choose a folder");
+	d->SetTitle(title);
 	if(SUCCEEDED(d->Show(owner))) {
 		IShellItem *it = NULL;
 		if(SUCCEEDED(d->GetResult(&it))) {
@@ -7611,7 +8990,10 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			SetWindowLongPtr(hwnd, DWLP_USER, lParam);
 			SendMessage(hwnd, WM_SETICON, ICON_BIG, (LPARAM)LoadIcon(globals.hInst,_T("ICONMAIN")));
 			HWND lv = GetDlgItem(hwnd, IDC_AF_LIST);
-			ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_HEADERDRAGDROP);
+			ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_HEADERDRAGDROP|LVS_EX_CHECKBOXES);
+			// Owner data: the checkboxes show the marks, given per row in LVN_GETDISPINFO.
+			ListView_SetCallbackMask(lv, LVIS_STATEIMAGEMASK);
+			f->checksDark = -1;
 			static const struct { const TCHAR *name; int w; } cols[] = {   // in AFC_ order
 				{ _T("File"), 220 }, { _T("Modified"), 130 }, { _T("Seed"), 100 }, { _T("Model"), 220 },
 				{ _T("Mode"), 130 }, { _T("Duration"), 70 }, { _T("Prompt"), 700 }, { NULL, 0 } };
@@ -7624,12 +9006,15 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 				ListView_InsertColumn(lv, i, &c);
 			}
 			SetWindowSubclass(lv, MainListSubclassProc, 1, 0);
+			HWND hdr = ListView_GetHeader(lv);
+			SetWindowLong(hdr, GWL_STYLE, GetWindowLong(hdr, GWL_STYLE) | HDS_CHECKBOXES);
 			if(globals.aif_sort) {
 				f->sortCol = (globals.aif_sort<0 ? -globals.aif_sort : globals.aif_sort) - 1;
 				f->sortDesc = globals.aif_sort<0;
 			}
 			twpng_FolderHeaderArrows(hwnd, f);
 			twpng_InitDarkDialog(hwnd);
+			twpng_FolderCheckImages(hwnd, f);
 			if(globals.window_prefs.aifolder.w>0 && globals.window_prefs.aifolder.h>0)
 				twpng_SetWindowPos(hwnd, &globals.window_prefs.aifolder);
 			twpng_LayoutFolder(hwnd);
@@ -7666,6 +9051,9 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			if(wParam==1 && f->dirty && !f->stopped) twpng_FolderQuietScan(hwnd, f);
 		}
 		return TRUE;
+	case WM_APP_HDRCHECK:
+		if(f) twpng_FolderMarkAll(hwnd, f);
+		return TRUE;
 	case WM_APP_FOLDERCHANGED:
 		// Wait until the folder is quiet for a moment (a render is still being written).
 		if(f && (LONG)wParam==f->watchGen) SetTimer(hwnd, TWPNG_WATCHTIMER, 1500, NULL);
@@ -7687,8 +9075,14 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			if(!f || nh->idFrom!=IDC_AF_LIST) break;
 			if(nh->code==LVN_GETDISPINFO) {
 				NMLVDISPINFO *di = (NMLVDISPINFO*)lParam;
-				if(!(di->item.mask & LVIF_TEXT) || di->item.iItem<0 || di->item.iItem>=f->nrows) return TRUE;
+				if(di->item.iItem<0 || di->item.iItem>=f->nrows) return TRUE;
 				const struct twpng_airec *r = &f->scan->recs[f->rows[di->item.iItem]];
+				if(di->item.mask & LVIF_STATE) {
+					di->item.state = (di->item.state & ~LVIS_STATEIMAGEMASK) |
+						INDEXTOSTATEIMAGEMASK(twpng_IsMarked(f->dir, r->name) ? 2 : 1);
+					di->item.stateMask |= LVIS_STATEIMAGEMASK;
+				}
+				if(!(di->item.mask & LVIF_TEXT)) return TRUE;
 				TCHAR *out = di->item.pszText;
 				int cap = di->item.cchTextMax;
 				out[0] = 0;
@@ -7725,6 +9119,44 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 				twpng_FolderSortClick(hwnd, f, ((LPNMLISTVIEW)lParam)->iSubItem);
 				return TRUE;
 			}
+			if(nh->code==NM_CLICK || nh->code==NM_DBLCLK) {
+				// A click on a row's checkbox marks or unmarks that file.
+				LVHITTESTINFO ht;
+				ZeroMemory(&ht, sizeof(ht));
+				ht.pt = ((LPNMITEMACTIVATE)lParam)->ptAction;
+				int i = ListView_HitTest(nh->hwndFrom, &ht);
+				if(i>=0 && i<f->nrows && (ht.flags & LVHT_ONITEMSTATEICON)) twpng_FolderToggleRows(hwnd, f, i);
+				return TRUE;
+			}
+			if(nh->code==LVN_ITEMCHANGED || nh->code==LVN_ODSTATECHANGED) {
+				twpng_FolderMarkUI(hwnd, f);
+				return TRUE;
+			}
+			if(nh->code==LVN_KEYDOWN) {
+				WORD vk = ((LPNMLVKEYDOWN)lParam)->wVKey;
+				BOOL ctrl = GetKeyState(VK_CONTROL)<0;
+				if(vk==VK_SPACE && !ctrl) twpng_FolderToggleRows(hwnd, f, -1);
+				else if(vk==VK_DELETE) twpng_FolderFileAction(hwnd, f, IDC_AF_DELETE);
+				else if(ctrl && vk=='A') { ListView_SetItemState(nh->hwndFrom, -1, LVIS_SELECTED, LVIS_SELECTED); }
+				else if(ctrl && vk=='C') {
+					int n;
+					BOOL marked;
+					TCHAR **names = twpng_FolderTargets(hwnd, f, FALSE, &n, &marked);
+					if(names) { twpng_CopyFiles(f->dir, names, n); twpng_FreeList(names, n); }
+				}
+				return TRUE;
+			}
+			if(nh->code==LVN_BEGINDRAG) {
+				// Dragging a marked row takes all marked rows along, otherwise the selection.
+				int i = ((LPNMLISTVIEW)lParam)->iItem, n;
+				BOOL marked;
+				BOOL onMarked = i>=0 && i<f->nrows && twpng_IsMarked(f->dir, f->scan->recs[f->rows[i]].name);
+				TCHAR **names = twpng_FolderTargets(hwnd, f, onMarked, &n, &marked);
+				if(names) { twpng_DragFiles(hwnd, f->dir, names, n); twpng_FreeList(names, n); }
+				return TRUE;
+			}
+			if(nh->code==NM_CUSTOMDRAW && ((LPNMCUSTOMDRAW)lParam)->dwDrawStage==CDDS_PREPAINT)
+				twpng_FolderCheckImages(hwnd, f);   // after a theme switch
 			if(nh->code==NM_CUSTOMDRAW && globals.dark) {
 				// The dark theme draws the selection of an unfocused list almost like the
 				// background, and the row of the file in the viewer should stand out.
@@ -7742,6 +9174,10 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			}
 			if(nh->code==LVN_ITEMACTIVATE) {
 				int i = ((LPNMITEMACTIVATE)lParam)->iItem;
+				LVHITTESTINFO ht;
+				ZeroMemory(&ht, sizeof(ht));
+				ht.pt = ((LPNMITEMACTIVATE)lParam)->ptAction;
+				if(ListView_HitTest(nh->hwndFrom, &ht)>=0 && (ht.flags & LVHT_ONITEMSTATEICON)) return TRUE;   // double-click on a checkbox
 				if(i>=0 && i<f->nrows) {
 					TCHAR path[MAX_PATH];
 					StringCchPrintf(path, MAX_PATH, _T("%s%s"), f->dir, f->scan->recs[f->rows[i]].name);
@@ -7779,6 +9215,16 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 			return TRUE;
 		case IDC_AF_EXPORT:
 			twpng_FolderExportCsv(hwnd, f);
+			return TRUE;
+		case IDC_AF_MARKEDONLY:
+			f->markedOnly = IsDlgButtonChecked(hwnd, IDC_AF_MARKEDONLY)==BST_CHECKED;
+			twpng_FolderRefilterKeep(hwnd, f);
+			twpng_FolderStatus(hwnd, f);
+			return TRUE;
+		case IDC_AF_DELETE:
+		case IDC_AF_COPYTO:
+		case IDC_AF_MOVETO:
+			twpng_FolderFileAction(hwnd, f, LOWORD(wParam));
 			return TRUE;
 		case IDCANCEL:
 			DestroyWindow(hwnd);
@@ -7960,13 +9406,45 @@ static void twpng_FormatSize(ULONGLONG b, TCHAR *out, int cap)
 	else StringCchPrintf(out, cap, _T("%.0f KB"), b/1024.0 + 0.5);
 }
 
-struct twpng_idxdlg { struct twpng_idxinfo *list; int n; };
+struct twpng_idxdlg { struct twpng_idxinfo *list; int n; int sortCol; BOOL sortDesc; };
+
+// Click a column header to sort on it, again to reverse (like the folder overview).
+static int g_axSortCol;
+static BOOL g_axSortDesc;
+
+static int twpng_CmpIdx(const void *a, const void *b)
+{
+	const struct twpng_idxinfo *x = (const struct twpng_idxinfo*)a, *y = (const struct twpng_idxinfo*)b;
+	int c;
+	switch(g_axSortCol) {
+	case 0:  c = StrCmpLogicalW(x->dir, y->dir); break;
+	case 1:  c = x->count < y->count ? -1 : x->count > y->count; break;
+	case 2:  c = x->size < y->size ? -1 : x->size > y->size; break;
+	default: c = CompareFileTime(&x->time, &y->time); break;
+	}
+	if(g_axSortDesc) c = -c;
+	if(!c) c = StrCmpLogicalW(x->dir, y->dir);
+	return c;
+}
 
 static void twpng_IndexDlgFill(HWND hwnd, struct twpng_idxdlg *x)
 {
 	free(x->list);
 	x->n = twpng_ListIndexes(&x->list);
+	g_axSortCol = x->sortCol;
+	g_axSortDesc = x->sortDesc;
+	if(x->n > 1) qsort(x->list, (size_t)x->n, sizeof(*x->list), twpng_CmpIdx);
 	HWND lv = GetDlgItem(hwnd, IDC_AX_LIST);
+	HWND hdr = ListView_GetHeader(lv);
+	for(int i=0; i<4; i++) {
+		HDITEM h;
+		ZeroMemory(&h, sizeof(h));
+		h.mask = HDI_FORMAT;
+		Header_GetItem(hdr, i, &h);
+		h.fmt &= ~(HDF_SORTUP|HDF_SORTDOWN);
+		if(i==x->sortCol) h.fmt |= x->sortDesc ? HDF_SORTDOWN : HDF_SORTUP;
+		Header_SetItem(hdr, i, &h);
+	}
 	ListView_DeleteAllItems(lv);
 	ULONGLONG total = 0;
 	for(int i=0; i<x->n; i++) {
@@ -8066,6 +9544,13 @@ static INT_PTR CALLBACK DlgProcIndexes(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 	case WM_NOTIFY:
 		if(x && ((LPNMHDR)lParam)->idFrom==IDC_AX_LIST && ((LPNMHDR)lParam)->code==LVN_ITEMCHANGED)
 			EnableWindow(GetDlgItem(hwnd, IDC_AX_DELETE), ListView_GetSelectedCount(GetDlgItem(hwnd, IDC_AX_LIST))>0);
+		if(x && ((LPNMHDR)lParam)->idFrom==IDC_AX_LIST && ((LPNMHDR)lParam)->code==LVN_COLUMNCLICK) {
+			int col = ((LPNMLISTVIEW)lParam)->iSubItem;
+			if(col==x->sortCol) x->sortDesc = !x->sortDesc;
+			else { x->sortCol = col; x->sortDesc = (col!=0); }   // biggest / newest first
+			twpng_IndexDlgFill(hwnd, x);
+			return TRUE;
+		}
 		break;
 	case WM_COMMAND:
 		if(!x) break;
@@ -8083,7 +9568,7 @@ static INT_PTR CALLBACK DlgProcIndexes(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
 static void twpng_ManageIndexes(HWND owner)
 {
-	struct twpng_idxdlg x = { NULL, 0 };
+	struct twpng_idxdlg x = { NULL, 0, 3, TRUE };
 	DialogBoxParam(globals.hInst, _T("DLG_AIINDEX"), owner, DlgProcIndexes, (LPARAM)&x);
 	free(x.list);
 }
@@ -9432,6 +10917,12 @@ static LRESULT CALLBACK MainListSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 	LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
 	(void)uIdSubclass; (void)dwRefData;
+	if(msg == WM_NOTIFY && ((LPNMHDR)lParam)->code == HDN_ITEMSTATEICONCLICK &&
+	   ((LPNMHDR)lParam)->hwndFrom == ListView_GetHeader(hwnd)) {
+		// The header's checkbox (folder overview: mark all): the dialog decides what it does.
+		PostMessage(GetParent(hwnd), WM_APP_HDRCHECK, 0, 0);
+		return TRUE;
+	}
 	if(msg == WM_NOTIFY && globals.dark) {
 		LPNMHDR pnmh = (LPNMHDR)lParam;
 		HWND hwndHdr = ListView_GetHeader(hwnd);
@@ -9458,6 +10949,16 @@ static LRESULT CALLBACK MainListSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 					HGDIOBJ hOldFont = globals.hUiFont ? SelectObject(pcd->hdc, globals.hUiFont) : NULL;
 					RECT rcTxt = pcd->rc;
 					InflateRect(&rcTxt, -6, 0);
+					if(hdi.fmt & HDF_CHECKBOX) {
+						HTHEME th = OpenThemeData(NULL, L"DarkMode_Explorer::Button");
+						int st = (hdi.fmt & HDF_CHECKED) ? CBS_CHECKEDNORMAL : CBS_UNCHECKEDNORMAL;
+						SIZE gs = { 13, 13 };
+						if(th) GetThemePartSize(th, pcd->hdc, BP_CHECKBOX, st, NULL, TS_DRAW, &gs);
+						int gy = (pcd->rc.top + pcd->rc.bottom - gs.cy)/2;
+						RECT gr = { rcTxt.left, gy, rcTxt.left+gs.cx, gy+gs.cy };
+						if(th) { DrawThemeBackground(th, pcd->hdc, BP_CHECKBOX, st, &gr, NULL); CloseThemeData(th); }
+						rcTxt.left = gr.right + 6;
+					}
 					if(hdi.fmt & (HDF_SORTUP|HDF_SORTDOWN)) {
 						// Sort arrow at the right, like the light header draws it.
 						int cx = pcd->rc.right - 12, cy = (pcd->rc.top + pcd->rc.bottom)/2;
@@ -10864,6 +12365,7 @@ static INT_PTR CALLBACK DlgProcPrefs(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 			globals.open_params_on_load?BST_CHECKED:BST_UNCHECKED);
 		prctx->remember_aimenu = is_ai_menu_set();
 		CheckDlgButton(hwnd,IDC_ADDAIMENU,prctx->remember_aimenu?BST_CHECKED:BST_UNCHECKED);
+		SetDlgItemText(hwnd,IDC_SPEEDSTEPS,globals.vid_steps);
 
 		twpng_InitDarkDialog(hwnd);
 		return 1;
@@ -10895,6 +12397,15 @@ static INT_PTR CALLBACK DlgProcPrefs(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 			{
 				int x = (IsDlgButtonChecked(hwnd,IDC_ADDAIMENU)==BST_CHECKED);
 				if(x!=prctx->remember_aimenu) set_ai_menu(x);
+			}
+			{
+				// Kept as typed; twpng_SpeedSteps skips what isn't a speed of 10..800.
+				TCHAR st[100];
+				GetDlgItemText(hwnd,IDC_SPEEDSTEPS,st,100);
+				int tmp[32];
+				StringCchCopy(globals.vid_steps,100,st);
+				if(!twpng_SpeedSteps(tmp,32) || !st[0]) StringCchCopy(globals.vid_steps,100,TWPNG_DEFAULT_STEPS);
+				twpng_VideoUI();
 			}
 
 			i=(int)SendDlgItemMessage(hwnd,IDC_CMPRLEVEL,CB_GETCURSEL,0,0);

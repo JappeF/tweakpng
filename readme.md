@@ -28,17 +28,22 @@ Civitai):
 - **ComfyUI video workflows** - for MP4/MOV the settings also show the generation mode
   (reference/image/first-last frame/text to video) and the reference or first/last frame
   images that were used.
-- **Browse a folder** - Prev/Next, the arrow keys, or a left/right click on the thumbnail
-  step through the images and videos in the same folder. Double-click the thumbnail for a
-  full-screen view you browse the same way, Esc to go back.
-- **Video playback** - videos play right in the viewer and full screen (Play or Space,
-  looped). - and + change the speed in steps of 25%, and the sound follows like a tape:
-  faster is higher, slower is lower.
+- **Browse a folder** - Prev/Next or the arrow keys step through the images and videos in
+  the same folder; hold them to race through it. Double-click the picture for a full-screen
+  view you browse the same way, Esc to go back.
+- **Culling renders** - S marks a file, Delete sends it to the Recycle Bin and moves on.
+  Drag the picture to any app, drop files on the viewer, and right-click for everything else
+  (open with, copy file/image/path/prompt, properties...).
+- **Video playback** - videos play right in the viewer and full screen (click, Play or
+  Space, looped). - and + step through your own list of speeds, and the sound follows like a
+  tape: faster is higher, slower is lower. Step frames with , and . and save the frame as a
+  PNG that keeps the video's prompt.
 - **Folder Overview** (Tools menu, or the Folder Overview button / Ctrl+F in the viewer,
   which then keeps the row of the file you are viewing selected) - all images and videos of a
   folder in one list with date, seed, model, mode, duration and prompt, a search box,
   sortable columns, a right-click menu (open, show in Explorer, copy path or prompt) and
-  Export CSV. Scans in the background and keeps an index, so a folder with 22,000 files
+  Export CSV. Check rows to mark them (kept per folder), then delete, copy or move them, or
+  drag them to another app. Scans in the background and keeps an index, so a folder with 22,000 files
   opens in well under a second the second time. The folder is watched: a render that
   just finished shows up by itself. Options > Folder Indexes shows the indexes and deletes
   the ones you no longer need.
@@ -76,7 +81,7 @@ The Folder Overview, with search, sortable columns and live updates:
 
 ![Folder Overview](docs/folder.jpg)
 
-Full-screen view (double-click the thumbnail), browse with the arrow keys or clicks:
+Full-screen view (double-click the thumbnail), browse with the arrow keys or the mouse wheel:
 
 ![Full-screen view](docs/fullscreen.jpg)
 

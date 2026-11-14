@@ -233,6 +233,10 @@ struct globals_struct {
 	// height, thumbnail share of the width (0 = from the image's aspect ratio).
 	int aip_split_prompt, aip_split_neg, aip_split_thumb;
 	int aif_sort;   // folder overview sort: column+1, negative = descending, 0 = by name
+	int vid_rate;   // video speed in percent, kept between runs
+	int vid_muted;
+#define TWPNG_DEFAULT_STEPS _T("25 50 75 100 125 150 200 300 400")
+	TCHAR vid_steps[100];   // the speeds -/+ step through, in percent, space separated
 	HANDLE hListRowImageList;
 
 	const TCHAR *twpng_homepage;

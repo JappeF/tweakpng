@@ -124,6 +124,11 @@
 #define IDC_AIP_SPEED                   1139
 #define IDC_AIP_FASTER                  1140
 #define IDC_AIP_FOLDER                  1141
+#define IDC_AF_MARKEDONLY               1142
+#define IDC_AF_DELETE                   1143
+#define IDC_AF_COPYTO                   1144
+#define IDC_AF_MOVETO                   1145
+#define IDC_SPEEDSTEPS                  1146
 #define ID_EXIT                         40001
 #define ID_OPEN                         40002
 #define ID_SAVEAS                       40003
