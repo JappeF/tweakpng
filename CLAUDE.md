@@ -419,7 +419,17 @@ fixed columns for the common settings plus "Other settings").
   the state icon or Space toggles. The header's checkbox (`HDS_CHECKBOXES` + `HDF_CHECKBOX`,
   drawn by the dark header custom draw) arrives as `HDN_ITEMSTATEICONCLICK` at the list,
   which `MainListSubclassProc` posts on as `WM_APP_HDRCHECK`: mark all shown rows or none.
-  "Marked only" filters in `twpng_FolderFilterMore`.
+  "Marked only" filters in `twpng_FolderFilterMore`. Names compare ordinal ignoring case
+  (`twpng_CmpName`; the locale's `lstrcmpi` was the slow part). Each record has a `mark`
+  flag (0 = not looked up, `twpng_RecMarked`), which `twpng_MarksChanged(dir, names, n, on)`
+  keeps current (a few names by binary search in the records, more than 64 by clearing the
+  flags), so counting, filtering and drawing need no lookups. Changes are written by
+  `twpng_FlushMarks` 500 ms after the last one (`TWPNG_MARKSTIMER` on the main window, also
+  at exit), not on every click. Unmarking many names is one sorted merge.
+- **Search speed**: `twpng_SplitWords` folds the search words once; `twpng_HasWord` matches
+  through `g_fold` (lower case of every character, one lookup each), and
+  `twpng_MatchRange` splits a big folder over the processors. It runs on the UI thread,
+  which is fine at these times.
 - **File actions** (`twpng_FolderTargets`: the marked shown rows, else the selection):
   Delete (Recycle Bin after a confirm, also the Delete key), Copy to / Move to (folder
   picker), all through `twpng_FileOp` (`IFileOperation` with `FOF_ALLOWUNDO`, so the shell
@@ -438,7 +448,10 @@ fixed columns for the common settings plus "Other settings").
   index files with the folder and file count from their headers, size and date (columns
   sortable, `twpng_CmpIdx`), and deletes the selected ones or all after a confirm.
 - Measured: 22,000 local files take about 3.4 s the first time and 0.2 s from the index;
-  on RaiDrive (cloud WebDAV) a first read costs about 50 ms per video.
+  on RaiDrive (cloud WebDAV) a first read costs about 50 ms per video. With 100,000
+  generated PNGs (1 to 2.5 KB prompts): first scan 4.9 s, from the index 1.3 s, a search
+  15 to 50 ms (was 3 to 8 s with `StrStrI`), mark all / unmark all / "Marked only" under
+  70 ms, sorting on Seed 0.8 s, about 480 MB of memory.
 
 ## Explorer menu and `/aiparams`
 

@@ -164,7 +164,8 @@ static int  twpng_SlurpFile(const TCHAR *fn, DWORD cap, unsigned char **outBuf, 
 static BOOL twpng_WriteWholeFile(const TCHAR *fn, const unsigned char *data, DWORD len);
 static BOOL twpng_IsMarkedPath(const TCHAR *path);
 static void twpng_ToggleMarkPath(const TCHAR *path);
-static void twpng_MarksChanged(const TCHAR *dir);
+static void twpng_MarksChanged(const TCHAR *dir, const TCHAR *const *names, int n, BOOL on);
+static void twpng_FlushMarks();
 static int  twpng_CmpStrPtr(const void *a, const void *b);
 struct twpng_folderdlg;
 static void twpng_FolderMarkUI(HWND hwnd, struct twpng_folderdlg *f);
@@ -1753,6 +1754,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 	Viewer::GlobalDestroy();
 #endif
 	twpng_VideoShutdown();
+	twpng_FlushMarks();
 	BufferedPaintUnInit();
 	OleUninitialize();
 	return (int)msg.wParam;
@@ -7411,6 +7413,7 @@ struct twpng_airec {
 	ULONGLONG size, mtime;
 	BOOL hasAI;
 	TCHAR *pos, *neg, *set;   // parsed like the viewer does (set includes video info)
+	BYTE mark;                // overview only: 0 = not looked up yet, 1 = unmarked, 2 = marked
 };
 
 static void twpng_FreeRec(struct twpng_airec *r)
@@ -7582,9 +7585,10 @@ static void twpng_SaveIndex(const TCHAR *dir, const struct twpng_airec *recs, in
 // Kept per folder next to the index, as <hash>.marks: a UTF-8 text file with a header line,
 // the folder and one file name per line. A few folders stay loaded, names sorted for lookup.
 
-struct twpng_marks { TCHAR dir[MAX_PATH]; TCHAR **names; int n, cap; };
+struct twpng_marks { TCHAR dir[MAX_PATH]; TCHAR **names; int n, cap; BOOL dirty; };
 #define TWPNG_MARKCACHE 8
 static struct twpng_marks *g_marks[TWPNG_MARKCACHE];   // [0] is the most recently used
+#define TWPNG_MARKSTIMER 78   // on the main window: write the changed marks files
 
 static BOOL twpng_MarksPath(const TCHAR *dir, TCHAR *out, int cap, BOOL create)
 {
@@ -7594,11 +7598,27 @@ static BOOL twpng_MarksPath(const TCHAR *dir, TCHAR *out, int cap, BOOL create)
 	return SUCCEEDED(StringCchCat(out, cap, _T(".marks")));
 }
 
+// File names compare like the file system does: ordinal, ignoring case (and much faster
+// than the locale's rules, which matters with 100,000 names).
+static int twpng_CmpName(const TCHAR *a, const TCHAR *b)
+{
+#ifdef UNICODE
+	return CompareStringOrdinal(a, -1, b, -1, TRUE) - CSTR_EQUAL;
+#else
+	return lstrcmpi(a, b);
+#endif
+}
+
+static int twpng_CmpNamePtr(const void *a, const void *b)
+{
+	return twpng_CmpName(*(const TCHAR* const*)a, *(const TCHAR* const*)b);
+}
+
 static int twpng_FindMark(const struct twpng_marks *m, const TCHAR *name, BOOL *found)
 {
 	int lo = 0, hi = m->n;
 	while(lo < hi) {
-		int mid = (lo+hi)/2, c = lstrcmpi(m->names[mid], name);
+		int mid = (lo+hi)/2, c = twpng_CmpName(m->names[mid], name);
 		if(!c) { *found = TRUE; return mid; }
 		if(c < 0) lo = mid+1; else hi = mid;
 	}
@@ -7606,12 +7626,21 @@ static int twpng_FindMark(const struct twpng_marks *m, const TCHAR *name, BOOL *
 	return lo;
 }
 
+static void twpng_SaveMarks(struct twpng_marks *m);
+
 static void twpng_FreeMarks(struct twpng_marks *m)
 {
 	if(!m) return;
+	if(m->dirty) twpng_SaveMarks(m);
 	for(int i=0; i<m->n; i++) free(m->names[i]);
 	free(m->names);
 	free(m);
+}
+
+// Write the marks files that changed (shortly after the last change, and at exit).
+static void twpng_FlushMarks()
+{
+	for(int i=0; i<TWPNG_MARKCACHE && g_marks[i]; i++) if(g_marks[i]->dirty) twpng_SaveMarks(g_marks[i]);
 }
 
 // The marks of `dir` (ending in a backslash), loaded from disk the first time.
@@ -7654,7 +7683,7 @@ static struct twpng_marks *twpng_MarksFor(const TCHAR *dir)
 		}
 		free(text);
 		if(!ok) { for(int i=0; i<m->n; i++) free(m->names[i]); m->n = 0; }
-		if(m->n > 1) qsort(m->names, (size_t)m->n, sizeof(TCHAR*), twpng_CmpStrPtr);
+		if(m->n > 1) qsort(m->names, (size_t)m->n, sizeof(TCHAR*), twpng_CmpNamePtr);
 	}
 	twpng_FreeMarks(g_marks[TWPNG_MARKCACHE-1]);
 	memmove(&g_marks[1], &g_marks[0], (TWPNG_MARKCACHE-1)*sizeof(g_marks[0]));
@@ -7662,9 +7691,10 @@ static struct twpng_marks *twpng_MarksFor(const TCHAR *dir)
 	return m;
 }
 
-static void twpng_SaveMarks(const struct twpng_marks *m)
+static void twpng_SaveMarks(struct twpng_marks *m)
 {
 	TCHAR fn[MAX_PATH], tmp[MAX_PATH];
+	m->dirty = FALSE;
 	if(!twpng_MarksPath(m->dir, fn, MAX_PATH, TRUE)) return;
 	if(!m->n) { DeleteFile(fn); return; }
 	struct twpng_tbuf b = { NULL, 0, 0 };
@@ -7727,29 +7757,37 @@ static void twpng_SetMarks(const TCHAR *dir, const TCHAR *const *names, int n, B
 			if((m->names[m->n] = _tcsdup(names[i]))!=NULL) { m->n++; changed = TRUE; }
 		}
 		if(changed) {
-			qsort(m->names, (size_t)m->n, sizeof(TCHAR*), twpng_CmpStrPtr);
+			qsort(m->names, (size_t)m->n, sizeof(TCHAR*), twpng_CmpNamePtr);
 			// The same name passed twice in one call: keep one.
 			int k = 0;
 			for(int i=0; i<m->n; i++) {
-				if(k && !lstrcmpi(m->names[k-1], m->names[i])) { free(m->names[i]); continue; }
+				if(k && !twpng_CmpName(m->names[k-1], m->names[i])) { free(m->names[i]); continue; }
 				m->names[k++] = m->names[i];
 			}
 			m->n = k;
 		}
-	} else {
-		for(int i=0; i<n; i++) {
-			BOOL found = FALSE;
-			int at = m->n ? twpng_FindMark(m, names[i], &found) : 0;
-			if(!found) continue;
-			free(m->names[at]);
-			memmove(&m->names[at], &m->names[at+1], (size_t)(m->n-at-1)*sizeof(TCHAR*));
-			m->n--;
-			changed = TRUE;
+	} else if(m->n) {
+		// Both lists sorted, then one merge pass (removing one by one is quadratic).
+		const TCHAR **del = (const TCHAR**)malloc((size_t)n*sizeof(TCHAR*));
+		if(!del) return;
+		memcpy(del, names, (size_t)n*sizeof(TCHAR*));
+		qsort(del, (size_t)n, sizeof(TCHAR*), twpng_CmpNamePtr);
+		int k = 0, j = 0;
+		for(int i=0; i<m->n; i++) {
+			while(j<n && twpng_CmpName(del[j], m->names[i])<0) j++;
+			if(j<n && !twpng_CmpName(del[j], m->names[i])) { free(m->names[i]); changed = TRUE; continue; }
+			m->names[k++] = m->names[i];
 		}
+		m->n = k;
+		free(del);
 	}
 	if(!changed) return;
-	twpng_SaveMarks(m);
-	twpng_MarksChanged(dir);
+	// Written a moment later, so marking many files one by one doesn't rewrite the file
+	// (100,000 names are a few MB) on every click.
+	m->dirty = TRUE;
+	if(globals.hwndMain) SetTimer(globals.hwndMain, TWPNG_MARKSTIMER, 500, NULL);
+	else twpng_SaveMarks(m);
+	twpng_MarksChanged(dir, names, n, on);
 }
 
 // Folder (with backslash) and name of a full path. FALSE without a folder.
@@ -7914,6 +7952,10 @@ static DWORD WINAPI twpng_ScanThread(LPVOID p)
 
 // ---- dialog ----
 
+// The search, split into words and folded to lower case.
+#define TWPNG_MAXWORDS 32
+struct twpng_words { TCHAR buf[512]; int off[TWPNG_MAXWORDS], len[TWPNG_MAXWORDS], n; };
+
 struct twpng_folderdlg {
 	struct twpng_scan *scan;
 	TCHAR dir[MAX_PATH];
@@ -7932,12 +7974,22 @@ struct twpng_folderdlg {
 	BOOL unsorted;                // rows were added since the last sort
 	TCHAR follow[MAX_PATH];       // file shown in the viewer, selected once its row is there
 	BOOL markedOnly;              // "Marked only": rows of marked files only
+	struct twpng_words words;     // the search, split and folded
 	HIMAGELIST checks;            // checkbox glyphs for the rows, drawn for the theme
 	int checksDark;               // theme the glyphs were drawn for, -1 = none yet
 };
 
 // Columns of the folder overview list.
 enum { AFC_FILE, AFC_MODIFIED, AFC_SEED, AFC_MODEL, AFC_MODE, AFC_DURATION, AFC_PROMPT, AFC_COUNT };
+
+// Whether a row's file is marked: looked up once per record, then kept current by
+// twpng_MarksChanged, so counting and filtering 100,000 rows needs no lookups.
+static BOOL twpng_RecMarked(struct twpng_folderdlg *f, const struct twpng_airec *r)
+{
+	struct twpng_airec *w = (struct twpng_airec*)r;
+	if(!w->mark) w->mark = twpng_IsMarked(f->dir, w->name) ? 2 : 1;
+	return w->mark==2;
+}
 
 // Value of `key` in a settings line ("k: v, k: v"), outer quotes removed.
 static BOOL twpng_FindSetting(const TCHAR *set, const TCHAR *key, TCHAR *out, int cap)
@@ -7964,21 +8016,114 @@ static BOOL twpng_FindSetting(const TCHAR *set, const TCHAR *key, TCHAR *out, in
 	return FALSE;
 }
 
-// Every space-separated word of the search must appear in the file name, prompts or settings.
-static BOOL twpng_RecMatches(const struct twpng_airec *r, const TCHAR *search)
+// ---- search: every space-separated word must appear in the file name, prompts or settings
+// Case-insensitive through a folding table (one lookup per character; StrStrI took seconds
+// for 100,000 prompts), and spread over a few threads for a big folder.
+
+static TCHAR *g_fold;   // lower-case of every character
+
+static void twpng_InitFold()
 {
-	TCHAR word[256];
+	if(g_fold) return;
+#ifdef UNICODE
+	const int n = 65536;
+#else
+	const int n = 256;
+#endif
+	TCHAR *t = (TCHAR*)malloc((size_t)n*sizeof(TCHAR));
+	if(!t) return;
+	for(int i=0; i<n; i++) t[i] = (TCHAR)i;
+#ifdef UNICODE
+	CharLowerBuff(t+1, 0xD800-1);           // not the surrogate halves
+	CharLowerBuff(t+0xE000, 0x10000-0xE000);
+#else
+	CharLowerBuff(t+1, n-1);
+#endif
+	g_fold = t;
+}
+
+#define TWPNG_FOLD(c) g_fold[(TBYTE)(c)]
+
+// `w` (wl characters) is already folded.
+static BOOL twpng_HasWord(const TCHAR *s, const TCHAR *w, int wl)
+{
+	if(!s) return FALSE;
+	TCHAR f0 = w[0];
+	for(; *s; s++) {
+		if(TWPNG_FOLD(*s)!=f0) continue;
+		int k = 1;
+		while(k<wl && TWPNG_FOLD(s[k])==w[k]) k++;   // the terminating 0 never matches
+		if(k==wl) return TRUE;
+	}
+	return FALSE;
+}
+
+static void twpng_SplitWords(const TCHAR *search, struct twpng_words *w)
+{
+	twpng_InitFold();
+	w->n = 0;
+	int o = 0;
 	const TCHAR *p = search;
-	for(;;) {
+	while(w->n < TWPNG_MAXWORDS && g_fold) {
 		while(*p==_T(' ')) p++;
-		if(!*p) return TRUE;
-		int n = 0;
-		while(*p && *p!=_T(' ') && n<255) word[n++] = *p++;
-		word[n] = 0;
-		if(!(StrStrI(r->name, word) || (r->pos && StrStrI(r->pos, word)) ||
-		     (r->neg && StrStrI(r->neg, word)) || (r->set && StrStrI(r->set, word))))
+		if(!*p) break;
+		w->off[w->n] = o;
+		while(*p && *p!=_T(' ') && o<510) w->buf[o++] = TWPNG_FOLD(*p++);
+		w->len[w->n] = o - w->off[w->n];
+		w->buf[o++] = 0;
+		if(w->len[w->n]) w->n++;
+		while(*p && *p!=_T(' ')) p++;
+	}
+}
+
+static BOOL twpng_RecMatches(const struct twpng_airec *r, const struct twpng_words *w)
+{
+	for(int i=0; i<w->n; i++) {
+		const TCHAR *x = w->buf + w->off[i];
+		int l = w->len[i];
+		if(!(twpng_HasWord(r->name, x, l) || twpng_HasWord(r->pos, x, l) ||
+		     twpng_HasWord(r->neg, x, l) || twpng_HasWord(r->set, x, l)))
 			return FALSE;
 	}
+	return TRUE;
+}
+
+struct twpng_matchjob { const struct twpng_airec *recs; const struct twpng_words *w; int from, to; BYTE *hit; };
+
+static DWORD WINAPI twpng_MatchThread(LPVOID p)
+{
+	struct twpng_matchjob *j = (struct twpng_matchjob*)p;
+	for(int i=j->from; i<j->to; i++) j->hit[i] = (BYTE)twpng_RecMatches(&j->recs[i], j->w);
+	return 0;
+}
+
+// hit[i] for recs[from..to): on this thread for a few, else split over the processors.
+static void twpng_MatchRange(const struct twpng_airec *recs, const struct twpng_words *w, int from, int to, BYTE *hit)
+{
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	int nt = (int)si.dwNumberOfProcessors;
+	if(nt > 16) nt = 16;
+	if(to-from < 4000 || nt < 2) {
+		struct twpng_matchjob j = { recs, w, from, to, hit };
+		twpng_MatchThread(&j);
+		return;
+	}
+	struct twpng_matchjob jobs[16];
+	HANDLE th[16];
+	int started = 0;
+	for(int k=0; k<nt; k++) {
+		jobs[k].recs = recs; jobs[k].w = w; jobs[k].hit = hit;
+		jobs[k].from = from + (int)((LONGLONG)(to-from)*k/nt);
+		jobs[k].to = from + (int)((LONGLONG)(to-from)*(k+1)/nt);
+		if(k==nt-1) break;   // the last part runs here
+		th[started] = CreateThread(NULL, 0, twpng_MatchThread, &jobs[k], 0, NULL);
+		if(th[started]) started++;
+		else twpng_MatchThread(&jobs[k]);
+	}
+	twpng_MatchThread(&jobs[nt-1]);
+	WaitForMultipleObjects((DWORD)started, th, TRUE, INFINITE);
+	for(int k=0; k<started; k++) CloseHandle(th[k]);
 }
 
 // ---- sorting: click a column header, again to reverse ----
@@ -8132,9 +8277,12 @@ static void twpng_FolderFilterMore(HWND hwnd, struct twpng_folderdlg *f)
 	if(!f->scan || f->scan->total<=0) return;
 	LONG done = f->scan->done;
 	int before = f->nrows;
+	BYTE *hit = NULL;
+	if(f->words.n && done > f->filtered && (hit = (BYTE*)malloc((size_t)done))!=NULL)
+		twpng_MatchRange(f->scan->recs, &f->words, f->filtered, done, hit);
 	for(; f->filtered<done; f->filtered++) {
-		if(!twpng_RecMatches(&f->scan->recs[f->filtered], f->search)) continue;
-		if(f->markedOnly && !twpng_IsMarked(f->dir, f->scan->recs[f->filtered].name)) continue;
+		if(f->words.n && (!hit || !hit[f->filtered])) continue;
+		if(f->markedOnly && !twpng_RecMarked(f, &f->scan->recs[f->filtered])) continue;
 		if(f->nrows==f->caprows) {
 			int nc = f->caprows ? f->caprows*2 : 1024;
 			int *nr = (int*)realloc(f->rows, (size_t)nc*sizeof(int));
@@ -8143,6 +8291,7 @@ static void twpng_FolderFilterMore(HWND hwnd, struct twpng_folderdlg *f)
 		}
 		f->rows[f->nrows++] = f->filtered;
 	}
+	free(hit);
 	if(f->nrows!=before || (f->finished && f->unsorted)) {
 		HWND lv = GetDlgItem(hwnd,IDC_AF_LIST);
 		ULONGLONG now = GetTickCount64();
@@ -8166,6 +8315,7 @@ static void twpng_FolderFilterMore(HWND hwnd, struct twpng_folderdlg *f)
 static void twpng_FolderRefilter(HWND hwnd, struct twpng_folderdlg *f)
 {
 	GetDlgItemText(hwnd, IDC_AF_SEARCH, f->search, 512);
+	twpng_SplitWords(f->search, &f->words);
 	f->nrows = 0;
 	f->filtered = 0;
 	ListView_SetItemCountEx(GetDlgItem(hwnd,IDC_AF_LIST), 0, 0);
@@ -8322,8 +8472,8 @@ static void twpng_FolderMarkUI(HWND hwnd, struct twpng_folderdlg *f)
 	int marked = 0, shownMarked = 0;
 	if(f->scan && f->scan->total > 0) {
 		LONG done = f->scan->done;
-		for(LONG i=0; i<done; i++) if(twpng_IsMarked(f->dir, f->scan->recs[i].name)) marked++;
-		if(marked) for(int i=0; i<f->nrows; i++) if(twpng_IsMarked(f->dir, f->scan->recs[f->rows[i]].name)) shownMarked++;
+		for(LONG i=0; i<done; i++) if(twpng_RecMarked(f, &f->scan->recs[i])) marked++;
+		if(marked) for(int i=0; i<f->nrows; i++) if(f->scan->recs[f->rows[i]].mark==2) shownMarked++;
 	}
 	TCHAR buf[100];
 	if(f->search[0]) StringCchPrintf(buf, 100, f->nrows==1 ? _T("%d match") : _T("%d matches"), f->nrows);
@@ -8362,11 +8512,42 @@ static void twpng_FolderRefilterKeep(HWND hwnd, struct twpng_folderdlg *f)
 	twpng_FolderRestorePos(lv, f, &pos, TRUE);
 }
 
+// The overview's record of `name`, found the way the records are sorted, or NULL.
+static struct twpng_airec *twpng_FolderFindRec(struct twpng_scan *s, const TCHAR *name)
+{
+	if(!s || s->total<=0) return NULL;
+	int lo = 0, hi = s->done;
+	struct twpng_dirent key;
+	key.name = (TCHAR*)name;
+	while(lo < hi) {
+		int mid = (lo+hi)/2;
+		struct twpng_dirent e;
+		e.name = s->recs[mid].name;
+		int c = twpng_CmpDirent(&e, &key);
+		if(!c) return !lstrcmpi(e.name, name) ? &s->recs[mid] : NULL;
+		if(c < 0) lo = mid+1; else hi = mid;
+	}
+	return NULL;
+}
+
 // Marks of `dir` changed (in the overview or with S in the viewer): show it everywhere.
-static void twpng_MarksChanged(const TCHAR *dir)
+static void twpng_MarksChanged(const TCHAR *dir, const TCHAR *const *names, int n, BOOL on)
 {
 	struct twpng_folderdlg *f = g_hwndAIFolder ? (struct twpng_folderdlg*)GetWindowLongPtr(g_hwndAIFolder, DWLP_USER) : NULL;
 	if(f && !lstrcmpi(f->dir, dir)) {
+		// Keep the rows' flags current: a few by name, many by looking them all up again.
+		struct twpng_scan *ss[2] = { f->scan, f->pending };
+		for(int k=0; k<2; k++) {
+			struct twpng_scan *s = ss[k];
+			if(!s || s->total<=0) continue;
+			BOOL redo = n > 64;
+			for(int i=0; i<n && !redo; i++) {
+				struct twpng_airec *r = twpng_FolderFindRec(s, names[i]);
+				if(r) r->mark = on ? 2 : 1;
+				else redo = TRUE;   // not reached yet, or a sort order surprise: look up again
+			}
+			if(redo) for(LONG i=0; i<s->done; i++) s->recs[i].mark = 0;
+		}
 		if(f->markedOnly) twpng_FolderRefilterKeep(g_hwndAIFolder, f);
 		else InvalidateRect(GetDlgItem(g_hwndAIFolder, IDC_AF_LIST), NULL, FALSE);
 		twpng_FolderMarkUI(g_hwndAIFolder, f);
@@ -8390,8 +8571,8 @@ static TCHAR **twpng_FolderTargets(HWND hwnd, struct twpng_folderdlg *f, BOOL pr
 	int n = 0;
 	if(preferMarked)
 		for(int i=0; i<f->nrows; i++) {
-			const TCHAR *name = f->scan->recs[f->rows[i]].name;
-			if(twpng_IsMarked(f->dir, name) && (list[n] = _tcsdup(name))!=NULL) n++;
+			const struct twpng_airec *r = &f->scan->recs[f->rows[i]];
+			if(twpng_RecMarked(f, r) && (list[n] = _tcsdup(r->name))!=NULL) n++;
 		}
 	if(n) *marked = TRUE;
 	else {
@@ -8431,7 +8612,7 @@ static void twpng_FolderMarkAll(HWND hwnd, struct twpng_folderdlg *f)
 	BOOL all = TRUE;
 	for(int i=0; i<f->nrows; i++) {
 		names[i] = f->scan->recs[f->rows[i]].name;
-		if(all && !twpng_IsMarked(f->dir, names[i])) all = FALSE;
+		if(all && !twpng_RecMarked(f, &f->scan->recs[f->rows[i]])) all = FALSE;
 	}
 	twpng_SetMarks(f->dir, names, f->nrows, !all);
 	free(names);
@@ -9079,7 +9260,7 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 				const struct twpng_airec *r = &f->scan->recs[f->rows[di->item.iItem]];
 				if(di->item.mask & LVIF_STATE) {
 					di->item.state = (di->item.state & ~LVIS_STATEIMAGEMASK) |
-						INDEXTOSTATEIMAGEMASK(twpng_IsMarked(f->dir, r->name) ? 2 : 1);
+						INDEXTOSTATEIMAGEMASK(twpng_RecMarked(f, r) ? 2 : 1);
 					di->item.stateMask |= LVIS_STATEIMAGEMASK;
 				}
 				if(!(di->item.mask & LVIF_TEXT)) return TRUE;
@@ -9150,7 +9331,7 @@ static INT_PTR CALLBACK DlgProcAIFolder(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 				// Dragging a marked row takes all marked rows along, otherwise the selection.
 				int i = ((LPNMLISTVIEW)lParam)->iItem, n;
 				BOOL marked;
-				BOOL onMarked = i>=0 && i<f->nrows && twpng_IsMarked(f->dir, f->scan->recs[f->rows[i]].name);
+				BOOL onMarked = i>=0 && i<f->nrows && twpng_RecMarked(f, &f->scan->recs[f->rows[i]]);
 				TCHAR **names = twpng_FolderTargets(hwnd, f, onMarked, &n, &marked);
 				if(names) { twpng_DragFiles(hwnd, f->dir, names, n); twpng_FreeList(names, n); }
 				return TRUE;
@@ -11607,6 +11788,11 @@ static LRESULT CALLBACK WndProcMain(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 		return 0;
 
 	case WM_TIMER:
+		if(wParam==TWPNG_MARKSTIMER) {
+			KillTimer(hwnd, TWPNG_MARKSTIMER);
+			twpng_FlushMarks();
+			return 0;
+		}
 		if(globals.timer_set) {
 			KillTimer(hwnd,1);
 			globals.timer_set=0;
